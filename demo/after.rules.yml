@@ -1,0 +1,11 @@
+groups:
+  - name: payment
+    interval: 30s
+    rules:
+      - alert: PaymentErrorsHigh
+        expr: sum(rate(payment_http_requests_total{code="500"}[2m])) > 1
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: Payment service is returning HTTP 500 responses
