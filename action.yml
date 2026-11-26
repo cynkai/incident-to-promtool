@@ -1,9 +1,12 @@
 name: Incident to Promtool
-description: Replay a captured incident against Prometheus alert rules before and after a Git change.
+description: Replay captured incidents against Prometheus alert rules before and after a Git change.
 inputs:
   fixture:
-    description: Path to a generated incident test fixture, relative to the checked-out repository.
-    required: true
+    description: Path to one generated incident test fixture, relative to repo-path. Provide either fixture or fixtures.
+    required: false
+  fixtures:
+    description: Newline-separated generated incident test fixture paths, relative to repo-path. Provide either fixtures or fixture.
+    required: false
   rule-files:
     description: Newline-separated, repository-root-relative rule paths present in both commits.
     required: true
@@ -34,6 +37,7 @@ runs:
       env:
         INCIDENT_ACTION_PATH: ${{ github.action_path }}
         INCIDENT_FIXTURE: ${{ inputs.fixture }}
+        INCIDENT_FIXTURES: ${{ inputs.fixtures }}
         INCIDENT_RULE_FILES: ${{ inputs.rule-files }}
         INCIDENT_RULE_FORMAT: ${{ inputs.rule-format }}
         INCIDENT_REPO_PATH: ${{ inputs.repo-path }}

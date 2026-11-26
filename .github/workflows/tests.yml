@@ -49,8 +49,21 @@ jobs:
           mkdir "$repo/rules"
           python3 incident_to_promtool.py demo/demo.json \
             --matrix demo/incident.matrix.json --output "$repo/payment.test.yml"
+          python3 - "$repo" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          repo = Path(sys.argv[1])
+          fixture = json.loads((repo / "payment.test.yml").read_text(encoding="utf-8"))
+          group = fixture["tests"][0]
+          group["input_series"][0]["values"] = "0+0x20"
+          for checkpoint in group["alert_rule_test"]:
+              checkpoint["exp_alerts"] = []
+          (repo / "quiet.test.yml").write_text(json.dumps(fixture), encoding="utf-8")
+          PY
           cp demo/kubernetes/before.yml "$repo/$rule"
-          git -C "$repo" add -- "$rule" payment.test.yml
+          git -C "$repo" add -- "$rule" payment.test.yml quiet.test.yml
           git -C "$repo" commit --quiet -m 'Add original payment alert'
           cp demo/kubernetes/after.yml "$repo/$rule"
           git -C "$repo" add -- "$rule"
@@ -72,13 +85,15 @@ jobs:
           report=$(cat "$REPORT_PATH")
           [[ "$report" == *'| Before | Failed | 1/2 |'* ]]
           [[ "$report" == *'| After | Passed | 2/2 |'* ]]
-      - name: Compare with refs reversed
+      - name: Compare two incidents with refs reversed
         id: regression
         continue-on-error: true
         uses: ./
         with:
           repo-path: ${{ runner.temp }}/composite-repo
-          fixture: payment.test.yml
+          fixtures: |
+            payment.test.yml
+            quiet.test.yml
           rule-files: |
             rules/payment alert.yml
           rule-format: kubernetes
@@ -92,5 +107,7 @@ jobs:
           test "$OUTCOME" = failure
           test -f "$REPORT_PATH"
           report=$(cat "$REPORT_PATH")
-          [[ "$report" == *'| Before | Passed | 2/2 |'* ]]
-          [[ "$report" == *'| After | Failed | 1/2 |'* ]]
+          [[ "$report" == *'| Before | Passed | 4/4 |'* ]]
+          [[ "$report" == *'| After | Failed | 3/4 |'* ]]
+          [[ "$report" == *'| <code>payment.test.yml</code> | Passed (2/2) | Failed (1/2) |'* ]]
+          [[ "$report" == *'| <code>quiet.test.yml</code> | Passed (2/2) | Passed (2/2) |'* ]]

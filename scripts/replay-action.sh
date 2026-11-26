@@ -6,10 +6,28 @@ set -euo pipefail
 cd -- "${GITHUB_WORKSPACE:-.}"
 cd -- "$INCIDENT_REPO_PATH"
 
-if [[ ! -f "$INCIDENT_FIXTURE" ]]; then
-    printf 'Incident fixture file not found: %q\n' "$INCIDENT_FIXTURE" >&2
+fixture_paths=()
+while IFS= read -r fixture_path; do
+    fixture_path=${fixture_path%$'\r'}
+    if [[ "$fixture_path" =~ [^[:space:]] ]]; then
+        fixture_paths+=("$fixture_path")
+    fi
+done <<< "${INCIDENT_FIXTURES:-}"
+
+if [[ -n "${INCIDENT_FIXTURE:-}" && -n "${fixture_paths[0]:-}" ]] ||
+   [[ -z "${INCIDENT_FIXTURE:-}" && -z "${fixture_paths[0]:-}" ]]; then
+    printf 'Provide exactly one of fixture or fixtures.\n' >&2
     exit 2
 fi
+if [[ -n "${INCIDENT_FIXTURE:-}" ]]; then
+    fixture_paths+=("$INCIDENT_FIXTURE")
+fi
+for fixture_path in "${fixture_paths[@]}"; do
+    if [[ ! -f "$fixture_path" ]]; then
+        printf 'Incident fixture file not found: %q\n' "$fixture_path" >&2
+        exit 2
+    fi
+done
 
 rule_arguments=()
 while IFS= read -r rule; do
@@ -56,7 +74,7 @@ printf '::stop-commands::%s\n' "$command_token"
 "$python" "$INCIDENT_ACTION_PATH/incident_to_promtool.py" compare \
     --before-ref="$INCIDENT_BEFORE_REF" --after-ref="$INCIDENT_AFTER_REF" \
     --promtool="$promtool" --rule-format="$INCIDENT_RULE_FORMAT" \
-    "${rule_arguments[@]}" -- "$INCIDENT_FIXTURE" > "$report" || status=$?
+    "${rule_arguments[@]}" -- "${fixture_paths[@]}" > "$report" || status=$?
 printf '::%s::\n' "$command_token"
 
 if [[ -s "$report" ]]; then
