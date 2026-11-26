@@ -82,6 +82,14 @@ jobs:
           "$cli" export-rules "$demo/kubernetes/after.yml" --output-dir rules
           "$RUNNER_TEMP/promtool" check rules rules/rules-1.yml
 
+          "$cli" bundle "$demo/alertmanager.incident.json" --matrix "$demo/incident.matrix.json" \
+            --output payment.zip
+          "$smoke/venv/bin/python" -m zipfile --extract payment.zip payment-bundle
+          cd payment-bundle
+          "$RUNNER_TEMP/promtool" test rules incident.test.yml
+          "$cli" incident.json --matrix incident.matrix.json --output regenerated.test.yml
+          cmp -- incident.test.yml regenerated.test.yml
+
   composite-action:
     name: Composite Action smoke test
     runs-on: ubuntu-latest

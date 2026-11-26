@@ -16,7 +16,7 @@ The demo replays synthetic payment metrics without a Prometheus server. It check
 
 Use Python 3.10+ and `promtool` 3.9+. With no local `promtool`, the demo downloads and verifies a pinned binary on Linux x64. Set `PROMTOOL=/path/to/promtool` to use a specific executable.
 
-Commit a fixture for your own incident, compare rule changes between Git refs, and add the same check to CI. Detailed examples are available in Korean. [Capture an incident](#내-prometheus로-실행) · [Plan capture selectors](#캡처할-시계열-계획) · [Raw metric snapshot](#원본-시계열-스냅샷) · [Inspect sample gaps](#시계열-표본-간격-확인) · [Alertmanager webhook](#alertmanager-웹훅으로-기대-동작-만들기) · [Native Prometheus rules](#룰-변경-전후-비교) · [Git ref comparison](#git-커밋으로-비교) · [Kubernetes PrometheusRule](#kubernetes-prometheusrule로-테스트) · [GitHub Action](#github-actions에서-pr-검사)
+Commit a fixture for your own incident, compare rule changes between Git refs, and add the same check to CI. Detailed examples are available in Korean. [Capture an incident](#내-prometheus로-실행) · [Plan capture selectors](#캡처할-시계열-계획) · [Raw metric snapshot](#원본-시계열-스냅샷) · [Bundle an incident](#장애-재현-번들) · [Inspect sample gaps](#시계열-표본-간격-확인) · [Alertmanager webhook](#alertmanager-웹훅으로-기대-동작-만들기) · [Native Prometheus rules](#룰-변경-전후-비교) · [Git ref comparison](#git-커밋으로-비교) · [Kubernetes PrometheusRule](#kubernetes-prometheusrule로-테스트) · [GitHub Action](#github-actions에서-pr-검사)
 
 ### Install the CLI from GitHub
 
@@ -255,6 +255,33 @@ python3 incident_to_promtool.py incident.json \
 
 저장 파일은 Prometheus `matrix` 응답 형식이며, 지정 구간의 표본 시각을 밀리초 정밀도로 보존하고 라벨과 값을 그대로 담습니다. 저장된 응답을 합치려면 `snapshot`에 `--matrix part-a.matrix.json --matrix part-b.matrix.json`과 같이 입력을 반복 지정합니다. 같은 시계열에서 시각과 값이 일치하는 표본은 하나로 합칩니다. 구간 안에 표본이 없거나 같은 시각의 값이 충돌하거나, 응답에 경고 또는 네이티브 히스토그램이 있으면 오류로 처리합니다.
 
+### 장애 재현 번들
+
+`bundle`은 한 번 캡처한 시계열로 스냅샷과 테스트를 만들고, 오프라인에서 다시 실행할 파일을 ZIP 하나에 담습니다. `--output`에는 새 ZIP 경로를 지정합니다.
+
+```sh
+mkdir -p demo/generated
+python3 incident_to_promtool.py bundle demo/alertmanager.incident.json \
+  --matrix demo/incident.matrix.json --output demo/generated/payment.zip
+unzip -q demo/generated/payment.zip -d demo/generated/payment
+(cd demo/generated/payment && promtool test rules incident.test.yml)
+```
+
+시계열은 `--matrix`를 반복해 지정하거나 `--prometheus-url`로 가져옵니다. `--rule-file`을 반복해 설정의 룰 파일을 바꿀 수 있습니다. `--round-up`과 `--max-shift`는 테스트를 생성할 때와 같은 의미입니다.
+
+| 파일 | 내용 |
+| --- | --- |
+| `incident.json` | 룰을 번들 내부의 상대 경로로 지정하고 기대 동작을 `alerts`에 담은 오프라인 설정 |
+| `incident.matrix.json` | 시각을 그대로 보존한 원본 시계열 스냅샷 |
+| `incident.test.yml` | `promtool`에서 바로 실행할 테스트 |
+| `capture.json` | 상대 테스트 경로, SHA-256, `generation_options` 배열을 담은 캡처 요약 |
+| `coverage.json` | 캡처 구간의 표본과 간격에 대한 관측 결과 |
+| `rules/rules-N.yml` | 사용한 룰 파일의 원본 바이트 |
+
+Alertmanager 웹훅을 사용했다면 기대 동작에 쓰는 라벨과 주석만 오프라인 설정에 남습니다. Prometheus 조회 주소, 인증 토큰, 실시간 조회 선택자는 캡처 단계에서만 사용합니다.
+
+압축을 푼 디렉터리에서 같은 버전의 CLI로 `incident.json`과 `incident.matrix.json`을 읽으면 테스트를 바이트 단위로 다시 생성할 수 있습니다. 출력은 같은 디렉터리 안에 새 파일로 지정하고, 생성에 사용한 옵션은 `capture.json`의 `generation_options`에 기록된 그대로 전달합니다.
+
 ### 시계열 표본 간격 확인
 
 `inspect`는 캡처 구간에서 관측된 시계열별로 표본 수, 첫 표본과 마지막 표본의 UTC 시각, 구간 양끝의 공백, 연속된 두 표본 사이의 최장 간격을 보고합니다. 간격은 실제 표본 시각으로 계산합니다. 기본 출력은 Markdown이고, `--format json`은 간격의 시작과 끝도 기록합니다.
@@ -315,4 +342,4 @@ python3 incident_to_promtool.py incident.json --prometheus-url http://localhost:
 
 ## 실제 변경에 적용하기
 
-최근에 고친 알람 하나로 시작하세요. 기존 룰에서는 기대 동작 검사가 실패하고 수정한 룰에서는 통과하는지 확인한 뒤, 생성된 테스트를 룰 변경 PR에 넣어보세요. CI에서는 `promtool test rules incident.test.yml`을 실행하면 됩니다. 테스트 파일에는 캡처한 메트릭 값과 라벨이 들어 있으므로 커밋 전에 저장소 접근 범위에 맞는 데이터인지 확인하세요. [Prometheus 룰 테스트 문서](https://prometheus.io/docs/prometheus/latest/configuration/unit_testing_rules/)
+최근에 고친 알람 하나로 시작하세요. 기존 룰에서는 기대 동작 검사가 실패하고 수정한 룰에서는 통과하는지 확인한 뒤, 생성된 테스트를 룰 변경 PR에 넣어보세요. CI에서는 `promtool test rules incident.test.yml`을 실행하면 됩니다. 테스트와 번들에는 캡처한 메트릭 값과 라벨, 알람 주석이 들어 있으므로 커밋 전에 저장소 접근 범위에 맞는 데이터인지 확인하세요. [Prometheus 룰 테스트 문서](https://prometheus.io/docs/prometheus/latest/configuration/unit_testing_rules/)

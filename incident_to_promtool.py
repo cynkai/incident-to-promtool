@@ -21,6 +21,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree
+from zipfile import ZIP_DEFLATED, ZipFile
 
 
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
@@ -454,8 +455,30 @@ def write_matrix_snapshot(path, samples, start_ms):
         output.write("\n]}}\n")
 
 
-def generate(args):
-    config = read_json(args.config)
+@dataclass(frozen=True)
+class PreparedCapture:
+    fixture: dict
+    summary: dict
+    samples: dict[str, CapturedSeries]
+    start: datetime
+    end: datetime
+    begin_ms: int
+
+
+def capture_rule_paths(args, config):
+    if args.rule_file:
+        paths = args.rule_file
+    else:
+        rule_files = config["rule_files"]
+        if not isinstance(rule_files, list) or not rule_files or not all(isinstance(path, str) for path in rule_files):
+            raise ValueError("rule_files must contain paths relative to the config file")
+        paths = [args.config.parent / path for path in rule_files]
+    if any(not path.is_file() for path in paths):
+        raise ValueError("every rule file must exist")
+    return paths
+
+
+def prepare_capture(args, config, rule_files):
     start, begin_ms = timestamp_ms(config["start"])
     end, end_ms = timestamp_ms(config["end"])
     window = end_ms - begin_ms
@@ -473,17 +496,6 @@ def generate(args):
         raise ValueError("with --round-up, end must fall on the sample grid")
 
     tests = rule_test_cases(config["expectations"], window, evaluation, args.config.parent)
-    if args.rule_file:
-        paths = args.rule_file
-    else:
-        rule_files = config["rule_files"]
-        if not isinstance(rule_files, list) or not rule_files or not all(isinstance(path, str) for path in rule_files):
-            raise ValueError("rule_files must contain paths relative to the config file")
-        paths = [args.config.parent / path for path in rule_files]
-    if any(not path.is_file() for path in paths):
-        raise ValueError("every rule file must exist")
-    rule_files = [os.path.relpath(path.resolve(), args.output.parent.resolve()) for path in paths]
-
     matrices = capture_matrices(args, config, end, window)
     samples = capture_samples(matrices, begin_ms, end_ms)
     if automatic:
@@ -504,12 +516,7 @@ def generate(args):
             "alert_rule_test": tests,
         }],
     }
-    # JSON syntax is also valid YAML, which lets promtool read it without a Python YAML dependency.
-    document = write_new_json(args.output, fixture)
-    return {
-        "schema_version": 1,
-        "fixture_path": str(args.output),
-        "fixture_sha256": hashlib.sha256(document).hexdigest(),
+    summary = {
         "start": start.isoformat(),
         "end": end.isoformat(),
         "evaluation_interval_ms": evaluation,
@@ -523,6 +530,80 @@ def generate(args):
         "checkpoint_count": len(tests),
         "expanded_slots": capture.expanded_slots,
     }
+    return PreparedCapture(fixture, summary, samples, start, end, begin_ms)
+
+
+def write_capture_fixture(path, prepared, *, relative=False):
+    # JSON syntax is also valid YAML, which lets promtool read it without a Python YAML dependency.
+    document = write_new_json(path, prepared.fixture)
+    return {
+        "schema_version": 1,
+        "fixture_path": path.name if relative else str(path),
+        "fixture_sha256": hashlib.sha256(document).hexdigest(),
+        **prepared.summary,
+    }
+
+
+def generate(args):
+    config = read_json(args.config)
+    parent = args.output.parent.resolve()
+    rule_files = [Path(os.path.relpath(path.resolve(), parent)).as_posix() for path in capture_rule_paths(args, config)]
+    prepared = prepare_capture(args, config, rule_files)
+    return write_capture_fixture(args.output, prepared)
+
+
+def offline_incident_config(prepared, sample_interval):
+    fixture = prepared.fixture
+    return {
+        "start": prepared.start.isoformat(),
+        "end": prepared.end.isoformat(),
+        "sample_interval": sample_interval,
+        "evaluation_interval": fixture["evaluation_interval"],
+        "rule_files": fixture["rule_files"],
+        "expectations": [
+            {
+                "at": case["eval_time"],
+                "alertname": case["alertname"],
+                "alerts": [
+                    {"labels": alert["exp_labels"], "annotations": alert["exp_annotations"]}
+                    for alert in case["exp_alerts"]
+                ],
+            }
+            for case in fixture["tests"][0]["alert_rule_test"]
+        ],
+    }
+
+
+def write_bundle(args):
+    if args.output.exists() or args.output.is_symlink():
+        raise FileExistsError(args.output)
+    config = read_json(args.config)
+    rule_paths = list(dict.fromkeys(path.resolve() for path in capture_rule_paths(args, config)))
+    rule_files = [f"rules/rules-{number}.yml" for number in range(1, len(rule_paths) + 1)]
+    with TemporaryDirectory(prefix="incident-to-promtool-") as temporary:
+        directory = Path(temporary)
+        (directory / "rules").mkdir()
+        for original, portable in zip(rule_paths, rule_files):
+            (directory / portable).write_bytes(original.read_bytes())
+
+        prepared = prepare_capture(args, config, rule_files)
+        summary = write_capture_fixture(directory / "incident.test.yml", prepared, relative=True)
+        generation_options = ["--round-up"] if args.round_up else []
+        if args.max_shift is not None:
+            generation_options.extend(("--max-shift", args.max_shift))
+        summary["generation_options"] = generation_options
+        write_new_json(directory / "capture.json", summary)
+        write_new_json(directory / "incident.json", offline_incident_config(prepared, config["sample_interval"]))
+        write_matrix_snapshot(directory / "incident.matrix.json", prepared.samples, prepared.begin_ms)
+        coverage = build_coverage_report(prepared.samples, prepared.start, prepared.end, None)
+        write_new_json(directory / "coverage.json", coverage)
+
+        entries = ["incident.json", "incident.matrix.json", "incident.test.yml", "capture.json", "coverage.json", *rule_files]
+        with new_output_file(args.output, "w+b") as output:
+            with ZipFile(output, "w", compression=ZIP_DEFLATED) as archive:
+                for name in entries:
+                    archive.write(directory / name, arcname=name)
+    return summary
 
 
 def git_output(repo, *args):
@@ -1020,6 +1101,31 @@ def add_capture_source_options(parser):
     source.add_argument("--matrix", type=Path, action="append", help="read a saved raw query response (repeatable)")
 
 
+def add_fixture_generation_options(parser):
+    parser.add_argument("--rule-file", type=Path, action="append", help="override config rule_files (repeatable)")
+    parser.add_argument("--round-up", action="store_true", help="shift off-grid samples with a numeric sample interval")
+    parser.add_argument("--max-shift", metavar="DURATION", help="allow bounded forward shifts if the exact auto grid is too large")
+
+
+def bundle_main(argv):
+    parser = argparse.ArgumentParser(
+        prog=f"{Path(sys.argv[0]).name} bundle",
+        description="Package raw samples, a replay fixture, native rules, and reports for offline use.",
+    )
+    parser.add_argument("config", type=Path, help="incident window and expected alert states (JSON)")
+    add_capture_source_options(parser)
+    add_fixture_generation_options(parser)
+    parser.add_argument("--output", required=True, type=Path, help="new ZIP archive")
+    args = parser.parse_args(argv)
+    try:
+        summary = write_bundle(args)
+    except FileExistsError:
+        parser.exit(1, f"error: output file already exists: {args.output}\n")
+    except (ValueError, KeyError, TypeError, AttributeError, InvalidOperation, OSError, OverflowError) as exc:
+        parser.exit(1, f"error: {exc}\n")
+    print(f"Wrote {args.output} ({summary['series_count']} series, {summary['checkpoint_count']} checkpoints).")
+
+
 def plan_capture_main(argv):
     parser = argparse.ArgumentParser(
         prog=f"{Path(sys.argv[0]).name} plan-capture",
@@ -1096,6 +1202,8 @@ def inspect_main(argv):
 
 
 def main():
+    if sys.argv[1:2] == ["bundle"]:
+        return bundle_main(sys.argv[2:])
     if sys.argv[1:2] == ["plan-capture"]:
         return plan_capture_main(sys.argv[2:])
     if sys.argv[1:2] == ["snapshot"]:
@@ -1107,15 +1215,14 @@ def main():
     if sys.argv[1:2] == ["export-rules"]:
         return export_rules_main(sys.argv[2:])
     parser = argparse.ArgumentParser(
-        description=__doc__, epilog="See plan-capture --help for metric selectors, snapshot --help for sample capture, "
+        description=__doc__, epilog="See bundle --help for portable captures, plan-capture --help for metric selectors, "
+        "snapshot --help for sample capture, "
         "inspect --help for sample coverage, compare --help for rule comparisons, "
         "or export-rules --help for Kubernetes manifests."
     )
     parser.add_argument("config", type=Path, help="incident window and expected alert states (JSON)")
     add_capture_source_options(parser)
-    parser.add_argument("--rule-file", type=Path, action="append", help="override config rule_files (repeatable)")
-    parser.add_argument("--round-up", action="store_true", help="shift off-grid samples with a numeric sample interval")
-    parser.add_argument("--max-shift", metavar="DURATION", help="allow bounded forward shifts if the exact auto grid is too large")
+    add_fixture_generation_options(parser)
     parser.add_argument("--summary-format", choices=("text", "json"), default="text",
                         help="write a plain-text or JSON capture summary to stdout (default: text)")
     parser.add_argument("--output", required=True, type=Path, help="new promtool YAML test file")
