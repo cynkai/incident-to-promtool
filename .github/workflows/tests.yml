@@ -84,6 +84,7 @@ jobs:
 
           "$cli" bundle "$demo/alertmanager.incident.json" --matrix "$demo/incident.matrix.json" \
             --output payment.zip
+          "$cli" verify-bundle payment.zip --format json > bundle-verification.json
           bundle_status=0
           "$cli" compare-bundle payment.zip --after "$demo/before.rules.yml" \
             --promtool "$RUNNER_TEMP/promtool" --gate regressions --json-report bundle-regression.json \
@@ -92,6 +93,14 @@ jobs:
           "$smoke/venv/bin/python" - <<'PY'
           import json
           from pathlib import Path
+
+          verification = json.loads(Path("bundle-verification.json").read_text(encoding="utf-8"))
+          assert verification["schema_version"] == 1
+          assert verification["bundle_path"] == "payment.zip"
+          assert verification["verified_files"] == [
+              "capture.json", "coverage.json", "incident.json",
+              "incident.matrix.json", "incident.test.yml", "rules/rules-1.yml",
+          ]
 
           report = json.loads(Path("bundle-regression.json").read_text(encoding="utf-8"))
           assert report["bundle"] == {"path": "payment.zip", "rule_files": ["rules/rules-1.yml"]}

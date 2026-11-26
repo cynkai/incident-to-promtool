@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "incident_to_promtool.py"
 DEMO = ROOT / "demo"
 ANNOTATION = "Payment service is returning HTTP 500 responses"
-BASE_MEMBERS = ["incident.json", "incident.matrix.json", "incident.test.yml", "capture.json", "coverage.json"]
+BASE_MEMBERS = ["incident.json", "incident.matrix.json", "incident.test.yml", "capture.json", "coverage.json", "manifest.json"]
 
 
 class CaptureBundleIntegrationTests(unittest.TestCase):
@@ -113,6 +113,7 @@ class CaptureBundleIntegrationTests(unittest.TestCase):
         capture = json.loads((extracted / "capture.json").read_text(encoding="utf-8"))
         fixture = extracted / "incident.test.yml"
         self.assertEqual(capture["schema_version"], 1)
+        self.assertEqual(capture["bundle_manifest_version"], 1)
         self.assertEqual(capture["fixture_path"], "incident.test.yml")
         self.assertEqual(capture["fixture_sha256"], hashlib.sha256(fixture.read_bytes()).hexdigest())
         self.assertEqual(capture["generation_options"], [])

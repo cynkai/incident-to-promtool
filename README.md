@@ -296,14 +296,27 @@ unzip -q demo/generated/payment.zip -d demo/generated/payment
 | `capture.json` | 상대 테스트 경로, SHA-256, `generation_options` 배열을 담은 캡처 요약 |
 | `coverage.json` | 캡처 구간의 표본과 간격에 대한 관측 결과 |
 | `rules/rules-N.yml` | 사용한 룰 파일의 원본 바이트 |
+| `manifest.json` | 번들 데이터 파일 전체의 SHA-256을 기록한 버전 1 매니페스트 |
 
 Alertmanager 웹훅을 사용했다면 기대 동작에 쓰는 라벨과 주석만 오프라인 설정에 남습니다. Prometheus 조회 주소, 인증 토큰, 실시간 조회 선택자는 캡처 단계에서만 사용합니다.
 
 압축을 푼 디렉터리에서 같은 버전의 CLI로 `incident.json`과 `incident.matrix.json`을 읽으면 테스트를 바이트 단위로 다시 생성할 수 있습니다. 출력은 같은 디렉터리 안에 새 파일로 지정하고, 생성에 사용한 옵션은 `capture.json`의 `generation_options`에 기록된 그대로 전달합니다.
 
+#### 번들 전체 검증
+
+새 번들의 `manifest.json`은 `schema_version`이 `1`이며, `files`는 번들 데이터 파일 경로를 각각의 SHA-256에 대응시킵니다. `capture.json`의 `bundle_manifest_version`은 해당 ZIP에 `manifest.json`이 필요하다는 표시입니다.
+
+위 예제로 만든 ZIP을 Python CLI만으로 바로 검사할 수 있습니다. 기본 출력은 Markdown입니다. `--format json`의 `schema_version`은 `1`이며, `bundle_path`와 `verified_files`에 ZIP 경로와 검증한 파일 목록을 기록합니다.
+
+```sh
+python3 incident_to_promtool.py verify-bundle demo/generated/payment.zip --format json
+```
+
+전체 검증에는 `manifest.json`이 필요합니다. 종료 코드는 검증을 통과하면 `0`, 형식이 잘못됐거나 파일과 해시가 일치하지 않으면 `2`입니다. 이 검사는 ZIP 내부 파일과 동봉된 해시의 일치 여부를 확인합니다. 작성자와 배포 출처를 확인하려면 신뢰할 수 있는 서명이나 별도의 출처 기록이 필요합니다.
+
 #### 번들에서 룰 변경 비교
 
-`compare-bundle`은 ZIP에서 테스트와 기준 Prometheus 룰을 바로 읽습니다. 번들 내부 `capture.json`에 기록된 테스트의 SHA-256을 확인하고, 같은 테스트로 기준 룰과 수정 룰을 비교합니다. 기존 `bundle` 명령으로 만든 ZIP도 사용할 수 있습니다.
+`compare-bundle`은 ZIP에서 테스트와 기준 Prometheus 룰을 바로 읽습니다. 번들 내부 `capture.json`에 기록된 테스트의 SHA-256을 확인하고, 같은 테스트로 기준 룰과 수정 룰을 비교합니다. 매니페스트가 있는 번들에서는 재생에 쓰는 `incident.test.yml`, `capture.json`, 테스트가 참조하는 기준 룰을 매니페스트와 대조합니다. 기존 ZIP도 `capture.json`의 테스트 해시로 검증해 비교할 수 있습니다. [번들 전체 검증](#번들-전체-검증)
 
 ```sh
 mkdir -p demo/generated

@@ -187,6 +187,11 @@ class CompareBundleIntegrationTests(unittest.TestCase):
 
         self.assert_preflight_error("sha", archive, r"(?i)sha-?256|digest|checksum")
 
+    def test_missing_optional_member_changes_manifest_inventory_before_promtool(self):
+        archive = self.copy_archive("missing-coverage.zip", remove=("coverage.json",))
+
+        self.assert_preflight_error("missing-coverage", archive, r"(?i)coverage\.json|inventory")
+
     def test_duplicate_member_is_ambiguous_before_promtool(self):
         for index, name in enumerate(("incident.test.yml", "rules/rules-1.yml")):
             with self.subTest(name=name):
@@ -225,12 +230,13 @@ class CompareBundleIntegrationTests(unittest.TestCase):
         fixture["rule_files"][0] = "../outside.rules.yml"
         content = (json.dumps(fixture) + "\n").encode()
         capture["fixture_sha256"] = hashlib.sha256(content).hexdigest()
+        del capture["bundle_manifest_version"]
         archive = self.copy_archive(
             "traversal.zip", replacements={"incident.test.yml": content, "capture.json": json.dumps(capture)},
-            additions=(("../outside.rules.yml", rule),),
+            remove=("manifest.json",), additions=(("../outside.rules.yml", rule),),
         )
 
-        self.assert_preflight_error("traversal", archive, r"(?i)path|unsafe|rule.files|member")
+        self.assert_preflight_error("traversal", archive, r"(?i)rule_files.*path|unsafe.*path")
         self.assertFalse((self.workspace / "outside.rules.yml").exists())
 
 
