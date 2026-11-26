@@ -16,7 +16,7 @@ The demo replays synthetic payment metrics without a Prometheus server. It check
 
 Use Python 3.10+ and `promtool` 3.9+. With no local `promtool`, the demo downloads and verifies a pinned binary on Linux x64. Set `PROMTOOL=/path/to/promtool` to use a specific executable.
 
-Commit a fixture for your own incident, compare rule changes between Git refs, and add the same check to CI. Detailed examples are available in Korean. [Capture an incident](#내-prometheus로-실행) · [Raw metric snapshot](#원본-시계열-스냅샷) · [Inspect sample gaps](#시계열-표본-간격-확인) · [Alertmanager webhook](#alertmanager-웹훅으로-기대-동작-만들기) · [Native Prometheus rules](#룰-변경-전후-비교) · [Git ref comparison](#git-커밋으로-비교) · [Kubernetes PrometheusRule](#kubernetes-prometheusrule로-테스트) · [GitHub Action](#github-actions에서-pr-검사)
+Commit a fixture for your own incident, compare rule changes between Git refs, and add the same check to CI. Detailed examples are available in Korean. [Capture an incident](#내-prometheus로-실행) · [Plan capture selectors](#캡처할-시계열-계획) · [Raw metric snapshot](#원본-시계열-스냅샷) · [Inspect sample gaps](#시계열-표본-간격-확인) · [Alertmanager webhook](#alertmanager-웹훅으로-기대-동작-만들기) · [Native Prometheus rules](#룰-변경-전후-비교) · [Git ref comparison](#git-커밋으로-비교) · [Kubernetes PrometheusRule](#kubernetes-prometheusrule로-테스트) · [GitHub Action](#github-actions에서-pr-검사)
 
 ### Install the CLI from GitHub
 
@@ -219,6 +219,26 @@ python3 incident_to_promtool.py incident.json --prometheus-url http://localhost:
 `"30s"`처럼 간격을 직접 지정하면 평가 간격은 그 배수여야 하며, 기본 변환은 표본 시각이 격자에 맞아야 합니다. 명시적으로 `--round-up`을 쓰면 표본을 다음 격자로 미루고 최대 이동 시간을 표시합니다. 이때 `end`도 격자에 맞춰야 하고, 같은 시계열의 두 타임스탬프가 한 칸에 들어가면 더 촘촘한 간격이 필요합니다.
 
 입력은 유한한 스칼라 표본입니다. Prometheus 원본 조회 API는 stale 표식을 제외하므로, `absent()`처럼 시계열이 stale 상태가 된 시각에 의존하는 룰은 이 방식으로 정확히 재현하기 어렵습니다.
+
+### 캡처할 시계열 계획
+
+`plan-capture`는 알람 룰에 필요한 원본 시계열 선택자를 찾아줍니다. 저장소 루트의 Python 가상 환경에서 실행합니다.
+
+```sh
+python3 -m pip install '.[planner]'
+python3 incident_to_promtool.py plan-capture demo/after.rules.yml \
+  --alertname PaymentErrorsHigh --prometheus-url http://localhost:9090
+```
+
+Prometheus 룰 YAML은 위치 인자로 여러 개 지정할 수 있습니다. Prometheus와 같이 각 파일의 첫 문서를 읽습니다. 알람이 여러 개면 `--alertname`을 반복합니다. Kubernetes `PrometheusRule`은 [`export-rules`](#kubernetes-prometheusrule로-테스트)로 변환한 YAML을 입력으로 사용합니다.
+
+이 명령은 PromQL 식을 Prometheus 3.x의 실험적 `/api/v1/parse_query`에 보내 구문을 분석합니다. Prometheus 3.9와 3.11에서 확인했으며, Bearer 인증에는 `PROMETHEUS_BEARER_TOKEN`을 사용합니다. 시계열 표본 조회는 이후 캡처 단계에서 실행합니다. [Prometheus 구문 분석 API](https://prometheus.io/docs/prometheus/latest/querying/api/#parsing-a-promql-expressions-into-a-abstract-syntax-tree-ast)
+
+출력은 `schema_version`이 `1`인 JSON으로, 요청한 `alertnames`, 따라간 `recording_rules`, 캡처할 `selectors`를 담습니다. `selectors` 배열을 장애 설정에 복사하세요. 상수식처럼 원본 시계열이 필요 없는 룰의 `selectors`는 빈 배열입니다. 룰 변경 전후에 참조하는 시계열이 달라지면 두 버전에서 얻은 선택자를 합쳐서 캡처하세요.
+
+기록 룰을 참조하면 입력 파일에서 같은 이름의 메트릭을 생성하는 룰을 모두 따라갑니다. 예를 들어 `foo{service="pay"}`가 `bar{job="api"}`를 읽는 기록 룰 `foo`를 참조하면 `bar{job="api"}`를 제안합니다. 입력에서 빠진 기록 룰의 출력은 캡처 대상 메트릭으로 남습니다.
+
+메트릭 이름이 없거나 하나로 확정되지 않는 선택자, `info()`, 순환 의존성, 내부 알람 상태 시계열은 오류로 처리합니다. 캡처의 `start`와 `end`는 범위 벡터와 하위 쿼리에 필요한 사전 구간, `offset`, `@`, 그룹의 `query_offset`, 알람의 `for`를 고려해 직접 정하세요.
 
 ### 원본 시계열 스냅샷
 

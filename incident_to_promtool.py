@@ -190,9 +190,13 @@ def rule_test_cases(expectations, window, evaluation, config_dir):
     return tests
 
 
-def fetch_matrix(base_url, selector, end, window):
-    params = urlencode({"query": f"{selector}[{as_duration(window + 1)}]", "time": end.isoformat()})
-    request = Request(f"{base_url}/api/v1/query?{params}", headers={"Accept": "application/json"})
+def prometheus_json(base_url, endpoint, params, *, post=False):
+    form = urlencode(params)
+    url = f"{base_url}/api/v1/{endpoint}"
+    request = Request(
+        url if post else f"{url}?{form}", data=form.encode("ascii") if post else None,
+        headers={"Accept": "application/json"},
+    )
     token = os.environ.get("PROMETHEUS_BEARER_TOKEN")
     if token:
         # urllib does not copy unredirected headers to a subsequent request.
@@ -201,18 +205,40 @@ def fetch_matrix(base_url, selector, end, window):
         with urlopen(request, timeout=30) as response:
             return json.load(response, parse_float=Decimal)
     except HTTPError as exc:
-        raise ValueError(f"Prometheus returned HTTP {exc.code}") from exc
+        message = f"Prometheus returned HTTP {exc.code} for /api/v1/{endpoint}"
+        with exc, suppress(ValueError, OSError):
+            error = json.loads(exc.read(4096))
+            if isinstance(error, dict) and isinstance(error.get("error"), str):
+                message += f": {error['error']}"
+        raise ValueError(message) from exc
     except URLError as exc:
         raise ValueError(f"Prometheus request failed: {exc.reason}") from exc
+
+
+def prometheus_base_url(value):
+    base_url = value.rstrip("/")
+    url = urlsplit(base_url)
+    if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password or url.query or url.fragment:
+        raise ValueError("use an HTTP(S) Prometheus base URL without credentials, query, or fragment")
+    return base_url
+
+
+def fetch_matrix(base_url, selector, end, window):
+    params = {"query": f"{selector}[{as_duration(window + 1)}]", "time": end.isoformat()}
+    return prometheus_json(base_url, "query", params)
+
+
+def fetch_promql_ast(base_url, expression):
+    response = prometheus_json(base_url, "parse_query", {"query": expression}, post=True)
+    if not isinstance(response, dict) or response.get("status") != "success" or response.get("warnings"):
+        raise ValueError("Prometheus could not parse the expression through /api/v1/parse_query")
+    return response.get("data")
 
 
 def capture_matrices(args, config, end, window):
     if args.matrix:
         return (read_json(path) for path in args.matrix)
-    base_url = args.prometheus_url.rstrip("/")
-    url = urlsplit(base_url)
-    if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password or url.query or url.fragment:
-        raise ValueError("use an HTTP(S) Prometheus base URL without credentials, query, or fragment")
+    base_url = prometheus_base_url(args.prometheus_url)
     selectors = config["selectors"]
     if not isinstance(selectors, list) or not selectors or any(
         not isinstance(selector, str) or not selector or not SELECTOR.fullmatch(selector)
@@ -994,6 +1020,28 @@ def add_capture_source_options(parser):
     source.add_argument("--matrix", type=Path, action="append", help="read a saved raw query response (repeatable)")
 
 
+def plan_capture_main(argv):
+    parser = argparse.ArgumentParser(
+        prog=f"{Path(sys.argv[0]).name} plan-capture",
+        description="Find candidate raw metric selectors for alerts and their recording-rule dependencies.",
+    )
+    parser.add_argument("rules", metavar="rule-file", nargs="+", type=Path, help="native Prometheus rule files")
+    parser.add_argument("--alertname", required=True, action="append", help="alert rule name (repeatable)")
+    parser.add_argument("--prometheus-url", required=True, help="Prometheus server providing /api/v1/parse_query")
+    args = parser.parse_args(argv)
+    if any(not name.strip() for name in args.alertname):
+        parser.error("--alertname must not be empty")
+    from capture_planner import plan_capture
+
+    try:
+        base_url = prometheus_base_url(args.prometheus_url)
+        sources = read_rule_sources(args.rules)
+        report = plan_capture(sources, args.alertname, lambda expression: fetch_promql_ast(base_url, expression))
+    except (ValueError, TypeError, KeyError, OSError, RecursionError) as exc:
+        parser.exit(2, f"error: {exc}\n")
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+
+
 def snapshot_main(argv):
     parser = argparse.ArgumentParser(
         prog=f"{Path(sys.argv[0]).name} snapshot",
@@ -1048,6 +1096,8 @@ def inspect_main(argv):
 
 
 def main():
+    if sys.argv[1:2] == ["plan-capture"]:
+        return plan_capture_main(sys.argv[2:])
     if sys.argv[1:2] == ["snapshot"]:
         return snapshot_main(sys.argv[2:])
     if sys.argv[1:2] == ["inspect"]:
@@ -1057,8 +1107,9 @@ def main():
     if sys.argv[1:2] == ["export-rules"]:
         return export_rules_main(sys.argv[2:])
     parser = argparse.ArgumentParser(
-        description=__doc__, epilog="See snapshot --help for sample capture, inspect --help for sample coverage, "
-        "compare --help for rule comparisons, or export-rules --help for Kubernetes manifests."
+        description=__doc__, epilog="See plan-capture --help for metric selectors, snapshot --help for sample capture, "
+        "inspect --help for sample coverage, compare --help for rule comparisons, "
+        "or export-rules --help for Kubernetes manifests."
     )
     parser.add_argument("config", type=Path, help="incident window and expected alert states (JSON)")
     add_capture_source_options(parser)

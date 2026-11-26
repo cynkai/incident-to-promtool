@@ -7,8 +7,8 @@ RULE_LIST_GVK = (API_VERSION, "PrometheusRuleList")
 LIST_GVK = ("v1", "List")
 
 
-def _manifest_loader(yaml):
-    class ManifestLoader(yaml.SafeLoader):
+def rules_yaml_loader(yaml, *, preserve_scalars=False):
+    class RulesLoader(yaml.SafeLoader):
         def __init__(self, stream):
             super().__init__(stream)
             self.flattened = set()
@@ -49,7 +49,13 @@ def _manifest_loader(yaml):
                 self.flattening.remove(node)
             self.flattened.add(node)
 
-    return ManifestLoader
+    if preserve_scalars:
+        # Prometheus reads rule expressions and names as scalar text, including YAML words like 'on'.
+        RulesLoader.yaml_implicit_resolvers = {
+            character: [(tag, pattern) for tag, pattern in resolvers if tag == "tag:yaml.org,2002:merge"]
+            for character, resolvers in RulesLoader.yaml_implicit_resolvers.items()
+        }
+    return RulesLoader
 
 
 def _gvk(resource, location):
@@ -123,7 +129,7 @@ def convert_manifests(sources: list[tuple[str, bytes]]) -> list[bytes]:
             "Install it with: python3 -m pip install 'PyYAML>=6,<7'"
         ) from exc
 
-    loader = _manifest_loader(yaml)
+    loader = rules_yaml_loader(yaml)
     rule_files = []
     found_groups = False
     for source, content in sources:

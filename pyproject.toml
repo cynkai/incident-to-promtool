@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 
 [project.optional-dependencies]
 kubernetes = ["PyYAML>=6,<7"]
+planner = ["PyYAML>=6,<7"]
 
 [project.scripts]
 incident-to-promtool = "incident_to_promtool:main"
@@ -20,4 +21,4 @@ Repository = "https://github.com/cynkai/incident-to-promtool"
 Issues = "https://github.com/cynkai/incident-to-promtool/issues"
 
 [tool.setuptools]
-py-modules = ["incident_to_promtool", "kubernetes_rules"]
+py-modules = ["incident_to_promtool", "kubernetes_rules", "capture_planner"]
