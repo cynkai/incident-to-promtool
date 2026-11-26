@@ -31,10 +31,7 @@ SELECTOR = re.compile(r'(?:[a-zA-Z_:][a-zA-Z0-9_:]*)?(?:\{(?:[^{}"\\]|"(?:[^"\\]
 FLOAT = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", re.ASCII)
 ALERT_MISMATCH = re.compile(r"\A[ \t]*alertname: (.+), time: ([^,\n]+),[ \t]*\n[ \t]*exp:")
 MAX_VALUES = 2_000_000
-
-
-class FixtureTooLargeError(ValueError):
-    pass
+MAX_PROMTOOL_DURATION_MS = (2**63 - 1) // 1_000_000
 
 
 def duration_ms(value):
@@ -192,6 +189,51 @@ def infer_sample_interval(samples_by_series, evaluation):
     return step
 
 
+def ceil_div(numerator, denominator):
+    return (numerator + denominator - 1) // denominator
+
+
+def slots_fit_shift(offsets, step, max_shift):
+    previous_slot = -1
+    for offset in offsets:
+        slot = ceil_div(offset, step)
+        if slot == previous_slot or slot * step - offset > max_shift:
+            return False
+        previous_slot = slot
+    return True
+
+
+def bounded_sample_interval(samples_by_series, evaluation, window, exact_step, max_shift):
+    remaining_slots = MAX_VALUES - len(samples_by_series)
+    if remaining_slots <= 0 or sum(map(len, samples_by_series.values())) > MAX_VALUES:
+        return None
+    offsets_by_series = [sorted(samples) for samples in samples_by_series.values()]
+    last_offsets = [offsets[-1] for offsets in offsets_by_series]
+    # The sum of rounded end slots cannot be smaller than sum(offsets) / step.
+    smallest = max(exact_step + 1, ceil_div(sum(last_offsets), remaining_slots))
+    if smallest > window:
+        return None
+
+    candidates = []
+    for divisor in range(1, min(window, math.isqrt(evaluation)) + 1):
+        complement, remainder = divmod(evaluation, divisor)
+        if remainder == 0:
+            if smallest <= divisor <= window:
+                candidates.append(divisor)
+            if complement != divisor and smallest <= complement <= window:
+                candidates.append(complement)
+
+    latest = max(last_offsets)
+    for step in sorted(candidates):
+        if ceil_div(latest, step) * step > window:
+            continue
+        if sum(ceil_div(last, step) for last in last_offsets) > remaining_slots:
+            continue
+        if all(slots_fit_shift(offsets, step, max_shift) for offsets in offsets_by_series):
+            return step
+    return None
+
+
 def encode_samples(samples_by_series, step, round_up):
     records = []
     largest_shift = 0
@@ -200,15 +242,15 @@ def encode_samples(samples_by_series, step, round_up):
         values = []
         next_slot = 0
         for offset, value in sorted(samples.items()):
-            slot, remainder = divmod(offset, step)
-            if remainder:
+            slot = ceil_div(offset, step)
+            delay = slot * step - offset
+            if delay:
                 if not round_up:
                     raise ValueError(
                         f"a sample is off the {as_duration(step)} grid; "
                         'set sample_interval to "auto", choose a finer interval, or rerun with --round-up'
                     )
-                largest_shift = max(largest_shift, step - remainder)
-                slot += 1
+                largest_shift = max(largest_shift, delay)
             missing = slot - next_slot
             if missing < 0:
                 raise ValueError("multiple samples land in one fixture slot; choose a finer sample_interval")
@@ -218,13 +260,33 @@ def encode_samples(samples_by_series, step, round_up):
             next_slot = slot + 1
         expanded_slots += next_slot
         if expanded_slots > MAX_VALUES:
-            raise FixtureTooLargeError(f"capture exceeds {MAX_VALUES:,} fixture slots; narrow the window or selectors")
+            raise ValueError(f"capture exceeds {MAX_VALUES:,} fixture slots; narrow the window or selectors")
         records.append({"series": name, "values": " ".join(values)})
     return records, largest_shift
 
 
 def collect_series(matrices, start, end, step, round_up):
     return encode_samples(capture_samples(matrices, start, end), step, round_up)
+
+
+def encode_automatic_samples(samples, evaluation, window, max_shift):
+    exact_step = infer_sample_interval(samples, evaluation)
+    step = exact_step
+    exact_slots = sum(max(series) // exact_step + 1 for series in samples.values())
+    if exact_slots > MAX_VALUES:
+        if not max_shift:
+            raise ValueError(
+                f"automatic {as_duration(exact_step)} sample interval exceeds {MAX_VALUES:,} fixture slots; "
+                "use a shorter capture window, narrow the selectors, or allow bounded rounding with --max-shift"
+            )
+        step = bounded_sample_interval(samples, evaluation, window, exact_step, max_shift)
+        if step is None:
+            raise ValueError(
+                f"no automatic interval fits {MAX_VALUES:,} fixture slots with --max-shift {as_duration(max_shift)} "
+                "while keeping distinct samples within the capture window; use a shorter window or narrower selectors"
+            )
+    records, shift = encode_samples(samples, step, round_up=step != exact_step)
+    return records, shift, step
 
 
 def generate(args):
@@ -237,6 +299,11 @@ def generate(args):
     step = evaluation if automatic else duration_ms(config["sample_interval"])
     if window <= 0 or step <= 0 or evaluation <= 0 or evaluation % step:
         raise ValueError("end must follow start and evaluation_interval must be a positive multiple of sample_interval")
+    if evaluation > MAX_PROMTOOL_DURATION_MS:
+        raise ValueError("evaluation_interval exceeds promtool's supported duration")
+    if args.max_shift is not None and not automatic:
+        raise ValueError('--max-shift requires sample_interval to be "auto"')
+    max_shift = duration_ms(args.max_shift) if args.max_shift is not None else 0
     if args.round_up and not automatic and window % step:
         raise ValueError("with --round-up, end must fall on the sample grid")
 
@@ -269,14 +336,7 @@ def generate(args):
 
     if automatic:
         samples = capture_samples(matrices, begin_ms, end_ms)
-        step = infer_sample_interval(samples, evaluation)
-        try:
-            records, shift = encode_samples(samples, step, round_up=False)
-        except FixtureTooLargeError as exc:
-            raise ValueError(
-                f"automatic {as_duration(step)} sample interval exceeds {MAX_VALUES:,} fixture slots; "
-                "use a shorter capture window, narrow the selectors, or set a numeric sample_interval with --round-up"
-            ) from exc
+        records, shift, step = encode_automatic_samples(samples, evaluation, window, max_shift)
     else:
         records, shift = collect_series(matrices, begin_ms, end_ms, step, args.round_up)
     fixture = {
@@ -663,6 +723,7 @@ def main():
     source.add_argument("--matrix", type=Path, action="append", help="read a saved raw query response (repeatable)")
     parser.add_argument("--rule-file", type=Path, action="append", help="override config rule_files (repeatable)")
     parser.add_argument("--round-up", action="store_true", help="shift off-grid samples with a numeric sample interval")
+    parser.add_argument("--max-shift", metavar="DURATION", help="allow bounded forward shifts if the exact auto grid is too large")
     parser.add_argument("--output", required=True, type=Path, help="new promtool YAML test file")
     args = parser.parse_args()
     try:
