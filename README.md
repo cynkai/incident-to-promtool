@@ -282,6 +282,25 @@ Alertmanager 웹훅을 사용했다면 기대 동작에 쓰는 라벨과 주석�
 
 압축을 푼 디렉터리에서 같은 버전의 CLI로 `incident.json`과 `incident.matrix.json`을 읽으면 테스트를 바이트 단위로 다시 생성할 수 있습니다. 출력은 같은 디렉터리 안에 새 파일로 지정하고, 생성에 사용한 옵션은 `capture.json`의 `generation_options`에 기록된 그대로 전달합니다.
 
+#### 번들에서 룰 변경 비교
+
+`compare-bundle`은 ZIP에서 테스트와 기준 Prometheus 룰을 바로 읽습니다. 번들 내부 `capture.json`에 기록된 테스트의 SHA-256을 확인하고, 같은 테스트로 기준 룰과 수정 룰을 비교합니다. 기존 `bundle` 명령으로 만든 ZIP도 사용할 수 있습니다.
+
+```sh
+mkdir -p demo/generated
+python3 incident_to_promtool.py bundle demo/alertmanager.incident.json \
+  --matrix demo/incident.matrix.json --rule-file demo/before.rules.yml \
+  --output demo/generated/payment-baseline.zip
+python3 incident_to_promtool.py compare-bundle demo/generated/payment-baseline.zip \
+  --after demo/after.rules.yml --json-report demo/generated/payment-comparison.json
+```
+
+결제 예제에서 기준 룰은 검사 2개 중 1개를 충족하고, 수정 룰은 2개 모두 충족합니다. 수정 룰 파일이 여러 개면 `--after`를 반복합니다. 수정 룰이 Kubernetes `PrometheusRule`이면 `--rule-format kubernetes`를 추가합니다. ZIP의 기준 룰은 Prometheus 룰 형식으로 읽습니다.
+
+Markdown은 표준 출력으로 보내고, `--json-report`를 지정하면 JSON도 저장합니다. 게이트는 `compare`와 같은 `strict`와 `regressions`를 지원합니다. 종료 코드는 게이트 통과 `0`, 게이트 실패 `1`, 입력 또는 실행 오류 `2`입니다. [룰 변경 전후 비교](#룰-변경-전후-비교)
+
+JSON 리포트의 `bundle`에는 ZIP 경로 `path`와 ZIP 내부의 기준 룰 경로 목록 `rule_files`가 들어갑니다. `fixtures` 항목의 `path`와 `capture_summary`는 각각 `ZIP!incident.test.yml`, `ZIP!capture.json` 형식입니다.
+
 ### 시계열 표본 간격 확인
 
 `inspect`는 캡처 구간에서 관측된 시계열별로 표본 수, 첫 표본과 마지막 표본의 UTC 시각, 구간 양끝의 공백, 연속된 두 표본 사이의 최장 간격을 보고합니다. 간격은 실제 표본 시각으로 계산합니다. 기본 출력은 Markdown이고, `--format json`은 간격의 시작과 끝도 기록합니다.

@@ -14,6 +14,7 @@ import os
 from pathlib import Path, PureWindowsPath
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from tempfile import NamedTemporaryFile, TemporaryDirectory
@@ -21,7 +22,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree
-from zipfile import ZIP_DEFLATED, ZipFile
+from zipfile import ZIP_DEFLATED, BadZipFile, ZipFile
+import zlib
 
 
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
@@ -35,6 +37,9 @@ FLOAT = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", re.ASCII)
 ALERT_MISMATCH = re.compile(r"\A[ \t]*alertname: (.+), time: ([^,\n]+),[ \t]*\n[ \t]*exp:")
 MAX_VALUES = 2_000_000
 MAX_PROMTOOL_DURATION_MS = (2**63 - 1) // 1_000_000
+BUNDLE_FIXTURE = "incident.test.yml"
+BUNDLE_CAPTURE_SUMMARY = "capture.json"
+BUNDLE_RULE_PATH = re.compile(r"rules/rules-[1-9][0-9]*\.yml")
 
 
 def duration_ms(value):
@@ -587,18 +592,18 @@ def write_bundle(args):
             (directory / portable).write_bytes(original.read_bytes())
 
         prepared = prepare_capture(args, config, rule_files)
-        summary = write_capture_fixture(directory / "incident.test.yml", prepared, relative=True)
+        summary = write_capture_fixture(directory / BUNDLE_FIXTURE, prepared, relative=True)
         generation_options = ["--round-up"] if args.round_up else []
         if args.max_shift is not None:
             generation_options.extend(("--max-shift", args.max_shift))
         summary["generation_options"] = generation_options
-        write_new_json(directory / "capture.json", summary)
+        write_new_json(directory / BUNDLE_CAPTURE_SUMMARY, summary)
         write_new_json(directory / "incident.json", offline_incident_config(prepared, config["sample_interval"]))
         write_matrix_snapshot(directory / "incident.matrix.json", prepared.samples, prepared.begin_ms)
         coverage = build_coverage_report(prepared.samples, prepared.start, prepared.end, None)
         write_new_json(directory / "coverage.json", coverage)
 
-        entries = ["incident.json", "incident.matrix.json", "incident.test.yml", "capture.json", "coverage.json", *rule_files]
+        entries = ["incident.json", "incident.matrix.json", BUNDLE_FIXTURE, BUNDLE_CAPTURE_SUMMARY, "coverage.json", *rule_files]
         with new_output_file(args.output, "w+b") as output:
             with ZipFile(output, "w", compression=ZIP_DEFLATED) as archive:
                 for name in entries:
@@ -643,11 +648,11 @@ def read_committed_rules(repo, revision, paths):
 
 @dataclass(frozen=True)
 class ReplayFixture:
-    path: Path
+    path: Path | str
     data: dict
     checkpoint_keys: list[set[tuple[str, int]]]
     sha256: str | None
-    capture_summary: Path | None
+    capture_summary: Path | str | None
 
     @property
     def checkpoints(self):
@@ -706,6 +711,11 @@ def capture_summary_digest(path, contents):
     return digest.lower()
 
 
+def verify_capture_summary(path, checksum, summary, summary_bytes):
+    if capture_summary_digest(summary, summary_bytes) != checksum:
+        raise ValueError(f"{path}: fixture SHA-256 does not match capture summary {summary}")
+
+
 def load_replay_fixtures(paths, summaries, repo, commit):
     identities = {path.as_posix() if commit else os.path.realpath(path, strict=True) for path in paths}
     if len(identities) != len(paths):
@@ -716,10 +726,44 @@ def load_replay_fixtures(paths, summaries, repo, commit):
         checksum = hashlib.sha256(contents).hexdigest() if commit or summary is not None else None
         if summary is not None:
             summary_bytes = read_replay_bytes(summary, repo, commit, "capture summary")
-            if capture_summary_digest(summary, summary_bytes) != checksum:
-                raise ValueError(f"{path}: fixture SHA-256 does not match capture summary {summary}")
+            verify_capture_summary(path, checksum, summary, summary_bytes)
         fixtures.append(load_replay_fixture(path, contents, checksum, summary))
     return fixtures
+
+
+def read_bundle_member(archive, path, name):
+    try:
+        entry = archive.getinfo(name)
+    except KeyError as exc:
+        raise ValueError(f"{path}: missing ZIP member {name!r}") from exc
+    kind = stat.S_IFMT(entry.external_attr >> 16) if entry.create_system == 3 else 0
+    if entry.orig_filename != name or entry.is_dir() or entry.external_attr & 0x10 or kind not in (0, stat.S_IFREG):
+        raise ValueError(f"{path}: ZIP member {name!r} must be a regular file")
+    return archive.read(entry)
+
+
+def load_bundle_replay(path):
+    fixture_path = f"{path}!{BUNDLE_FIXTURE}"
+    summary_path = f"{path}!{BUNDLE_CAPTURE_SUMMARY}"
+    try:
+        with ZipFile(path) as archive:
+            names = archive.namelist()
+            if len(names) != len(set(names)):
+                raise ValueError(f"{path}: ZIP archive contains duplicate member names")
+            contents = read_bundle_member(archive, path, BUNDLE_FIXTURE)
+            summary = read_bundle_member(archive, path, BUNDLE_CAPTURE_SUMMARY)
+            checksum = hashlib.sha256(contents).hexdigest()
+            verify_capture_summary(fixture_path, checksum, summary_path, summary)
+            fixture = load_replay_fixture(fixture_path, contents, checksum, summary_path)
+            rule_paths = fixture.data.get("rule_files")
+            if not isinstance(rule_paths, list) or not rule_paths or any(
+                not isinstance(name, str) or not BUNDLE_RULE_PATH.fullmatch(name) for name in rule_paths
+            ) or len(rule_paths) != len(set(rule_paths)):
+                raise ValueError(f"{fixture_path}: rule_files must list distinct bundled paths such as 'rules/rules-1.yml'")
+            rules = [read_bundle_member(archive, path, name) for name in rule_paths]
+    except (BadZipFile, EOFError, RuntimeError, zlib.error) as exc:
+        raise ValueError(f"{path}: could not read the incident bundle ZIP: {exc}") from exc
+    return fixture, rules, {"path": str(path), "rule_files": rule_paths}
 
 
 def identify_alert_mismatches(fixture, cases):
@@ -933,6 +977,8 @@ def print_markdown_report(report):
         print(f"Compared Git commits `{commits['before']}` and `{commits['after']}` (before and after).\n")
     if fixture_commit := report.get("fixture_commit"):
         print(f"Loaded fixtures from Git commit `{fixture_commit}`.\n")
+    if bundle := report.get("bundle"):
+        print(f"Loaded the baseline rules and fixture from bundle {markdown_code(bundle['path'])}.\n")
     if "capture_summary" in fixtures[0]:
         print(f"Verified SHA-256 against capture summaries for {len(fixtures)} fixture(s).\n")
     gate = report["gate"]
@@ -974,7 +1020,7 @@ def print_markdown_report(report):
             print(f"\n{fence}text\n{details}\n{fence}")
 
 
-def compare(fixtures, before, after, executable, revisions, gate, json_report, fixture_commit):
+def compare(fixtures, before, after, executable, revisions, gate, json_report, fixture_commit, *, bundle=None):
     promtool = shutil.which(executable)
     if not promtool:
         raise ValueError(f"promtool executable not found: {executable}")
@@ -985,6 +1031,8 @@ def compare(fixtures, before, after, executable, revisions, gate, json_report, f
         after_failures = test_rule_version(promtool, fixtures, after, path / "after")
 
     report = build_comparison_report(fixtures, before_failures, after_failures, revisions, gate, fixture_commit)
+    if bundle is not None:
+        report["bundle"] = bundle
     if json_report is not None:
         try:
             write_new_json(json_report, report)
@@ -992,6 +1040,23 @@ def compare(fixtures, before, after, executable, revisions, gate, json_report, f
             raise ValueError(f"JSON report already exists: {json_report}") from exc
     print_markdown_report(report)
     return int(not report["gate"]["passed"])
+
+
+def add_comparison_report_options(parser):
+    parser.add_argument("--promtool", default="promtool", help="promtool executable or path")
+    parser.add_argument("--json-report", type=Path, help="also write a machine-readable report to this new path")
+    parser.add_argument(
+        "--gate", choices=("strict", "regressions"), default="strict",
+        help="fail on any proposed mismatch or only on newly failing checkpoints (default: strict)",
+    )
+
+
+def comparison_rule_bytes(sources, rule_format):
+    if rule_format == "kubernetes":
+        from kubernetes_rules import convert_manifests
+
+        return convert_manifests(sources)
+    return [content for _, content in sources]
 
 
 def compare_main(argv):
@@ -1015,12 +1080,7 @@ def compare_main(argv):
         "--rule-format", choices=("prometheus", "kubernetes"), default="prometheus",
         help="input rule format for both versions (default: prometheus)",
     )
-    parser.add_argument("--promtool", default="promtool", help="promtool executable or path")
-    parser.add_argument("--json-report", type=Path, help="also write a machine-readable report to this new path")
-    parser.add_argument(
-        "--gate", choices=("strict", "regressions"), default="strict",
-        help="fail on any proposed mismatch or only on newly failing checkpoints (default: strict)",
-    )
+    add_comparison_report_options(parser)
     args = parser.parse_args(argv)
     git_mode = any(value is not None for value in (args.before_ref, args.after_ref, args.rule_file, args.repo))
     if args.fixture_ref is not None and not git_mode:
@@ -1048,16 +1108,35 @@ def compare_main(argv):
             before = read_rule_sources(args.before)
             after = read_rule_sources(args.after)
         fixtures = load_replay_fixtures(args.fixtures, args.capture_summary, repo, fixture_commit)
-        if args.rule_format == "kubernetes":
-            from kubernetes_rules import convert_manifests
-
-            before_rules, after_rules = convert_manifests(before), convert_manifests(after)
-        else:
-            before_rules = [content for _, content in before]
-            after_rules = [content for _, content in after]
+        before_rules = comparison_rule_bytes(before, args.rule_format)
+        after_rules = comparison_rule_bytes(after, args.rule_format)
         return compare(
             fixtures, before_rules, after_rules, args.promtool, revisions=revisions,
             gate=args.gate, json_report=args.json_report, fixture_commit=fixture_commit,
+        )
+    except (OSError, ValueError, TypeError) as exc:
+        parser.exit(2, f"error: {exc}\n")
+
+
+def compare_bundle_main(argv):
+    parser = argparse.ArgumentParser(
+        prog=f"{Path(sys.argv[0]).name} compare-bundle",
+        description="Compare proposed rules with an incident bundle's archived baseline and fixture.",
+    )
+    parser.add_argument("bundle", type=Path, help="ZIP archive created with bundle")
+    parser.add_argument("--after", required=True, type=Path, action="append", help="proposed rule file (repeatable)")
+    parser.add_argument(
+        "--rule-format", choices=("prometheus", "kubernetes"), default="prometheus",
+        help="input format of the proposed rule files (default: prometheus)",
+    )
+    add_comparison_report_options(parser)
+    args = parser.parse_args(argv)
+    try:
+        fixture, before, bundle = load_bundle_replay(args.bundle)
+        after = comparison_rule_bytes(read_rule_sources(args.after), args.rule_format)
+        return compare(
+            [fixture], before, after, args.promtool, revisions=None,
+            gate=args.gate, json_report=args.json_report, fixture_commit=None, bundle=bundle,
         )
     except (OSError, ValueError, TypeError) as exc:
         parser.exit(2, f"error: {exc}\n")
@@ -1212,12 +1291,14 @@ def main():
         return inspect_main(sys.argv[2:])
     if sys.argv[1:2] == ["compare"]:
         return compare_main(sys.argv[2:])
+    if sys.argv[1:2] == ["compare-bundle"]:
+        return compare_bundle_main(sys.argv[2:])
     if sys.argv[1:2] == ["export-rules"]:
         return export_rules_main(sys.argv[2:])
     parser = argparse.ArgumentParser(
         description=__doc__, epilog="See bundle --help for portable captures, plan-capture --help for metric selectors, "
         "snapshot --help for sample capture, "
-        "inspect --help for sample coverage, compare --help for rule comparisons, "
+        "inspect --help for sample coverage, compare --help and compare-bundle --help for rule comparisons, "
         "or export-rules --help for Kubernetes manifests."
     )
     parser.add_argument("config", type=Path, help="incident window and expected alert states (JSON)")

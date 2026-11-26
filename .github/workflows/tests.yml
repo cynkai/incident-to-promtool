@@ -84,6 +84,25 @@ jobs:
 
           "$cli" bundle "$demo/alertmanager.incident.json" --matrix "$demo/incident.matrix.json" \
             --output payment.zip
+          bundle_status=0
+          "$cli" compare-bundle payment.zip --after "$demo/before.rules.yml" \
+            --promtool "$RUNNER_TEMP/promtool" --gate regressions --json-report bundle-regression.json \
+            > bundle-regression.md || bundle_status=$?
+          [[ "$bundle_status" -eq 1 ]]
+          "$smoke/venv/bin/python" - <<'PY'
+          import json
+          from pathlib import Path
+
+          report = json.loads(Path("bundle-regression.json").read_text(encoding="utf-8"))
+          assert report["bundle"] == {"path": "payment.zip", "rule_files": ["rules/rules-1.yml"]}
+          assert report["gate"] == {"mode": "regressions", "passed": False}
+          assert report["summary"]["before"] == {"matched": 2, "total": 2}
+          assert report["summary"]["after"] == {"matched": 1, "total": 2}
+          assert report["summary"]["newly_failed"] == 1
+          fixture, = report["fixtures"]
+          assert fixture["path"] == "payment.zip!incident.test.yml"
+          PY
+
           "$smoke/venv/bin/python" -m zipfile --extract payment.zip payment-bundle
           cd payment-bundle
           "$RUNNER_TEMP/promtool" test rules incident.test.yml
