@@ -39,6 +39,21 @@ python3 incident_to_promtool.py compare demo/generated/after.test.yml \
 
 리포트에는 게이트 결과와 새로 실패한 검사(`Newly failed`), 다시 통과한 검사(`Fixed`), 여전히 실패하는 검사(`Still failing`)가 표시됩니다. `regressions`에서 게이트를 통과해도 기존 실패는 리포트에 남습니다. 종료 코드는 게이트 통과 `0`, 게이트 실패 `1`, 입력 또는 `promtool` 실행 오류 `2`입니다. 실행 오류는 두 모드 모두 로그에 표시됩니다.
 
+### JSON 리포트
+
+자동화에서 비교 결과를 읽으려면 `--json-report`를 추가합니다. JSON 출력은 새 경로를 지정합니다. 종료 코드 `0`과 `1`에서 JSON이 기록되고, 입력이나 실행 오류(`2`)가 발생하면 JSON 파일은 생성되지 않습니다.
+
+```sh
+python3 incident_to_promtool.py compare demo/generated/after.test.yml \
+  --before demo/before.rules.yml --after demo/after.rules.yml \
+  --json-report demo/generated/review.json > demo/generated/review.md
+```
+
+- `schema_version`은 `1`입니다. `gate`에는 모드 `mode`와 통과 여부 `passed`가 들어갑니다.
+- `commits`는 Git 비교의 `{before, after}` 커밋 ID이며 파일 경로로 비교할 때는 `null`입니다.
+- `summary`에는 `before`와 `after`의 `{matched, total}` 및 `newly_failed`, `fixed`, `still_failing` 건수가 들어갑니다.
+- `fixtures`는 `path`, `before`, `after`, `changes`를 담은 배열입니다. 각 `changes` 항목은 `group`(1부터 시작), `alertname`, `offset_ms`(테스트 시작 기준), `change`, `before_diagnostic`, `after_diagnostic`를 포함합니다. `change`는 `newly_failed`, `fixed`, `still_failing` 중 하나이며, 해당 버전에서 조건을 충족한 경우 진단값은 `null`입니다.
+
 ### Git 커밋으로 비교
 
 두 Git ref를 지정하면 현재 체크아웃을 유지한 채 각 커밋에서 룰을 읽습니다. Markdown 리포트에는 확정된 두 커밋 ID가 들어가며 종료 코드는 파일 경로로 비교할 때와 같습니다.
@@ -93,7 +108,9 @@ jobs:
 | `gate` | `strict`. 새로 실패한 검사만 단계 실패로 처리하려면 `with`에 `gate: regressions`를 지정합니다. |
 | `promtool-path` | 생략하면 Linux x64에서 고정된 Promtool 3.11.0을 설치합니다. 기존 실행 파일은 작업 디렉터리 기준 경로나 `PATH`에 있는 명령으로 지정합니다. |
 
-`kubernetes` 모드는 PyYAML 6.0.3을 격리된 가상 환경에 설치합니다. 비교 결과는 실행 요약에 표시되며 Markdown 파일 경로를 `steps.compare.outputs.report-path`로 제공합니다. 게이트를 통과하지 못해도 리포트를 남긴 뒤 단계가 실패합니다. 입력이나 실행 오류는 단계 로그에만 표시됩니다.
+`kubernetes` 모드는 PyYAML 6.0.3을 격리된 가상 환경에 설치합니다. 완료된 비교는 실행 요약을 남기며 `steps.compare.outputs.report-path`로 Markdown 경로, `steps.compare.outputs.json-report-path`로 JSON 경로, `steps.compare.outputs.newly-failed`로 새로 실패한 검사 건수(문자열)를 제공합니다. 게이트를 통과하지 못해도 이 출력들은 제공됩니다. 입력이나 실행 오류는 단계 로그에만 표시됩니다.
+
+게이트가 실패한 경우에도 후속 단계에서 JSON을 읽으려면 해당 단계에 `if: ${{ always() && steps.compare.outputs.json-report-path != '' }}`를 지정합니다.
 
 ## Kubernetes PrometheusRule로 테스트
 

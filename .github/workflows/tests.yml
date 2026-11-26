@@ -114,3 +114,23 @@ jobs:
           [[ "$report" == *'| <code>payment.test.yml</code> | Passed (2/2) | Failed (1/2) |'* ]]
           [[ "$report" == *'| <code>quiet.test.yml</code> | Passed (2/2) | Passed (2/2) |'* ]]
           [[ "$report" == *'| <code>payment.test.yml</code> | 1 | <code>PaymentErrorsHigh</code> | 420s | Newly failed |'* ]]
+      - name: Check JSON outputs for both comparisons
+        env:
+          FIXED_JSON: ${{ steps.fixed.outputs.json-report-path }}
+          FIXED_COUNT: ${{ steps.fixed.outputs.newly-failed }}
+          REGRESSION_JSON: ${{ steps.regression.outputs.json-report-path }}
+          REGRESSION_COUNT: ${{ steps.regression.outputs.newly-failed }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          for comparison, gate, newly_failed in (("FIXED", "strict", 0), ("REGRESSION", "regressions", 1)):
+              assert os.environ[f"{comparison}_COUNT"] == str(newly_failed)
+              path = Path(os.environ[f"{comparison}_JSON"])
+              report = json.loads(path.read_text(encoding="utf-8"))
+              assert report["schema_version"] == 1
+              assert report["gate"] == {"mode": gate, "passed": newly_failed == 0}
+              assert report["summary"]["newly_failed"] == newly_failed
+          PY

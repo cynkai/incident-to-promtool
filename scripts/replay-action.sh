@@ -76,6 +76,7 @@ fi
 
 report_dir=$(mktemp -d "$runner_temp/incident-review.XXXXXXXX")
 report="$report_dir/review.md"
+json_report="$report_dir/review.json"
 status=0
 command_token=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
 # Prevent diagnostic text from repository content from being read as runner commands.
@@ -83,14 +84,33 @@ printf '::stop-commands::%s\n' "$command_token"
 "$python" "$INCIDENT_ACTION_PATH/incident_to_promtool.py" compare \
     --before-ref="$INCIDENT_BEFORE_REF" --after-ref="$INCIDENT_AFTER_REF" \
     --promtool="$promtool" --rule-format="$INCIDENT_RULE_FORMAT" --gate "$gate" \
-    "${rule_arguments[@]}" -- "${fixture_paths[@]}" > "$report" || status=$?
+    --json-report "$json_report" "${rule_arguments[@]}" -- "${fixture_paths[@]}" > "$report" || status=$?
 printf '::%s::\n' "$command_token"
 
-if [[ -s "$report" ]]; then
-    printf 'report-path=%s\n' "$report" >> "$GITHUB_OUTPUT"
-    cat -- "$report" >> "$GITHUB_STEP_SUMMARY"
-else
-    rm -f -- "$report"
-    rmdir -- "$report_dir"
+if [[ "$status" -le 1 ]]; then
+    if [[ -s "$report" && -s "$json_report" ]] && newly_failed=$("$python" - "$json_report" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as report:
+        count = json.load(report)["summary"]["newly_failed"]
+except (OSError, ValueError, KeyError, TypeError):
+    sys.exit(1)
+if type(count) is not int or count < 0:
+    sys.exit(1)
+print(count)
+PY
+    ); then
+        cat -- "$report" >> "$GITHUB_STEP_SUMMARY"
+        printf 'report-path=%s\njson-report-path=%s\nnewly-failed=%s\n' \
+            "$report" "$json_report" "$newly_failed" >> "$GITHUB_OUTPUT"
+        exit "$status"
+    fi
+    printf 'Could not read complete Markdown and JSON comparison reports.\n' >&2
+    status=2
 fi
+
+rm -f -- "$report" "$json_report"
+rmdir -- "$report_dir"
 exit "$status"

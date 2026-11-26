@@ -31,6 +31,12 @@ outputs:
   report-path:
     description: Path to the generated Markdown report on the runner, when rule comparison completes.
     value: ${{ steps.replay.outputs.report-path }}
+  json-report-path:
+    description: Path to the generated JSON report on the runner, when rule comparison completes.
+    value: ${{ steps.replay.outputs.json-report-path }}
+  newly-failed:
+    description: Number of checkpoints that passed before and failed after the rule changes.
+    value: ${{ steps.replay.outputs.newly-failed }}
 runs:
   using: composite
   steps:

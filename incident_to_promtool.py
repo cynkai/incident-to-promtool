@@ -72,6 +72,18 @@ def read_json(path):
         return json.load(source, parse_float=Decimal)
 
 
+def write_new_json(path, data):
+    document = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    temporary = NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False)
+    staged = Path(temporary.name)
+    try:
+        with temporary:
+            temporary.write(document)
+        os.link(staged, path)
+    finally:
+        staged.unlink()
+
+
 def read_rule_sources(paths):
     return [(str(path), path.read_bytes()) for path in paths]
 
@@ -244,15 +256,7 @@ def generate(args):
         }],
     }
     # JSON syntax is also valid YAML, which lets promtool read it without a Python YAML dependency.
-    document = json.dumps(fixture, ensure_ascii=False, indent=2) + "\n"
-    temporary = NamedTemporaryFile("w", encoding="utf-8", dir=args.output.parent, delete=False)
-    path = Path(temporary.name)
-    try:
-        with temporary:
-            temporary.write(document)
-        os.link(path, args.output)
-    finally:
-        path.unlink()
+    write_new_json(args.output, fixture)
     return len(records), len(tests), shift
 
 
@@ -408,11 +412,104 @@ def markdown_code(value):
     return f"<code>{escaped}</code>"
 
 
-def compare(fixture_paths, before, after, executable, revisions=None, gate="strict"):
+def build_comparison_report(fixtures, before_failures, after_failures, revisions, gate):
+    count = sum(fixture.checkpoints for fixture in fixtures)
+    summary = {
+        "before": {"matched": count - sum(map(len, before_failures)), "total": count},
+        "after": {"matched": count - sum(map(len, after_failures)), "total": count},
+        "newly_failed": 0,
+        "fixed": 0,
+        "still_failing": 0,
+    }
+    fixture_results = []
+    for fixture, baseline, candidate in zip(fixtures, before_failures, after_failures):
+        changes = []
+        for identity in sorted(baseline.keys() | candidate.keys()):
+            group, name, offset = identity
+            before_diagnostic = baseline.get(identity)
+            after_diagnostic = candidate.get(identity)
+            if before_diagnostic is None:
+                change = "newly_failed"
+            elif after_diagnostic is None:
+                change = "fixed"
+            else:
+                change = "still_failing"
+            summary[change] += 1
+            changes.append({
+                "group": group,
+                "alertname": name,
+                "offset_ms": offset,
+                "change": change,
+                "before_diagnostic": before_diagnostic,
+                "after_diagnostic": after_diagnostic,
+            })
+        checks = fixture.checkpoints
+        fixture_results.append({
+            "path": str(fixture.path),
+            "before": {"matched": checks - len(baseline), "total": checks},
+            "after": {"matched": checks - len(candidate), "total": checks},
+            "changes": changes,
+        })
+    gate_passed = summary["after"]["matched"] == count if gate == "strict" else summary["newly_failed"] == 0
+    return {
+        "schema_version": 1,
+        "gate": {"mode": gate, "passed": gate_passed},
+        "commits": {"before": revisions[0], "after": revisions[1]} if revisions else None,
+        "summary": summary,
+        "fixtures": fixture_results,
+    }
+
+
+def print_markdown_report(report):
+    summary = report["summary"]
+    fixtures = report["fixtures"]
+    versions = ("before", "after")
+    print("## Prometheus alert comparison\n")
+    if commits := report["commits"]:
+        print(f"Compared Git commits `{commits['before']}` and `{commits['after']}` (before and after).\n")
+    gate = report["gate"]
+    print(f"Gate `{gate['mode']}`: **{'Passed' if gate['passed'] else 'Failed'}**\n")
+    print("| Rule version | Result | Checkpoints matched |\n| --- | --- | ---: |")
+    for version in versions:
+        matched, total = summary[version]["matched"], summary[version]["total"]
+        print(f"| {version.title()} | {'Passed' if matched == total else 'Failed'} | {matched}/{total} |")
+    if len(fixtures) > 1:
+        print("\n| Incident fixture | Before | After |\n| --- | --- | --- |")
+        for fixture in fixtures:
+            cells = [markdown_code(fixture["path"])]
+            for version in versions:
+                matched, total = fixture[version]["matched"], fixture[version]["total"]
+                cells.append(f"{'Passed' if matched == total else 'Failed'} ({matched}/{total})")
+            print("| " + " | ".join(cells) + " |")
+    if any(fixture["changes"] for fixture in fixtures):
+        labels = {"newly_failed": "Newly failed", "fixed": "Fixed", "still_failing": "Still failing"}
+        print("\n### Checkpoint changes\n")
+        print("| Incident fixture | Group | Alert | Offset | Change |\n| --- | ---: | --- | --- | --- |")
+        for fixture in fixtures:
+            for change in fixture["changes"]:
+                print(f"| {markdown_code(fixture['path'])} | {change['group']} | {markdown_code(change['alertname'])} "
+                      f"| {as_duration(change['offset_ms'])} | {labels[change['change']]} |")
+    for version in versions:
+        if summary[version]["matched"] == summary[version]["total"]:
+            continue
+        print(f"\n### {version.title()} mismatches")
+        for fixture in fixtures:
+            key = f"{version}_diagnostic"
+            failures = [item[key] for item in fixture["changes"] if item[key] is not None]
+            if not failures:
+                continue
+            if len(fixtures) > 1:
+                print(f"\n#### {markdown_code(fixture['path'])}")
+            details = "\n\n".join(item.strip("\n") for item in failures)
+            longest = max((len(run) for run in re.findall(r"`+", details)), default=0)
+            fence = "`" * max(3, longest + 1)
+            print(f"\n{fence}text\n{details}\n{fence}")
+
+
+def compare(fixture_paths, before, after, executable, revisions=None, gate="strict", json_report=None):
     if len({os.path.realpath(path, strict=True) for path in fixture_paths}) != len(fixture_paths):
         raise ValueError("each incident fixture must be supplied only once")
     fixtures = [load_replay_fixture(path) for path in fixture_paths]
-    count = sum(fixture.checkpoints for fixture in fixtures)
     promtool = shutil.which(executable)
     if not promtool:
         raise ValueError(f"promtool executable not found: {executable}")
@@ -422,53 +519,14 @@ def compare(fixture_paths, before, after, executable, revisions=None, gate="stri
         before_failures = test_rule_version(promtool, fixtures, before, path / "before")
         after_failures = test_rule_version(promtool, fixtures, after, path / "after")
 
-    changes = []
-    for fixture, baseline, candidate in zip(fixtures, before_failures, after_failures):
-        for identity in sorted(baseline.keys() | candidate.keys()):
-            if identity not in baseline:
-                status = "Newly failed"
-            elif identity not in candidate:
-                status = "Fixed"
-            else:
-                status = "Still failing"
-            changes.append((fixture, identity, status))
-    gate_failed = any(after_failures) if gate == "strict" else any(status == "Newly failed" for _, _, status in changes)
-
-    print("## Prometheus alert comparison\n")
-    if revisions:
-        print(f"Compared Git commits `{revisions[0]}` and `{revisions[1]}` (before and after).\n")
-    print(f"Gate `{gate}`: **{'Failed' if gate_failed else 'Passed'}**\n")
-    print("| Rule version | Result | Checkpoints matched |\n| --- | --- | ---: |")
-    versions = (("Before", before_failures), ("After", after_failures))
-    for version, incident_failures in versions:
-        failed = sum(map(len, incident_failures))
-        print(f"| {version} | {'Failed' if failed else 'Passed'} | {count - failed}/{count} |")
-    if len(fixtures) > 1:
-        print("\n| Incident fixture | Before | After |\n| --- | --- | --- |")
-        for fixture, baseline, candidate in zip(fixtures, before_failures, after_failures):
-            checks = fixture.checkpoints
-            before_cell = f"{'Failed' if baseline else 'Passed'} ({checks - len(baseline)}/{checks})"
-            after_cell = f"{'Failed' if candidate else 'Passed'} ({checks - len(candidate)}/{checks})"
-            print(f"| {markdown_code(fixture.path)} | {before_cell} | {after_cell} |")
-    if changes:
-        print("\n### Checkpoint changes\n")
-        print("| Incident fixture | Group | Alert | Offset | Change |\n| --- | ---: | --- | --- | --- |")
-        for fixture, (number, name, offset), status in changes:
-            print(f"| {markdown_code(fixture.path)} | {number} | {markdown_code(name)} | {as_duration(offset)} | {status} |")
-    for version, incident_failures in versions:
-        if not any(incident_failures):
-            continue
-        print(f"\n### {version} mismatches")
-        for fixture, failures in zip(fixtures, incident_failures):
-            if not failures:
-                continue
-            if len(fixtures) > 1:
-                print(f"\n#### {markdown_code(fixture.path)}")
-            details = "\n\n".join(item.strip("\n") for item in failures.values())
-            longest = max((len(run) for run in re.findall(r"`+", details)), default=0)
-            fence = "`" * max(3, longest + 1)
-            print(f"\n{fence}text\n{details}\n{fence}")
-    return int(gate_failed)
+    report = build_comparison_report(fixtures, before_failures, after_failures, revisions, gate)
+    if json_report is not None:
+        try:
+            write_new_json(json_report, report)
+        except FileExistsError as exc:
+            raise ValueError(f"JSON report already exists: {json_report}") from exc
+    print_markdown_report(report)
+    return int(not report["gate"]["passed"])
 
 
 def compare_main(argv):
@@ -488,6 +546,7 @@ def compare_main(argv):
         help="input rule format for both versions (default: prometheus)",
     )
     parser.add_argument("--promtool", default="promtool", help="promtool executable or path")
+    parser.add_argument("--json-report", type=Path, help="also write a machine-readable report to this new path")
     parser.add_argument(
         "--gate", choices=("strict", "regressions"), default="strict",
         help="fail on any proposed mismatch or only on newly failing checkpoints (default: strict)",
@@ -517,9 +576,9 @@ def compare_main(argv):
             from kubernetes_rules import convert_manifests
 
             return compare(args.fixtures, convert_manifests(before), convert_manifests(after), args.promtool,
-                           revisions, gate=args.gate)
+                           revisions, gate=args.gate, json_report=args.json_report)
         return compare(args.fixtures, [content for _, content in before], [content for _, content in after],
-                       args.promtool, revisions, gate=args.gate)
+                       args.promtool, revisions, gate=args.gate, json_report=args.json_report)
     except (OSError, ValueError, TypeError) as exc:
         parser.exit(2, f"error: {exc}\n")
 
