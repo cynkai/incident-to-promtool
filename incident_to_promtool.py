@@ -2,7 +2,7 @@
 """Create and compare offline promtool rule tests from historical samples."""
 
 import argparse
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -74,16 +74,22 @@ def read_json(path):
         return json.load(source, parse_float=Decimal)
 
 
-def write_new_json(path, data):
-    document = (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-    temporary = NamedTemporaryFile("wb", dir=path.parent, delete=False)
+@contextmanager
+def new_output_file(path, mode, **options):
+    temporary = NamedTemporaryFile(mode, dir=path.parent, delete=False, **options)
     staged = Path(temporary.name)
     try:
         with temporary:
-            temporary.write(document)
+            yield temporary
         os.link(staged, path)
     finally:
         staged.unlink()
+
+
+def write_new_json(path, data):
+    document = (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    with new_output_file(path, "wb") as output:
+        output.write(document)
     return document
 
 
@@ -191,6 +197,22 @@ def fetch_matrix(base_url, selector, end, window):
         raise ValueError(f"Prometheus request failed: {exc.reason}") from exc
 
 
+def capture_matrices(args, config, end, window):
+    if args.matrix:
+        return (read_json(path) for path in args.matrix)
+    base_url = args.prometheus_url.rstrip("/")
+    url = urlsplit(base_url)
+    if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password or url.query or url.fragment:
+        raise ValueError("use an HTTP(S) Prometheus base URL without credentials, query, or fragment")
+    selectors = config["selectors"]
+    if not isinstance(selectors, list) or not selectors or any(
+        not isinstance(selector, str) or not selector or not SELECTOR.fullmatch(selector)
+        for selector in selectors
+    ):
+        raise ValueError("selectors must contain raw metric selectors, such as requests_total{job=\"api\"}")
+    return (fetch_matrix(base_url, selector, end, window) for selector in selectors)
+
+
 def series_name(labels):
     labels = string_map(labels, "series labels", check_names=True)
     metric = labels.get("__name__", "")
@@ -203,6 +225,12 @@ def series_name(labels):
     return metric + ("{" + ",".join(matchers) + "}" if matchers else "")
 
 
+@dataclass(frozen=True)
+class CapturedSeries:
+    labels: dict[str, str]
+    samples: dict[int, str]
+
+
 def capture_samples(matrices, start, end):
     samples_by_series = {}
     for matrix in matrices:
@@ -212,11 +240,18 @@ def capture_samples(matrices, start, end):
         if result["resultType"] != "matrix":
             raise ValueError("expected raw matrix data from /api/v1/query with a range selector")
         for series in result["result"]:
-            name = series_name(series["metric"])
+            labels = series["metric"]
+            name = series_name(labels)
             if series.get("histograms"):
                 raise ValueError("native histograms require a different fixture format")
-            samples = samples_by_series.setdefault(name, {})
-            for timestamp, value in series["values"]:
+            samples = samples_by_series.setdefault(name, CapturedSeries(labels, {})).samples
+            values = series["values"]
+            if not isinstance(values, (list, tuple)):
+                raise ValueError("matrix series values must be an array of samples")
+            for sample in values:
+                if not isinstance(sample, (list, tuple)) or len(sample) != 2:
+                    raise ValueError("matrix samples must be timestamp and value pairs")
+                timestamp, value = sample
                 milliseconds = Decimal(str(timestamp)) * 1000
                 if not milliseconds.is_finite() or milliseconds != milliseconds.to_integral_value():
                     raise ValueError("sample timestamps must have millisecond precision")
@@ -231,7 +266,7 @@ def capture_samples(matrices, start, end):
                     continue
                 samples[offset] = value
 
-    active = {name: samples for name, samples in samples_by_series.items() if samples}
+    active = {name: series for name, series in samples_by_series.items() if series.samples}
     if not active:
         raise ValueError("no float samples found in the capture window")
     return active
@@ -239,8 +274,8 @@ def capture_samples(matrices, start, end):
 
 def infer_sample_interval(samples_by_series, evaluation):
     step = evaluation
-    for samples in samples_by_series.values():
-        for offset in samples:
+    for series in samples_by_series.values():
+        for offset in series.samples:
             step = math.gcd(step, offset)
             if step == 1:
                 return step
@@ -263,9 +298,9 @@ def slots_fit_shift(offsets, step, max_shift):
 
 def bounded_sample_interval(samples_by_series, evaluation, window, exact_step, max_shift):
     remaining_slots = MAX_VALUES - len(samples_by_series)
-    if remaining_slots <= 0 or sum(map(len, samples_by_series.values())) > MAX_VALUES:
+    if remaining_slots <= 0 or sum(len(series.samples) for series in samples_by_series.values()) > MAX_VALUES:
         return None
-    offsets_by_series = [sorted(samples) for samples in samples_by_series.values()]
+    offsets_by_series = [sorted(series.samples) for series in samples_by_series.values()]
     last_offsets = [offsets[-1] for offsets in offsets_by_series]
     # The sum of rounded end slots cannot be smaller than sum(offsets) / step.
     smallest = max(exact_step + 1, ceil_div(sum(last_offsets), remaining_slots))
@@ -307,10 +342,10 @@ def encode_samples(samples_by_series, step, round_up):
     shifted_sample_count = 0
     largest_shift = 0
     expanded_slots = 0
-    for name, samples in sorted(samples_by_series.items()):
+    for name, series in sorted(samples_by_series.items()):
         values = []
         next_slot = 0
-        for offset, value in sorted(samples.items()):
+        for offset, value in sorted(series.samples.items()):
             slot = ceil_div(offset, step)
             delay = slot * step - offset
             if delay:
@@ -328,7 +363,7 @@ def encode_samples(samples_by_series, step, round_up):
                 values.append("_" if missing == 1 else f"_x{missing}")
             values.append(value)
             next_slot = slot + 1
-        sample_count += len(samples)
+        sample_count += len(series.samples)
         expanded_slots += next_slot
         if expanded_slots > MAX_VALUES:
             raise ValueError(f"capture exceeds {MAX_VALUES:,} fixture slots; narrow the window or selectors")
@@ -344,7 +379,7 @@ def collect_series(matrices, start, end, step, round_up):
 def encode_automatic_samples(samples, evaluation, window, max_shift):
     exact_step = infer_sample_interval(samples, evaluation)
     step = exact_step
-    exact_slots = sum(max(series) // exact_step + 1 for series in samples.values())
+    exact_slots = sum(max(series.samples) // exact_step + 1 for series in samples.values())
     if exact_slots > MAX_VALUES:
         if not max_shift:
             raise ValueError(
@@ -358,6 +393,30 @@ def encode_automatic_samples(samples, evaluation, window, max_shift):
                 "while keeping distinct samples within the capture window; use a shorter window or narrower selectors"
             )
     return encode_samples(samples, step, round_up=step != exact_step), step
+
+
+def unix_seconds(milliseconds):
+    # Write a JSON number directly from integer milliseconds.
+    seconds, fraction = divmod(abs(milliseconds), 1000)
+    sign = "-" if milliseconds < 0 else ""
+    return f"{sign}{seconds}.{fraction:03d}"
+
+
+def write_matrix_snapshot(path, samples, start_ms):
+    with new_output_file(path, "w", encoding="utf-8", newline="\n") as output:
+        output.write('{"status":"success","data":{"resultType":"matrix","result":[\n')
+        for series_index, (_, series) in enumerate(sorted(samples.items())):
+            if series_index:
+                output.write(",\n")
+            labels = json.dumps(series.labels, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            output.write(f'{{"metric":{labels},"values":[')
+            for sample_index, (offset, value) in enumerate(sorted(series.samples.items())):
+                if sample_index:
+                    output.write(",")
+                timestamp = unix_seconds(start_ms + offset)
+                output.write(f"[{timestamp},{json.dumps(value)}]")
+            output.write("]}")
+        output.write("\n]}}\n")
 
 
 def generate(args):
@@ -390,21 +449,7 @@ def generate(args):
         raise ValueError("every rule file must exist")
     rule_files = [os.path.relpath(path.resolve(), args.output.parent.resolve()) for path in paths]
 
-    if args.matrix:
-        matrices = (read_json(path) for path in args.matrix)
-    else:
-        base_url = args.prometheus_url.rstrip("/")
-        url = urlsplit(base_url)
-        if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password or url.query or url.fragment:
-            raise ValueError("use an HTTP(S) Prometheus base URL without credentials, query, or fragment")
-        selectors = config["selectors"]
-        if not isinstance(selectors, list) or not selectors or any(
-            not isinstance(selector, str) or not selector or not SELECTOR.fullmatch(selector)
-            for selector in selectors
-        ):
-            raise ValueError("selectors must contain raw metric selectors, such as requests_total{job=\"api\"}")
-        matrices = (fetch_matrix(base_url, selector, end, window) for selector in selectors)
-
+    matrices = capture_matrices(args, config, end, window)
     samples = capture_samples(matrices, begin_ms, end_ms)
     if automatic:
         capture, step = encode_automatic_samples(samples, evaluation, window, max_shift)
@@ -865,18 +910,51 @@ def export_rules_main(argv):
     print(f"Exported {len(rules)} native rule file(s) to {args.output_dir}.")
 
 
+def add_capture_source_options(parser):
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--prometheus-url", help="query a Prometheus server for raw historical samples")
+    source.add_argument("--matrix", type=Path, action="append", help="read a saved raw query response (repeatable)")
+
+
+def snapshot_main(argv):
+    parser = argparse.ArgumentParser(
+        prog=f"{Path(sys.argv[0]).name} snapshot",
+        description="Save raw Prometheus samples in a matrix JSON file for offline fixture generation.",
+    )
+    parser.add_argument("config", type=Path, help="capture window and selectors (JSON)")
+    add_capture_source_options(parser)
+    parser.add_argument("--output", required=True, type=Path, help="new matrix JSON file")
+    args = parser.parse_args(argv)
+    try:
+        config = read_json(args.config)
+        _, begin_ms = timestamp_ms(config["start"])
+        end, end_ms = timestamp_ms(config["end"])
+        if end_ms <= begin_ms:
+            raise ValueError("end must follow start")
+        matrices = capture_matrices(args, config, end, end_ms - begin_ms)
+        samples = capture_samples(matrices, begin_ms, end_ms)
+        write_matrix_snapshot(args.output, samples, begin_ms)
+    except FileExistsError:
+        parser.exit(1, f"error: output file already exists: {args.output}\n")
+    except (ValueError, KeyError, TypeError, AttributeError, InvalidOperation, OSError) as exc:
+        parser.exit(1, f"error: {exc}\n")
+    sample_count = sum(len(series.samples) for series in samples.values())
+    print(f"Wrote {args.output} ({len(samples)} series, {sample_count} samples).")
+
+
 def main():
+    if sys.argv[1:2] == ["snapshot"]:
+        return snapshot_main(sys.argv[2:])
     if sys.argv[1:2] == ["compare"]:
         return compare_main(sys.argv[2:])
     if sys.argv[1:2] == ["export-rules"]:
         return export_rules_main(sys.argv[2:])
     parser = argparse.ArgumentParser(
-        description=__doc__, epilog="See compare --help for rule comparisons or export-rules --help for Kubernetes manifests."
+        description=__doc__, epilog="See snapshot --help for sample capture, compare --help for rule comparisons, "
+        "or export-rules --help for Kubernetes manifests."
     )
     parser.add_argument("config", type=Path, help="incident window and expected alert states (JSON)")
-    source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--prometheus-url", help="query a Prometheus server for raw historical samples")
-    source.add_argument("--matrix", type=Path, action="append", help="read a saved raw query response (repeatable)")
+    add_capture_source_options(parser)
     parser.add_argument("--rule-file", type=Path, action="append", help="override config rule_files (repeatable)")
     parser.add_argument("--round-up", action="store_true", help="shift off-grid samples with a numeric sample interval")
     parser.add_argument("--max-shift", metavar="DURATION", help="allow bounded forward shifts if the exact auto grid is too large")

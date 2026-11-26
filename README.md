@@ -16,7 +16,7 @@ The demo replays synthetic payment metrics without a Prometheus server. It check
 
 Use Python 3.10+ and `promtool` 3.9+. With no local `promtool`, the demo downloads and verifies a pinned binary on Linux x64. Set `PROMTOOL=/path/to/promtool` to use a specific executable.
 
-Commit a fixture for your own incident, compare rule changes between Git refs, and add the same check to CI. Detailed examples are available in Korean. [Capture an incident](#내-prometheus로-실행) · [Alertmanager webhook](#alertmanager-웹훅으로-기대-동작-만들기) · [Native Prometheus rules](#룰-변경-전후-비교) · [Git ref comparison](#git-커밋으로-비교) · [Kubernetes PrometheusRule](#kubernetes-prometheusrule로-테스트) · [GitHub Action](#github-actions에서-pr-검사)
+Commit a fixture for your own incident, compare rule changes between Git refs, and add the same check to CI. Detailed examples are available in Korean. [Capture an incident](#내-prometheus로-실행) · [Raw metric snapshot](#원본-시계열-스냅샷) · [Alertmanager webhook](#alertmanager-웹훅으로-기대-동작-만들기) · [Native Prometheus rules](#룰-변경-전후-비교) · [Git ref comparison](#git-커밋으로-비교) · [Kubernetes PrometheusRule](#kubernetes-prometheusrule로-테스트) · [GitHub Action](#github-actions에서-pr-검사)
 
 ### Install the CLI from GitHub
 
@@ -219,6 +219,21 @@ python3 incident_to_promtool.py incident.json --prometheus-url http://localhost:
 `"30s"`처럼 간격을 직접 지정하면 평가 간격은 그 배수여야 하며, 기본 변환은 표본 시각이 격자에 맞아야 합니다. 명시적으로 `--round-up`을 쓰면 표본을 다음 격자로 미루고 최대 이동 시간을 표시합니다. 이때 `end`도 격자에 맞춰야 하고, 같은 시계열의 두 타임스탬프가 한 칸에 들어가면 더 촘촘한 간격이 필요합니다.
 
 입력은 유한한 스칼라 표본입니다. Prometheus 원본 조회 API는 stale 표식을 제외하므로, `absent()`처럼 시계열이 stale 상태가 된 시각에 의존하는 룰은 이 방식으로 정확히 재현하기 어렵습니다.
+
+### 원본 시계열 스냅샷
+
+`snapshot`으로 장애 구간의 시계열을 저장해 두면, 이후 Prometheus 서버 연결 없이 테스트를 생성할 수 있습니다.
+
+```sh
+python3 incident_to_promtool.py snapshot incident.json \
+  --prometheus-url http://localhost:9090 --output incident.matrix.json
+python3 incident_to_promtool.py incident.json \
+  --matrix incident.matrix.json --output incident.offline.test.yml
+```
+
+스냅샷 설정에는 시간대가 포함된 `start`와 `end`가 필요합니다. 서버에서 가져올 때는 `selectors`도 지정합니다. `sample_interval`, `evaluation_interval`, `rule_files`, `expectations`는 두 번째 명령에서 테스트를 생성할 때 채웁니다. 같은 구간을 재현할 수 있도록 `incident.json`도 스냅샷과 함께 보관합니다.
+
+저장 파일은 Prometheus `matrix` 응답 형식이며, 지정 구간의 표본 시각을 밀리초 정밀도로 보존하고 라벨과 값을 그대로 담습니다. 저장된 응답을 합치려면 `snapshot`에 `--matrix part-a.matrix.json --matrix part-b.matrix.json`과 같이 입력을 반복 지정합니다. 같은 시계열에서 시각과 값이 일치하는 표본은 하나로 합칩니다. 구간 안에 표본이 없거나 같은 시각의 값이 충돌하거나, 응답에 경고 또는 네이티브 히스토그램이 있으면 오류로 처리합니다.
 
 ### Alertmanager 웹훅으로 기대 동작 만들기
 

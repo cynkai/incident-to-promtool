@@ -51,7 +51,9 @@ jobs:
           cd "$smoke"
           demo="$GITHUB_WORKSPACE/demo"
           cli="$smoke/venv/bin/incident-to-promtool"
-          "$cli" "$demo/alertmanager.incident.json" --matrix "$demo/incident.matrix.json" \
+          "$cli" snapshot "$demo/alertmanager.incident.json" --matrix "$demo/incident.matrix.json" \
+            --output payment.matrix.json
+          "$cli" "$demo/alertmanager.incident.json" --matrix payment.matrix.json \
             --output payment.test.yml --summary-format json > summary.json
           "$smoke/venv/bin/python" - <<'PY'
           import hashlib
