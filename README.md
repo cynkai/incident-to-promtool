@@ -75,6 +75,28 @@ jobs:
             --rule-file prometheus/payment.rules.yml >> "$GITHUB_STEP_SUMMARY"
 ```
 
+## Kubernetes PrometheusRule로 테스트
+
+Kubernetes 모드에는 PyYAML이 필요합니다. 아래 명령은 Python 가상 환경에서 실행할 수 있습니다. Helm 차트는 먼저 `helm template`으로 렌더링합니다.
+
+```sh
+python3 -m pip install 'PyYAML>=6,<7'
+mkdir -p demo/generated
+python3 incident_to_promtool.py export-rules demo/kubernetes/after.yml \
+  --output-dir demo/generated/native
+python3 incident_to_promtool.py demo/demo.json --matrix demo/incident.matrix.json \
+  --rule-file demo/generated/native/rules-1.yml --output demo/generated/kubernetes.test.yml
+python3 incident_to_promtool.py compare demo/generated/kubernetes.test.yml \
+  --rule-format kubernetes --before demo/kubernetes/before.yml \
+  --after demo/kubernetes/after.yml > demo/generated/kubernetes-review.md
+```
+
+`export-rules`의 출력 디렉터리는 새 경로여야 하며 상위 디렉터리는 미리 만듭니다. 입력에 등장하는 순서대로 리소스 하나당 `rules-1.yml`, `rules-2.yml` 형식의 `promtool` 룰 파일이 생성됩니다. 의존하는 기록 룰이 있으면 해당 매니페스트도 입력으로 제공하고, 테스트를 생성할 때 필요한 출력 파일을 `--rule-file`로 하나씩 지정하세요.
+
+렌더링된 다중 문서 YAML, Kubernetes `v1/List`, `monitoring.coreos.com/v1`의 `PrometheusRuleList`를 읽을 수 있습니다. 같은 입력에 들어 있는 다른 종류의 리소스는 건너뜁니다. Git 커밋 간 비교에도 `--rule-format kubernetes`를 추가하고 `--rule-file`에 매니페스트 경로를 지정합니다.
+
+평가는 매니페스트에 선언된 Prometheus 룰을 기준으로 합니다. Operator가 Prometheus에서 무시하는 Thanos Ruler 전용 `partial_response_strategy`는 내보낼 때 제외합니다. Operator admission 단계의 변경과 `enforcedNamespaceLabel` 적용은 범위 밖입니다. [Prometheus Operator API 문서](https://prometheus-operator.dev/docs/api-reference/api/)
+
 ## 내 Prometheus로 실행
 
 `demo/demo.json`을 복사해 장애 시간과 메트릭, 룰 파일, 기대 동작을 바꿉니다. 아래는 설정을 저장소 루트의 `incident.json`에 저장한 경우입니다.

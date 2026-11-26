@@ -2,6 +2,7 @@
 """Create and compare offline promtool rule tests from historical samples."""
 
 import argparse
+from contextlib import suppress
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import json
@@ -67,6 +68,10 @@ def string_map(value, option, check_names=False):
 def read_json(path):
     with path.open(encoding="utf-8") as source:
         return json.load(source, parse_float=Decimal)
+
+
+def read_rule_sources(paths):
+    return [(str(path), path.read_bytes()) for path in paths]
 
 
 def rule_test_cases(expectations, window, evaluation):
@@ -277,7 +282,7 @@ def read_committed_rules(repo, revision, paths):
         mode, kind, object_id = metadata.decode("ascii").split()
         if kind != "blob" or mode not in ("100644", "100755"):
             raise ValueError(f"rule path {path!r} is not a regular file at Git commit {revision}")
-        rules.append(git_output(repo, "cat-file", "blob", object_id))
+        rules.append((f"{revision}:{path}", git_output(repo, "cat-file", "blob", object_id)))
     return rules
 
 
@@ -364,6 +369,10 @@ def compare_main(argv):
     parser.add_argument("--after-ref", help="proposed Git ref or commit")
     parser.add_argument("--rule-file", action="append", help="repository-root-relative path present in both commits (repeatable)")
     parser.add_argument("--repo", type=Path, help="Git repository for ref comparison (default: current directory)")
+    parser.add_argument(
+        "--rule-format", choices=("prometheus", "kubernetes"), default="prometheus",
+        help="input rule format for both versions (default: prometheus)",
+    )
     parser.add_argument("--promtool", default="promtool", help="promtool executable or path")
     args = parser.parse_args(argv)
     git_mode = any(value is not None for value in (args.before_ref, args.after_ref, args.rule_file, args.repo))
@@ -374,6 +383,7 @@ def compare_main(argv):
     if not git_mode and not (args.before and args.after):
         parser.error("file comparison requires both --before and --after")
     try:
+        revisions = None
         if git_mode:
             for path in args.rule_file:
                 if "\\" in path or PureWindowsPath(path).drive or any(part in ("", ".", "..") for part in path.split("/")):
@@ -382,19 +392,58 @@ def compare_main(argv):
             revisions = (resolve_commit(repo, args.before_ref), resolve_commit(repo, args.after_ref))
             before = read_committed_rules(repo, revisions[0], args.rule_file)
             after = read_committed_rules(repo, revisions[1], args.rule_file)
-            return compare(args.fixture, before, after, args.promtool, revisions)
-        before = [path.read_bytes() for path in args.before]
-        after = [path.read_bytes() for path in args.after]
-        return compare(args.fixture, before, after, args.promtool)
+        else:
+            before = read_rule_sources(args.before)
+            after = read_rule_sources(args.after)
+        if args.rule_format == "kubernetes":
+            from kubernetes_rules import convert_manifests
+
+            return compare(args.fixture, convert_manifests(before), convert_manifests(after), args.promtool, revisions)
+        return compare(args.fixture, [content for _, content in before], [content for _, content in after],
+                       args.promtool, revisions)
     except (OSError, ValueError, TypeError) as exc:
         parser.exit(2, f"error: {exc}\n")
+
+
+def export_rules_main(argv):
+    parser = argparse.ArgumentParser(
+        prog=f"{Path(sys.argv[0]).name} export-rules",
+        description="Export rendered Kubernetes PrometheusRule manifests as native rule files.",
+    )
+    parser.add_argument("manifests", type=Path, nargs="+", help="rendered manifest files")
+    parser.add_argument("--output-dir", required=True, type=Path, help="new directory for native rule files")
+    args = parser.parse_args(argv)
+    from kubernetes_rules import convert_manifests
+
+    try:
+        rules = convert_manifests(read_rule_sources(args.manifests))
+        args.output_dir.mkdir()
+        created = []
+        try:
+            for index, content in enumerate(rules, start=1):
+                path = args.output_dir / f"rules-{index}.yml"
+                with path.open("xb") as output:
+                    created.append(path)
+                    output.write(content)
+        except BaseException:
+            for path in created:
+                with suppress(OSError):
+                    path.unlink()
+            with suppress(OSError):
+                args.output_dir.rmdir()
+            raise
+    except (OSError, ValueError, TypeError) as exc:
+        parser.exit(2, f"error: {exc}\n")
+    print(f"Exported {len(rules)} native rule file(s) to {args.output_dir}.")
 
 
 def main():
     if sys.argv[1:2] == ["compare"]:
         return compare_main(sys.argv[2:])
+    if sys.argv[1:2] == ["export-rules"]:
+        return export_rules_main(sys.argv[2:])
     parser = argparse.ArgumentParser(
-        description=__doc__, epilog="To compare two rulesets, run incident_to_promtool.py compare --help."
+        description=__doc__, epilog="See compare --help for rule comparisons or export-rules --help for Kubernetes manifests."
     )
     parser.add_argument("config", type=Path, help="incident window and expected alert states (JSON)")
     source = parser.add_mutually_exclusive_group(required=True)

@@ -36,5 +36,10 @@ jobs:
           printf '%s  %s\n' "$SHA256" "$archive" | sha256sum --check
           tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP" \
             --strip-components=1 "${asset}/promtool"
+      - name: Set up test environment
+        run: |
+          python3 -m venv "$RUNNER_TEMP/test-venv"
+          "$RUNNER_TEMP/test-venv/bin/python" -m pip install --disable-pip-version-check 'PyYAML==6.0.3'
       - name: Run tests
-        run: PROMTOOL="$RUNNER_TEMP/promtool" python3 -m unittest discover -s tests -v
+        run: |
+          PROMTOOL="$RUNNER_TEMP/promtool" "$RUNNER_TEMP/test-venv/bin/python" -m unittest discover -s tests -v
