@@ -219,11 +219,13 @@ jobs:
           [[ "$report" == *'| <code>payment.test.yml</code> | Passed (2/2) | Failed (1/2) |'* ]]
           [[ "$report" == *'| <code>quiet.test.yml</code> | Passed (2/2) | Passed (2/2) |'* ]]
           [[ "$report" == *'| <code>payment.test.yml</code> | 1 | <code>PaymentErrorsHigh</code> | 420s | Newly failed |'* ]]
-      - name: Check JSON outputs for both comparisons
+      - name: Check JSON and JUnit outputs for both comparisons
         env:
           FIXED_JSON: ${{ steps.fixed.outputs.json-report-path }}
+          FIXED_JUNIT: ${{ steps.fixed.outputs.junit-report-path }}
           FIXED_COUNT: ${{ steps.fixed.outputs.newly-failed }}
           REGRESSION_JSON: ${{ steps.regression.outputs.json-report-path }}
+          REGRESSION_JUNIT: ${{ steps.regression.outputs.junit-report-path }}
           REGRESSION_COUNT: ${{ steps.regression.outputs.newly-failed }}
         run: |
           python3 - <<'PY'
@@ -232,6 +234,7 @@ jobs:
           import os
           from pathlib import Path
           import subprocess
+          from xml.etree import ElementTree
 
           repo = Path(os.environ["RUNNER_TEMP"]) / "composite-repo"
           fixture_commit = subprocess.check_output(["git", "rev-parse", "HEAD^1"], cwd=repo, text=True).strip()
@@ -239,7 +242,7 @@ jobs:
           def committed_bytes(path):
               return subprocess.check_output(["git", "show", f"{fixture_commit}:{path}"], cwd=repo)
 
-          for comparison, gate, newly_failed in (("FIXED", "strict", 0), ("REGRESSION", "regressions", 1)):
+          for comparison, gate, tests, newly_failed in (("FIXED", "strict", 2, 0), ("REGRESSION", "regressions", 4, 1)):
               assert os.environ[f"{comparison}_COUNT"] == str(newly_failed)
               path = Path(os.environ[f"{comparison}_JSON"])
               report = json.loads(path.read_text(encoding="utf-8"))
@@ -247,8 +250,21 @@ jobs:
               assert report["fixture_commit"] == fixture_commit
               assert report["gate"] == {"mode": gate, "passed": newly_failed == 0}
               assert report["summary"]["newly_failed"] == newly_failed
+
+              junit = ElementTree.parse(os.environ[f"{comparison}_JUNIT"]).getroot()
+              assert junit.tag == "testsuites"
+              assert int(junit.attrib["tests"]) == tests
+              assert int(junit.attrib["failures"]) == newly_failed
+              assert junit.attrib["errors"] == junit.attrib["skipped"] == "0"
+              suites = junit.findall("testsuite")
+              fixtures = report["fixtures"]
+              assert [suite.attrib["name"] for suite in suites] == [fixture["path"] for fixture in fixtures]
+              for suite, fixture in zip(suites, fixtures):
+                  assert int(suite.attrib["tests"]) == len(suite.findall("testcase")) == fixture["after"]["total"]
+              assert len(junit.findall("testsuite/testcase/failure")) == newly_failed
+
               if comparison == "FIXED":
-                  fixture, = report["fixtures"]
+                  fixture, = fixtures
                   assert fixture["path"] == "payment.test.yml"
                   assert fixture["capture_summary"] == "payment.capture.json"
                   summary = json.loads(committed_bytes("payment.capture.json"))

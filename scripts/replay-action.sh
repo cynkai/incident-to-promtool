@@ -131,6 +131,7 @@ fi
 report_dir=$(mktemp -d "$runner_temp/incident-review.XXXXXXXX")
 report="$report_dir/review.md"
 json_report="$report_dir/review.json"
+junit_report="$report_dir/review.xml"
 status=0
 command_token=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
 # Prevent diagnostic text from repository content from being read as runner commands.
@@ -138,11 +139,12 @@ printf '::stop-commands::%s\n' "$command_token"
 "$python" "$INCIDENT_ACTION_PATH/incident_to_promtool.py" \
     "${comparison_arguments[@]}" \
     --promtool="$promtool" --rule-format="$INCIDENT_RULE_FORMAT" --gate "$gate" \
-    --json-report "$json_report" "${rule_arguments[@]}" -- "${input_paths[@]}" > "$report" || status=$?
+    --json-report "$json_report" --junit-report "$junit_report" \
+    "${rule_arguments[@]}" -- "${input_paths[@]}" > "$report" || status=$?
 printf '::%s::\n' "$command_token"
 
 if [[ "$status" -le 1 ]]; then
-    if [[ -s "$report" && -s "$json_report" ]] && newly_failed=$("$python" - "$json_report" <<'PY'
+    if [[ -s "$report" && -s "$json_report" && -s "$junit_report" ]] && newly_failed=$("$python" - "$json_report" <<'PY'
 import json
 import sys
 
@@ -157,14 +159,14 @@ print(count)
 PY
     ); then
         cat -- "$report" >> "$GITHUB_STEP_SUMMARY"
-        printf 'report-path=%s\njson-report-path=%s\nnewly-failed=%s\n' \
-            "$report" "$json_report" "$newly_failed" >> "$GITHUB_OUTPUT"
+        printf 'report-path=%s\njson-report-path=%s\njunit-report-path=%s\nnewly-failed=%s\n' \
+            "$report" "$json_report" "$junit_report" "$newly_failed" >> "$GITHUB_OUTPUT"
         exit "$status"
     fi
-    printf 'Could not read complete Markdown and JSON comparison reports.\n' >&2
+    printf 'Could not read complete Markdown, JSON, and JUnit XML comparison reports.\n' >&2
     status=2
 fi
 
-rm -f -- "$report" "$json_report"
+rm -f -- "$report" "$json_report" "$junit_report"
 rmdir -- "$report_dir"
 exit "$status"

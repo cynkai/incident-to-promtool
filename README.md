@@ -93,6 +93,19 @@ python3 incident_to_promtool.py compare demo/generated/after.test.yml \
 - `fixtures`는 `path`, `before`, `after`, `changes`를 담은 배열입니다. 각 `changes` 항목은 `group`(1부터 시작), `alertname`, `offset_ms`(테스트 시작 기준), `change`, `before_diagnostic`, `after_diagnostic`를 포함합니다. `change`는 `newly_failed`, `fixed`, `still_failing` 중 하나이며, 해당 버전에서 조건을 충족한 경우 진단값은 `null`입니다.
 - `--fixture-ref`를 지정하면 최상위 `fixture_commit`에 테스트 파일을 읽은 커밋 ID를 기록합니다. 각 `fixtures` 항목은 커밋에서 읽었거나 캡처 요약으로 검증했을 때 `sha256`을 포함합니다. 캡처 요약으로 검증한 경우 `capture_summary`에 요약 경로를 기록합니다.
 
+### JUnit XML 리포트
+
+`compare`와 `compare-bundle`에서 `--junit-report PATH`로 JUnit XML을 저장합니다. 출력에는 새 경로를 지정합니다. `--json-report`를 함께 사용할 때는 두 리포트에 서로 다른 경로를 사용합니다. 리포트는 비교가 완료되는 종료 코드 `0`과 `1`에서만 생성됩니다.
+
+```sh
+python3 incident_to_promtool.py compare demo/generated/after.test.yml \
+  --before demo/before.rules.yml --after demo/after.rules.yml \
+  --json-report demo/generated/payment-review.json \
+  --junit-report demo/generated/payment-review.xml
+```
+
+테스트 파일마다 스위트 하나, 검사 시점마다 테스트 케이스 하나를 기록합니다. `strict`에서는 수정 룰의 모든 불일치가 실패이고, `regressions`에서는 새로 발생한 불일치가 실패입니다. 다시 통과한 검사와 `regressions`에서 허용한 기존 실패의 진단은 `system-out`에 기록합니다.
+
 ### Git 커밋으로 비교
 
 두 Git ref를 지정하면 현재 체크아웃을 유지한 채 각 커밋에서 룰을 읽습니다. Markdown 리포트에는 확정된 두 커밋 ID가 들어가며 종료 코드는 파일 경로로 비교할 때와 같습니다.
@@ -157,9 +170,9 @@ jobs:
 | `gate` | `strict`. 새로 실패한 검사만 단계 실패로 처리하려면 `with`에 `gate: regressions`를 지정합니다. |
 | `promtool-path` | 생략하면 Linux x64에서 고정된 Promtool 3.11.0을 설치합니다. 기존 실행 파일은 작업 디렉터리 기준 경로나 `PATH`에 있는 명령으로 지정합니다. |
 
-`kubernetes` 모드는 PyYAML 6.0.3을 격리된 가상 환경에 설치합니다. 완료된 비교는 실행 요약을 남기며 `steps.compare.outputs.report-path`로 Markdown 경로, `steps.compare.outputs.json-report-path`로 JSON 경로, `steps.compare.outputs.newly-failed`로 새로 실패한 검사 건수(문자열)를 제공합니다. 게이트를 통과하지 못해도 이 출력들은 제공됩니다. 입력이나 실행 오류는 단계 로그에만 표시됩니다.
+`kubernetes` 모드는 PyYAML 6.0.3을 격리된 가상 환경에 설치합니다. 완료된 비교는 실행 요약을 남기며 `steps.compare.outputs.report-path`로 Markdown 경로, `steps.compare.outputs.json-report-path`로 JSON 경로, `steps.compare.outputs.junit-report-path`로 JUnit XML 경로, `steps.compare.outputs.newly-failed`로 새로 실패한 검사 건수(문자열)를 제공합니다. 게이트를 통과하지 못해도 이 출력들은 제공됩니다. 입력이나 실행 오류는 단계 로그에만 표시됩니다.
 
-게이트가 실패한 경우에도 후속 단계에서 JSON을 읽으려면 해당 단계에 `if: ${{ always() && steps.compare.outputs.json-report-path != '' }}`를 지정합니다.
+게이트가 실패한 경우에도 후속 단계에서 JSON을 읽으려면 해당 단계에 `if: ${{ always() && steps.compare.outputs.json-report-path != '' }}`를 지정합니다. JUnit XML에는 같은 조건에서 `junit-report-path`를 사용합니다.
 
 #### 기준 번들로 PR 검사
 
@@ -331,7 +344,7 @@ python3 incident_to_promtool.py compare-bundle demo/generated/payment-baseline.z
 
 파일 비교와 Git 비교 모두 ZIP 경로를 위치 인자로 여러 개 지정할 수 있습니다. 지정한 순서대로 각 ZIP에 보관된 테스트와 기준 룰을 사용하고, 모든 ZIP에 동일한 수정 룰을 적용합니다. 같은 ZIP 경로를 반복하거나 배치에 잘못된 입력이 있으면 종료 코드 `2`로 처리합니다. 리포트는 비교를 완료한 배치에 대해 생성됩니다.
 
-전체 집계와 번들별 결과를 Markdown으로 표준 출력에 보내고, `--json-report`를 지정하면 JSON도 저장합니다. 게이트는 `compare`와 같은 `strict`와 `regressions`를 지원합니다. 종료 코드는 게이트 통과 `0`, 게이트 실패 `1`, 입력 또는 실행 오류 `2`입니다. [룰 변경 전후 비교](#룰-변경-전후-비교)
+전체 집계와 번들별 결과를 Markdown으로 표준 출력에 보냅니다. JSON은 `--json-report`, JUnit XML은 `--junit-report`로 저장합니다. 게이트는 `compare`와 같은 `strict`와 `regressions`를 지원합니다. 종료 코드는 게이트 통과 `0`, 게이트 실패 `1`, 입력 또는 실행 오류 `2`입니다. [룰 변경 전후 비교](#룰-변경-전후-비교) · [JUnit XML 리포트](#junit-xml-리포트)
 
 JSON에는 ZIP 하나를 비교할 때 기존 `bundle` 객체를, 여러 개면 `bundles` 배열을 기록합니다. `bundles`와 `fixtures`는 입력 순서대로 대응합니다. 각 번들 항목에는 ZIP 경로 `path`와 ZIP 내부의 기준 룰 경로 목록 `rule_files`가 있습니다. `fixtures` 항목의 `path`와 `capture_summary`는 각각 `ZIP!incident.test.yml`, `ZIP!capture.json` 형식입니다.
 

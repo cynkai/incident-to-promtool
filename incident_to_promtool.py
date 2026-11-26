@@ -2,7 +2,7 @@
 """Create and compare offline promtool rule tests from historical samples."""
 
 import argparse
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -46,6 +46,7 @@ BUNDLE_FIXED_FILES = (
     "incident.json", "incident.matrix.json", BUNDLE_FIXTURE, BUNDLE_CAPTURE_SUMMARY, "coverage.json",
 )
 SHA256_HEX = re.compile(r"[0-9a-fA-F]{64}")
+XML_INVALID = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
 
 
 def duration_ms(value):
@@ -96,19 +97,29 @@ def read_json(path):
 
 
 @contextmanager
-def new_output_file(path, mode, **options):
+def staged_output_file(path, mode, **options):
     temporary = NamedTemporaryFile(mode, dir=path.parent, delete=False, **options)
-    staged = Path(temporary.name)
     try:
+        yield temporary
+    finally:
+        temporary.close()
+        Path(temporary.name).unlink()
+
+
+@contextmanager
+def new_output_file(path, mode, **options):
+    with staged_output_file(path, mode, **options) as temporary:
         with temporary:
             yield temporary
-        os.link(staged, path)
-    finally:
-        staged.unlink()
+        os.link(temporary.name, path)
+
+
+def json_document(data):
+    return (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
 
 
 def write_new_json(path, data):
-    document = (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    document = json_document(data)
     with new_output_file(path, "wb") as output:
         output.write(document)
     return document
@@ -1150,7 +1161,79 @@ def print_markdown_report(report):
             print(f"\n{fence}text\n{details}\n{fence}")
 
 
-def compare(fixtures, baseline_rule_sets, after, executable, revisions, gate, json_report, fixture_commit, *, bundles=()):
+def build_junit_report(fixtures, report):
+    zero_counts = {"errors": "0", "skipped": "0"}
+    root = ElementTree.Element("testsuites", {
+        "name": "incident-to-promtool", "tests": str(report["summary"]["after"]["total"]), **zero_counts,
+    })
+    strict = report["gate"]["mode"] == "strict"
+    failures = 0
+    for fixture, result in zip(fixtures, report["fixtures"], strict=True):
+        name = XML_INVALID.sub("\ufffd", result["path"])
+        suite = ElementTree.SubElement(root, "testsuite", {
+            "name": name, "tests": str(fixture.checkpoints), **zero_counts,
+        })
+        changes = {(change["group"], change["alertname"], change["offset_ms"]): change for change in result["changes"]}
+        suite_failures = 0
+        for group, checkpoints in enumerate(fixture.checkpoint_keys, start=1):
+            for alert, offset in sorted(checkpoints):
+                title = XML_INVALID.sub("\ufffd", f"{alert} @ {as_duration(offset)} [group {group}]")
+                case = ElementTree.SubElement(suite, "testcase", {"classname": name, "name": title})
+                change = changes.get((group, alert, offset))
+                if change is None:
+                    continue
+                kind = change["change"]
+                details = "\n\n".join(
+                    f"{label}\n{change[key].strip()}" for label, key in (
+                        ("Baseline", "before_diagnostic"), ("Proposed", "after_diagnostic"),
+                    ) if change[key] is not None
+                )
+                if kind == "newly_failed" or (strict and kind == "still_failing"):
+                    message = "Newly failed checkpoint" if kind == "newly_failed" else "Still failing checkpoint"
+                    failure = ElementTree.SubElement(case, "failure", {"message": message, "type": kind})
+                    failure.text = XML_INVALID.sub("\ufffd", details)
+                    suite_failures += 1
+                else:
+                    message = "Fixed checkpoint." if kind == "fixed" else "Still failing. Allowed by the regressions gate."
+                    ElementTree.SubElement(case, "system-out").text = XML_INVALID.sub("\ufffd", f"{message}\n\n{details}")
+        suite.set("failures", str(suite_failures))
+        failures += suite_failures
+    root.set("failures", str(failures))
+    ElementTree.indent(root)
+    return ElementTree.tostring(root, encoding="utf-8", xml_declaration=True) + b"\n"
+
+
+def write_comparison_reports(reports):
+    with ExitStack() as resources:
+        staged = []
+        for kind, destination, document in reports:
+            with resources.enter_context(staged_output_file(destination, "wb")) as output:
+                output.write(document)
+            staged.append((kind, destination, Path(output.name)))
+
+        published = []
+        try:
+            for kind, destination, source in staged:
+                try:
+                    os.link(source, destination)
+                except FileExistsError as exc:
+                    raise ValueError(f"{kind} report already exists: {destination}") from exc
+                published.append((source, destination))
+        except BaseException:
+            for source, destination in reversed(published):
+                with suppress(OSError):
+                    if os.path.samestat(source.stat(), destination.lstat()):
+                        destination.unlink()
+            raise
+
+
+def compare(
+    fixtures, baseline_rule_sets, after, executable, revisions, gate, json_report, fixture_commit,
+    *, bundles=(), junit_report=None,
+):
+    if (json_report is not None and junit_report is not None
+            and os.path.realpath(json_report) == os.path.realpath(junit_report)):
+        raise ValueError("JSON and JUnit reports require distinct output paths")
     promtool = shutil.which(executable)
     if not promtool:
         raise ValueError(f"promtool executable not found: {executable}")
@@ -1165,11 +1248,13 @@ def compare(fixtures, baseline_rule_sets, after, executable, revisions, gate, js
         report["bundle"] = bundles[0]
     elif bundles:
         report["bundles"] = list(bundles)
+    reports = []
     if json_report is not None:
-        try:
-            write_new_json(json_report, report)
-        except FileExistsError as exc:
-            raise ValueError(f"JSON report already exists: {json_report}") from exc
+        reports.append(("JSON", json_report, json_document(report)))
+    if junit_report is not None:
+        reports.append(("JUnit", junit_report, build_junit_report(fixtures, report)))
+    if reports:
+        write_comparison_reports(reports)
     print_markdown_report(report)
     return int(not report["gate"]["passed"])
 
@@ -1177,6 +1262,7 @@ def compare(fixtures, baseline_rule_sets, after, executable, revisions, gate, js
 def add_comparison_report_options(parser):
     parser.add_argument("--promtool", default="promtool", help="promtool executable or path")
     parser.add_argument("--json-report", type=Path, help="also write a machine-readable report to this new path")
+    parser.add_argument("--junit-report", type=Path, help="also write a JUnit XML report to this new path")
     parser.add_argument(
         "--gate", choices=("strict", "regressions"), default="strict",
         help="fail on any proposed mismatch or only on newly failing checkpoints (default: strict)",
@@ -1244,7 +1330,7 @@ def compare_main(argv):
         after_rules = comparison_rule_bytes(after, args.rule_format)
         return compare(
             fixtures, [before_rules] * len(fixtures), after_rules, args.promtool, revisions=revisions,
-            gate=args.gate, json_report=args.json_report, fixture_commit=fixture_commit,
+            gate=args.gate, json_report=args.json_report, fixture_commit=fixture_commit, junit_report=args.junit_report,
         )
     except (OSError, ValueError, TypeError) as exc:
         parser.exit(2, f"error: {exc}\n")
@@ -1291,6 +1377,7 @@ def compare_bundle_main(argv):
         return compare(
             fixtures, baseline_rule_sets, comparison_rule_bytes(after, args.rule_format), args.promtool, revisions=revisions,
             gate=args.gate, json_report=args.json_report, fixture_commit=None, bundles=bundles,
+            junit_report=args.junit_report,
         )
     except (OSError, ValueError, TypeError) as exc:
         parser.exit(2, f"error: {exc}\n")

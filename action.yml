@@ -46,6 +46,9 @@ outputs:
   json-report-path:
     description: Path to the generated JSON report on the runner, when rule comparison completes.
     value: ${{ steps.replay.outputs.json-report-path }}
+  junit-report-path:
+    description: Path to the generated JUnit XML report on the runner, when rule comparison completes.
+    value: ${{ steps.replay.outputs.junit-report-path }}
   newly-failed:
     description: Number of checkpoints that passed before and failed after the rule changes.
     value: ${{ steps.replay.outputs.newly-failed }}
