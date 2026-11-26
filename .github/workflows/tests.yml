@@ -130,6 +130,9 @@ jobs:
           repo="$RUNNER_TEMP/composite-repo"
           rule="rules/payment alert.yml"
           candidate="rules/payment candidate.yml"
+          scoped_baseline="rules/legacy payment alert.yml"
+          renamed_rule="rules/renamed payment alert.yml"
+          recording_rule="rules/payment recording.yml"
           bundle="incidents/payment baseline.zip"
           second_bundle="incidents/alternative baseline.zip"
           git init --quiet "$repo"
@@ -160,16 +163,34 @@ jobs:
           (repo / "quiet.test.yml").write_text(json.dumps(fixture), encoding="utf-8")
           PY
           cp demo/kubernetes/before.yml "$repo/$rule"
-          git -C "$repo" add -- "$rule" "$bundle" "$second_bundle" payment.test.yml payment.capture.json quiet.test.yml
+          cp demo/kubernetes/before.yml "$repo/$scoped_baseline"
+          git -C "$repo" add -- "$rule" "$scoped_baseline" "$bundle" "$second_bundle" \
+            payment.test.yml payment.capture.json quiet.test.yml
           git -C "$repo" commit --quiet -m 'Add original payment alert'
           cp demo/kubernetes/after.yml "$repo/$rule"
           cp demo/kubernetes/after.yml "$repo/$candidate"
+          sed 's/^          expr: .*$/          expr: payment:http_errors:rate2m > 1/' \
+            demo/kubernetes/after.yml > "$repo/$renamed_rule"
+          cat > "$repo/$recording_rule" <<'YAML'
+          apiVersion: monitoring.coreos.com/v1
+          kind: PrometheusRule
+          metadata:
+            name: payment-recording
+          spec:
+            groups:
+              - name: payment-derived
+                interval: 30s
+                rules:
+                  - record: payment:http_errors:rate2m
+                    expr: sum(rate(payment_http_requests_total{code="500"}[2m]))
+          YAML
           printf 'invalid replacement bundle\n' > "$repo/$bundle"
-          git -C "$repo" add -- "$rule" "$candidate" "$bundle"
-          git -C "$repo" rm --quiet -- "$second_bundle"
+          git -C "$repo" add -- "$rule" "$candidate" "$renamed_rule" "$recording_rule" "$bundle"
+          git -C "$repo" rm --quiet -- "$second_bundle" "$scoped_baseline"
           git -C "$repo" commit --quiet -m 'Fix late payment alert'
           printf 'invalid fixture\n' > "$repo/payment.test.yml"
-          rm -- "$repo/payment.capture.json" "$repo/quiet.test.yml" "$repo/$candidate" "$repo/$bundle"
+          rm -- "$repo/payment.capture.json" "$repo/quiet.test.yml" \
+            "$repo/$candidate" "$repo/$renamed_rule" "$repo/$recording_rule" "$repo/$bundle"
       - name: Compare the fixed rule
         id: fixed
         uses: ./
@@ -270,6 +291,40 @@ jobs:
                   summary = json.loads(committed_bytes("payment.capture.json"))
                   fixture_sha256 = hashlib.sha256(committed_bytes("payment.test.yml")).hexdigest()
                   assert fixture["sha256"] == summary["fixture_sha256"] == fixture_sha256
+          PY
+      - name: Compare a renamed alert and added recording rule
+        id: split-paths
+        uses: ./
+        with:
+          repo-path: ${{ runner.temp }}/composite-repo
+          fixture: payment.test.yml
+          fixture-ref: HEAD^1
+          before-rule-files: |
+            rules/legacy payment alert.yml
+          after-rule-files: |
+            rules/renamed payment alert.yml
+            rules/payment recording.yml
+          rule-format: kubernetes
+      - name: Check comparison with different rule paths
+        env:
+          REPORT_PATH: ${{ steps.split-paths.outputs.report-path }}
+          JSON_REPORT_PATH: ${{ steps.split-paths.outputs.json-report-path }}
+          NEWLY_FAILED: ${{ steps.split-paths.outputs.newly-failed }}
+        run: |
+          report=$(cat "$REPORT_PATH")
+          [[ "$report" == *'| Before | Failed | 1/2 |'* ]]
+          [[ "$report" == *'| After | Passed | 2/2 |'* ]]
+          [[ "$NEWLY_FAILED" == '0' ]]
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          report = json.loads(Path(os.environ["JSON_REPORT_PATH"]).read_text(encoding="utf-8"))
+          assert report["rule_files"] == {
+              "before": ["rules/legacy payment alert.yml"],
+              "after": ["rules/renamed payment alert.yml", "rules/payment recording.yml"],
+          }
           PY
       - name: Compare a committed bundle to a proposed Kubernetes rule
         id: bundled

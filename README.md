@@ -92,6 +92,7 @@ python3 incident_to_promtool.py compare demo/generated/after.test.yml \
 - `summary`에는 `before`와 `after`의 `{matched, total}` 및 `newly_failed`, `fixed`, `still_failing` 건수가 들어갑니다.
 - `fixtures`는 `path`, `before`, `after`, `changes`를 담은 배열입니다. 각 `changes` 항목은 `group`(1부터 시작), `alertname`, `offset_ms`(테스트 시작 기준), `change`, `before_diagnostic`, `after_diagnostic`를 포함합니다. `change`는 `newly_failed`, `fixed`, `still_failing` 중 하나이며, 해당 버전에서 조건을 충족한 경우 진단값은 `null`입니다.
 - `--fixture-ref`를 지정하면 최상위 `fixture_commit`에 테스트 파일을 읽은 커밋 ID를 기록합니다. 각 `fixtures` 항목은 커밋에서 읽었거나 캡처 요약으로 검증했을 때 `sha256`을 포함합니다. 캡처 요약으로 검증한 경우 `capture_summary`에 요약 경로를 기록합니다.
+- `--before-rule-file`과 `--after-rule-file`을 사용하면 최상위 `rule_files`의 `before`와 `after` 배열에 기준 커밋과 수정 커밋의 룰 경로 목록을 기록합니다.
 
 ### JUnit XML 리포트
 
@@ -118,7 +119,7 @@ python3 incident_to_promtool.py compare \
   --rule-file prometheus/checkout.rules.yml > review.md
 ```
 
-`--repo`를 생략하면 현재 디렉터리의 Git 저장소를 사용합니다. `--rule-file`에는 두 커밋에 모두 있는 일반 파일의 경로를 저장소 루트 기준으로 지정합니다. 경로 구분자는 `/`입니다. 의존 룰 파일은 `--rule-file`을 반복해서 추가하세요. 룰 파일이 이동해 경로가 달라졌다면 위의 `--before`와 `--after`로 각 파일 경로를 지정하세요. `--promtool`로 실행 파일을 지정할 수 있습니다.
+`--repo`를 생략하면 현재 디렉터리의 Git 저장소를 사용합니다. `--rule-file`에는 두 커밋에 모두 있는 일반 파일의 경로를 저장소 루트 기준으로 지정합니다. 경로 구분자는 `/`입니다. 의존 룰 파일은 `--rule-file`을 반복해서 추가하세요. `--promtool`로 실행 파일을 지정할 수 있습니다.
 
 PR의 기준 커밋에 있는 기대 동작으로 비교하려면 `--fixture-ref 'HEAD^1'`을 추가할 수 있습니다. 이 경우 작업 트리에서 파일을 수정했거나 그 경로에 파일이 없어도 지정한 커밋에서 테스트 파일과 선택한 캡처 요약을 읽습니다. 두 파일의 경로는 모두 저장소 루트 기준입니다.
 
@@ -126,6 +127,17 @@ PR의 기준 커밋에 있는 기대 동작으로 비교하려면 `--fixture-ref
 python3 incident_to_promtool.py compare tests/fixtures/payment.test.yml \
   --before-ref 'HEAD^1' --after-ref HEAD --rule-file prometheus/payment.rules.yml \
   --fixture-ref 'HEAD^1' --capture-summary tests/fixtures/payment.capture.json
+```
+
+룰 파일의 이름을 바꾸거나 여러 파일을 분할·병합하는 경우에는 `--before-rule-file`과 `--after-rule-file`로 각 커밋의 경로를 지정합니다. `--before-ref`와 `--after-ref` 및 양쪽 경로 목록을 모두 제공하며, 경로는 저장소 루트 기준입니다. 공통 경로(`--rule-file`), 커밋별 경로, 로컬 파일(`--before`, `--after`) 중 한 방식을 선택합니다. `--rule-format kubernetes`는 두 커밋의 룰에 적용합니다.
+
+```sh
+python3 incident_to_promtool.py compare tests/fixtures/payment.test.yml \
+  --before-ref 'HEAD^1' --after-ref HEAD --fixture-ref 'HEAD^1' \
+  --before-rule-file prometheus/payment.rules.yml \
+  --after-rule-file prometheus/payment/alerts.yml \
+  --after-rule-file prometheus/payment/recording.yml \
+  --json-report review-split.json
 ```
 
 ### GitHub Actions에서 PR 검사
@@ -158,7 +170,20 @@ jobs:
             prometheus/checkout.rules.yml
 ```
 
-테스트 파일을 하나 검사하면 `fixture`, 여러 개 검사하면 `fixtures`를 사용합니다. 테스트 파일은 `repo-path` 기준 경로이며 `fixtures`에서는 한 줄에 하나씩 적습니다. 이 경우 `rule-files`에는 두 커밋에 모두 있는 룰 경로를 저장소 루트 기준으로 한 줄에 하나씩 적습니다.
+테스트 파일을 하나 검사하면 `fixture`, 여러 개 검사하면 `fixtures`를 사용합니다. 테스트 파일은 `repo-path` 기준 경로이며 `fixtures`에서는 한 줄에 하나씩 적습니다. 두 커밋의 룰 경로가 같으면 `rule-files`에 저장소 루트 기준으로 한 줄에 하나씩 적습니다.
+
+파일 이동이나 분할·병합을 비교할 때는 `fixture` 또는 `fixtures`와 함께 `before-rule-files`와 `after-rule-files`를 모두 지정합니다. 공통 `rule-files`와 커밋별 목록 중 한 방식을 선택합니다. 각 목록에는 저장소 루트 기준 경로를 한 줄에 하나씩 적습니다. 위 비교 단계의 `with`를 아래와 같이 바꿀 수 있습니다.
+
+```yaml
+with:
+  fixture: tests/fixtures/payment.test.yml
+  fixture-ref: 'HEAD^1'
+  before-rule-files: |
+    prometheus/payment.rules.yml
+  after-rule-files: |
+    prometheus/payment/alerts.yml
+    prometheus/payment/recording.yml
+```
 
 | 선택 입력 | 기본값과 용도 |
 | --- | --- |
@@ -191,7 +216,7 @@ jobs:
       prometheus/checkout.rules.yml
 ```
 
-ZIP 하나를 비교할 때는 `bundle`, 여러 개면 `bundles`에 한 줄에 하나씩 경로를 적습니다. `bundle`, `bundles`, `fixture`, `fixtures` 중 하나를 선택하고 `rule-files`를 함께 지정합니다. 번들 비교에서는 ZIP을 `before-ref`(기본 `HEAD^1`)에서 읽고 공통 수정 룰을 `after-ref`(기본 `HEAD`)에서 읽습니다. 두 경로는 저장소 루트 기준이며, 이 경우 룰 파일은 수정 커밋에 있으면 됩니다. [장애 재현 번들](#장애-재현-번들)
+ZIP 하나를 비교할 때는 `bundle`, 여러 개면 `bundles`에 한 줄에 하나씩 경로를 적습니다. 비교에는 `bundle`, `bundles`, `fixture`, `fixtures` 중 하나를 선택합니다. 번들 비교에서는 ZIP을 `before-ref`(기본 `HEAD^1`)에서 읽고, `rule-files`에 지정한 공통 수정 룰을 `after-ref`(기본 `HEAD`)에서 읽습니다. 두 경로는 저장소 루트 기준이며, 룰 파일은 수정 커밋에 있으면 됩니다. [장애 재현 번들](#장애-재현-번들)
 
 ## Kubernetes PrometheusRule로 테스트
 

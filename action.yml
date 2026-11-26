@@ -20,8 +20,14 @@ inputs:
     description: Newline-separated capture summary paths in the same order as the fixtures. Use with fixture or fixtures.
     required: false
   rule-files:
-    description: Newline-separated rule paths from the repository root. Fixture mode reads these from both refs. Bundle mode reads these from after-ref.
-    required: true
+    description: Newline-separated rule paths from the repository root. Fixture mode reads these from both refs. Bundle mode requires this input and reads it from after-ref.
+    required: false
+  before-rule-files:
+    description: Newline-separated repository-root-relative rule paths at before-ref. Use with after-rule-files in fixture mode.
+    required: false
+  after-rule-files:
+    description: Newline-separated repository-root-relative rule paths at after-ref. Use with before-rule-files in fixture mode.
+    required: false
   rule-format:
     description: Either prometheus or kubernetes. Applies to both versions in fixture mode and proposed rules in bundle mode.
     default: prometheus
@@ -67,6 +73,8 @@ runs:
         INCIDENT_FIXTURE_REF: ${{ inputs.fixture-ref }}
         INCIDENT_CAPTURE_SUMMARIES: ${{ inputs.capture-summaries }}
         INCIDENT_RULE_FILES: ${{ inputs.rule-files }}
+        INCIDENT_BEFORE_RULE_FILES: ${{ inputs.before-rule-files }}
+        INCIDENT_AFTER_RULE_FILES: ${{ inputs.after-rule-files }}
         INCIDENT_RULE_FORMAT: ${{ inputs.rule-format }}
         INCIDENT_GATE: ${{ inputs.gate }}
         INCIDENT_REPO_PATH: ${{ inputs.repo-path }}

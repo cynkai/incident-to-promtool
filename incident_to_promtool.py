@@ -1118,6 +1118,10 @@ def print_markdown_report(report):
             print(f"Read proposed rules from Git commit `{commits['after']}`.\n")
     elif commits:
         print(f"Compared Git commits `{commits['before']}` and `{commits['after']}` (before and after).\n")
+    if rule_paths := report.get("rule_files"):
+        for version in versions:
+            paths = ", ".join(markdown_code(path) for path in rule_paths[version])
+            print(f"{version.title()} rule files {paths}.\n")
     if fixture_commit := report.get("fixture_commit"):
         print(f"Loaded fixtures from Git commit `{fixture_commit}`.\n")
     if "capture_summary" in fixtures[0]:
@@ -1229,7 +1233,7 @@ def write_comparison_reports(reports):
 
 def compare(
     fixtures, baseline_rule_sets, after, executable, revisions, gate, json_report, fixture_commit,
-    *, bundles=(), junit_report=None,
+    *, bundles=(), junit_report=None, rule_paths=None,
 ):
     if (json_report is not None and junit_report is not None
             and os.path.realpath(json_report) == os.path.realpath(junit_report)):
@@ -1248,6 +1252,8 @@ def compare(
         report["bundle"] = bundles[0]
     elif bundles:
         report["bundles"] = list(bundles)
+    if rule_paths is not None:
+        report["rule_files"] = rule_paths
     reports = []
     if json_report is not None:
         reports.append(("JSON", json_report, json_document(report)))
@@ -1288,6 +1294,8 @@ def compare_main(argv):
     parser.add_argument("--before-ref", help="baseline Git ref or commit")
     parser.add_argument("--after-ref", help="proposed Git ref or commit")
     parser.add_argument("--rule-file", action="append", help="repository-root-relative path present in both commits (repeatable)")
+    parser.add_argument("--before-rule-file", action="append", help="repository-root-relative rule path at --before-ref (repeatable)")
+    parser.add_argument("--after-rule-file", action="append", help="repository-root-relative rule path at --after-ref (repeatable)")
     parser.add_argument("--repo", type=Path, help="Git repository for ref comparison (default: current directory)")
     parser.add_argument("--fixture-ref", help="read fixtures and capture summaries from this Git ref (Git comparison only)")
     parser.add_argument(
@@ -1300,28 +1308,40 @@ def compare_main(argv):
     )
     add_comparison_report_options(parser)
     args = parser.parse_args(argv)
-    git_mode = any(value is not None for value in (args.before_ref, args.after_ref, args.rule_file, args.repo))
+    scoped_paths = args.before_rule_file is not None or args.after_rule_file is not None
+    git_mode = scoped_paths or any(value is not None for value in (args.before_ref, args.after_ref, args.rule_file, args.repo))
     if args.fixture_ref is not None and not git_mode:
         parser.error("--fixture-ref requires Git rule comparison")
     if args.capture_summary is not None and len(args.capture_summary) != len(args.fixtures):
         parser.error("provide one --capture-summary per incident fixture, in the same order")
     if git_mode and (args.before or args.after):
         parser.error("choose either --before and --after or Git ref comparison options")
-    if git_mode and not (args.before_ref and args.after_ref and args.rule_file):
-        parser.error("Git comparison requires --before-ref, --after-ref and at least one --rule-file")
+    if git_mode and not (args.before_ref and args.after_ref):
+        parser.error("Git comparison requires --before-ref and --after-ref")
+    if scoped_paths and args.rule_file:
+        parser.error("choose either --rule-file or the --before-rule-file and --after-rule-file lists")
+    if scoped_paths and not (args.before_rule_file and args.after_rule_file):
+        parser.error("provide both --before-rule-file and --after-rule-file lists")
+    if git_mode and not (scoped_paths or args.rule_file):
+        parser.error("provide --rule-file or both --before-rule-file and --after-rule-file lists")
     if not git_mode and not (args.before and args.after):
         parser.error("file comparison requires both --before and --after")
     try:
         repo = None
         revisions = None
         fixture_commit = None
+        rule_paths = None
         if git_mode:
             repo = args.repo or Path.cwd()
             revisions = (resolve_commit(repo, args.before_ref), resolve_commit(repo, args.after_ref))
             if args.fixture_ref is not None:
                 fixture_commit = resolve_commit(repo, args.fixture_ref)
-            before = read_committed_rules(repo, revisions[0], args.rule_file)
-            after = read_committed_rules(repo, revisions[1], args.rule_file)
+            baseline_paths = args.before_rule_file if scoped_paths else args.rule_file
+            candidate_paths = args.after_rule_file if scoped_paths else args.rule_file
+            before = read_committed_rules(repo, revisions[0], baseline_paths)
+            after = read_committed_rules(repo, revisions[1], candidate_paths)
+            if scoped_paths:
+                rule_paths = {"before": baseline_paths, "after": candidate_paths}
         else:
             before = read_rule_sources(args.before)
             after = read_rule_sources(args.after)
@@ -1331,6 +1351,7 @@ def compare_main(argv):
         return compare(
             fixtures, [before_rules] * len(fixtures), after_rules, args.promtool, revisions=revisions,
             gate=args.gate, json_report=args.json_report, fixture_commit=fixture_commit, junit_report=args.junit_report,
+            rule_paths=rule_paths,
         )
     except (OSError, ValueError, TypeError) as exc:
         parser.exit(2, f"error: {exc}\n")
