@@ -15,11 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - version: '3.9.0'
-            sha256: 27c7438ffbd2a99a25b14e5b1540bdc4f14519b5c5495efad537a61296075198
-          - version: '3.11.0'
-            sha256: ff799c3e4c318e17dec14aaaa406a4da328fabb4578336b36d96d893870c3b76
+        version: ['3.9.0', '3.11.0']
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -27,15 +23,7 @@ jobs:
       - name: Download and verify promtool
         env:
           VERSION: ${{ matrix.version }}
-          SHA256: ${{ matrix.sha256 }}
-        run: |
-          asset="prometheus-${VERSION}.linux-amd64"
-          archive="$RUNNER_TEMP/promtool.tar.gz"
-          curl --fail --silent --show-error --location --retry 3 \
-            --output "$archive" "https://github.com/prometheus/prometheus/releases/download/v${VERSION}/${asset}.tar.gz"
-          printf '%s  %s\n' "$SHA256" "$archive" | sha256sum --check
-          tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP" \
-            --strip-components=1 "${asset}/promtool"
+        run: bash scripts/install-promtool.sh "$VERSION" "$RUNNER_TEMP"
       - name: Set up test environment
         run: |
           python3 -m venv "$RUNNER_TEMP/test-venv"
@@ -43,3 +31,66 @@ jobs:
       - name: Run tests
         run: |
           PROMTOOL="$RUNNER_TEMP/promtool" "$RUNNER_TEMP/test-venv/bin/python" -m unittest discover -s tests -v
+
+  composite-action:
+    name: Composite Action smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Prepare Kubernetes rules and fixture
+        run: |
+          repo="$RUNNER_TEMP/composite-repo"
+          rule="rules/payment alert.yml"
+          git init --quiet "$repo"
+          git -C "$repo" config user.name 'Integration Test'
+          git -C "$repo" config user.email 'test@example.invalid'
+          mkdir "$repo/rules"
+          python3 incident_to_promtool.py demo/demo.json \
+            --matrix demo/incident.matrix.json --output "$repo/payment.test.yml"
+          cp demo/kubernetes/before.yml "$repo/$rule"
+          git -C "$repo" add -- "$rule" payment.test.yml
+          git -C "$repo" commit --quiet -m 'Add original payment alert'
+          cp demo/kubernetes/after.yml "$repo/$rule"
+          git -C "$repo" add -- "$rule"
+          git -C "$repo" commit --quiet -m 'Fix late payment alert'
+      - name: Compare the fixed rule
+        id: fixed
+        uses: ./
+        with:
+          repo-path: ${{ runner.temp }}/composite-repo
+          fixture: payment.test.yml
+          rule-files: |
+            rules/payment alert.yml
+          rule-format: kubernetes
+      - name: Check the successful report
+        env:
+          REPORT_PATH: ${{ steps.fixed.outputs.report-path }}
+        run: |
+          test -f "$REPORT_PATH"
+          report=$(cat "$REPORT_PATH")
+          [[ "$report" == *'| Before | Failed | 1/2 |'* ]]
+          [[ "$report" == *'| After | Passed | 2/2 |'* ]]
+      - name: Compare with refs reversed
+        id: regression
+        continue-on-error: true
+        uses: ./
+        with:
+          repo-path: ${{ runner.temp }}/composite-repo
+          fixture: payment.test.yml
+          rule-files: |
+            rules/payment alert.yml
+          rule-format: kubernetes
+          before-ref: HEAD
+          after-ref: HEAD^1
+      - name: Check that the regression failed
+        env:
+          OUTCOME: ${{ steps.regression.outcome }}
+          REPORT_PATH: ${{ steps.regression.outputs.report-path }}
+        run: |
+          test "$OUTCOME" = failure
+          test -f "$REPORT_PATH"
+          report=$(cat "$REPORT_PATH")
+          [[ "$report" == *'| Before | Passed | 2/2 |'* ]]
+          [[ "$report" == *'| After | Failed | 1/2 |'* ]]

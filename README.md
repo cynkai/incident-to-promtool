@@ -51,7 +51,7 @@ python3 incident_to_promtool.py compare tests/fixtures/payment.test.yml \
 
 ### GitHub Actions에서 PR 검사
 
-아래 예제의 테스트 파일과 룰 경로를 저장소에 커밋한 경로로 바꾸고 기존 `promtool` 설치 단계를 사용하세요. 기본 PR 체크아웃에서는 GitHub가 만든 머지 후보(`HEAD`)와 그 첫 부모인 대상 브랜치 커밋(`HEAD^1`)을 비교합니다. 머지 후 룰이 기대 동작과 다르면 검사 단계가 실패합니다. 비교 결과는 실행 요약에 표시됩니다.
+테스트 파일과 룰을 커밋한 뒤 PR 워크플로에 액션을 추가합니다. 기본 PR 체크아웃에서 읽은 동일한 테스트 파일을 적용해 GitHub가 만든 머지 후보(`HEAD`)와 그 첫 부모(`HEAD^1`)를 비교합니다. 두 커밋이 로컬 Git 이력에 있도록 전체 이력을 가져옵니다.
 
 ```yaml
 name: Alert rule review
@@ -67,13 +67,25 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      # 기존 promtool 3.9+ 설치 단계를 여기에 둡니다.
       - name: Compare alert rules
-        run: |
-          python3 incident_to_promtool.py compare tests/fixtures/payment.test.yml \
-            --before-ref 'HEAD^1' --after-ref HEAD \
-            --rule-file prometheus/payment.rules.yml >> "$GITHUB_STEP_SUMMARY"
+        id: compare
+        uses: cynkai/incident-to-promtool@main
+        with:
+          fixture: tests/fixtures/payment.test.yml
+          rule-files: |
+            prometheus/payment.rules.yml
 ```
+
+`fixture`와 `rule-files`는 필수입니다. 테스트 파일은 `repo-path` 기준 경로로, 룰은 저장소 루트 기준 경로로 한 줄에 하나씩 지정합니다.
+
+| 선택 입력 | 기본값과 용도 |
+| --- | --- |
+| `repo-path` | `.`. 체크아웃한 Git 저장소 경로 |
+| `rule-format` | `prometheus`. 렌더링된 `PrometheusRule`은 `kubernetes` |
+| `before-ref`, `after-ref` | `HEAD^1`, `HEAD`. 다른 Git ref를 쓰려면 두 커밋을 미리 가져옵니다. |
+| `promtool-path` | 생략하면 Linux x64에서 고정된 Promtool 3.11.0을 설치합니다. 기존 실행 파일은 작업 디렉터리 기준 경로나 `PATH`에 있는 명령으로 지정합니다. |
+
+`kubernetes` 모드는 PyYAML 6.0.3을 격리된 가상 환경에 설치합니다. 유효한 비교는 실행 요약에 표시되며 Markdown 파일 경로를 `steps.compare.outputs.report-path`로 제공합니다. 수정 룰이 기대 동작을 충족하면 단계가 통과합니다. 불일치하면 리포트가 남고 단계는 실패합니다. 입력이나 실행 오류는 단계 로그에만 표시됩니다.
 
 ## Kubernetes PrometheusRule로 테스트
 

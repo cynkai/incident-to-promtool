@@ -1,0 +1,43 @@
+name: Incident to Promtool
+description: Replay a captured incident against Prometheus alert rules before and after a Git change.
+inputs:
+  fixture:
+    description: Path to a generated incident test fixture, relative to the checked-out repository.
+    required: true
+  rule-files:
+    description: Newline-separated, repository-root-relative rule paths present in both commits.
+    required: true
+  rule-format:
+    description: Rule format for both versions, either prometheus or kubernetes.
+    default: prometheus
+  repo-path:
+    description: Checkout directory, relative to the workflow workspace if not absolute.
+    default: '.'
+  before-ref:
+    description: Baseline Git revision. The default is the first parent of the PR merge candidate.
+    default: 'HEAD^1'
+  after-ref:
+    description: Proposed Git revision. The default is the checked-out PR merge candidate.
+    default: HEAD
+  promtool-path:
+    description: Path to an existing promtool executable or command name. The action installs promtool on Linux x64 when omitted.
+outputs:
+  report-path:
+    description: Path to the generated Markdown report on the runner, when rule comparison completes.
+    value: ${{ steps.replay.outputs.report-path }}
+runs:
+  using: composite
+  steps:
+    - name: Replay incident
+      id: replay
+      shell: bash
+      env:
+        INCIDENT_ACTION_PATH: ${{ github.action_path }}
+        INCIDENT_FIXTURE: ${{ inputs.fixture }}
+        INCIDENT_RULE_FILES: ${{ inputs.rule-files }}
+        INCIDENT_RULE_FORMAT: ${{ inputs.rule-format }}
+        INCIDENT_REPO_PATH: ${{ inputs.repo-path }}
+        INCIDENT_BEFORE_REF: ${{ inputs.before-ref }}
+        INCIDENT_AFTER_REF: ${{ inputs.after-ref }}
+        INCIDENT_PROMTOOL_PATH: ${{ inputs.promtool-path }}
+      run: bash "$INCIDENT_ACTION_PATH/scripts/replay-action.sh"
