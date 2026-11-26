@@ -37,7 +37,43 @@ python3 incident_to_promtool.py compare demo/generated/after.test.yml \
 
 종료 코드 `0`은 수정 룰 통과, `1`은 수정 룰에서 기대 동작 불일치, `2`는 입력 또는 `promtool` 실행 오류입니다. 기존 룰에서 발생한 기대 동작 불일치는 리포트에 표시하며 종료 코드는 수정 룰의 결과를 따릅니다.
 
-GitHub Actions에서 같은 명령의 출력을 `>> "$GITHUB_STEP_SUMMARY"`로 보내면 실행 요약에 표와 불일치 내용이 표시됩니다. 수정 룰이 검사에 실패하면 그 단계도 실패합니다.
+### Git 커밋으로 비교
+
+두 Git ref를 지정하면 현재 체크아웃을 유지한 채 각 커밋에서 룰을 읽습니다. Markdown 리포트에는 확정된 두 커밋 ID가 들어가며 종료 코드는 파일 경로로 비교할 때와 같습니다.
+
+```sh
+python3 incident_to_promtool.py compare tests/fixtures/payment.test.yml \
+  --before-ref "$BASE_SHA" --after-ref "$HEAD_SHA" \
+  --rule-file prometheus/payment.rules.yml > review.md
+```
+
+`--repo`를 생략하면 현재 디렉터리의 Git 저장소를 사용합니다. `--rule-file`에는 두 커밋에 모두 있는 일반 파일의 경로를 저장소 루트 기준으로 지정합니다. 경로 구분자는 `/`입니다. 의존 룰 파일은 `--rule-file`을 반복해서 추가하세요. 룰 파일이 이동해 경로가 달라졌다면 위의 `--before`와 `--after`로 각 파일 경로를 지정하세요. `--promtool`로 실행 파일을 지정할 수 있습니다.
+
+### GitHub Actions에서 PR 검사
+
+아래 예제의 테스트 파일과 룰 경로를 저장소에 커밋한 경로로 바꾸고 기존 `promtool` 설치 단계를 사용하세요. 기본 PR 체크아웃에서는 GitHub가 만든 머지 후보(`HEAD`)와 그 첫 부모인 대상 브랜치 커밋(`HEAD^1`)을 비교합니다. 머지 후 룰이 기대 동작과 다르면 검사 단계가 실패합니다. 비교 결과는 실행 요약에 표시됩니다.
+
+```yaml
+name: Alert rule review
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # 기존 promtool 3.9+ 설치 단계를 여기에 둡니다.
+      - name: Compare alert rules
+        run: |
+          python3 incident_to_promtool.py compare tests/fixtures/payment.test.yml \
+            --before-ref 'HEAD^1' --after-ref HEAD \
+            --rule-file prometheus/payment.rules.yml >> "$GITHUB_STEP_SUMMARY"
+```
 
 ## 내 Prometheus로 실행
 
