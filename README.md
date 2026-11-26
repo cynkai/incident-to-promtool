@@ -75,6 +75,8 @@ python3 incident_to_promtool.py compare demo/generated/after.test.yml \
 
 리포트에는 게이트 결과와 새로 실패한 검사(`Newly failed`), 다시 통과한 검사(`Fixed`), 여전히 실패하는 검사(`Still failing`)가 표시됩니다. `regressions`에서 게이트를 통과해도 기존 실패는 리포트에 남습니다. 종료 코드는 게이트 통과 `0`, 게이트 실패 `1`, 입력 또는 `promtool` 실행 오류 `2`입니다. 실행 오류는 두 모드 모두 로그에 표시됩니다.
 
+캡처 요약을 보관했다면 `--capture-summary PATH`로 비교에 사용할 테스트 파일이 생성 당시와 같은지 검증할 수 있습니다. 이 옵션을 쓸 때는 위치 인자로 지정한 테스트 파일마다 하나씩, 같은 순서로 요약을 지정합니다. v1 요약의 `fixture_sha256`을 테스트 파일 바이트의 SHA-256과 대조합니다. 요약이 유효하지 않거나 해시가 다르면 `promtool` 실행 전에 종료 코드 `2`를 반환합니다. [캡처 요약 JSON](#캡처-요약-json)
+
 ### JSON 리포트
 
 자동화에서 비교 결과를 읽으려면 `--json-report`를 추가합니다. JSON 출력은 새 경로를 지정합니다. 종료 코드 `0`과 `1`에서 JSON이 기록되고, 입력이나 실행 오류(`2`)가 발생하면 JSON 파일은 생성되지 않습니다.
@@ -89,6 +91,7 @@ python3 incident_to_promtool.py compare demo/generated/after.test.yml \
 - `commits`는 Git 비교의 `{before, after}` 커밋 ID이며 파일 경로로 비교할 때는 `null`입니다.
 - `summary`에는 `before`와 `after`의 `{matched, total}` 및 `newly_failed`, `fixed`, `still_failing` 건수가 들어갑니다.
 - `fixtures`는 `path`, `before`, `after`, `changes`를 담은 배열입니다. 각 `changes` 항목은 `group`(1부터 시작), `alertname`, `offset_ms`(테스트 시작 기준), `change`, `before_diagnostic`, `after_diagnostic`를 포함합니다. `change`는 `newly_failed`, `fixed`, `still_failing` 중 하나이며, 해당 버전에서 조건을 충족한 경우 진단값은 `null`입니다.
+- `--fixture-ref`를 지정하면 최상위 `fixture_commit`에 테스트 파일을 읽은 커밋 ID를 기록합니다. 각 `fixtures` 항목은 커밋에서 읽었거나 캡처 요약으로 검증했을 때 `sha256`을 포함합니다. 캡처 요약으로 검증한 경우 `capture_summary`에 요약 경로를 기록합니다.
 
 ### Git 커밋으로 비교
 
@@ -103,6 +106,14 @@ python3 incident_to_promtool.py compare \
 ```
 
 `--repo`를 생략하면 현재 디렉터리의 Git 저장소를 사용합니다. `--rule-file`에는 두 커밋에 모두 있는 일반 파일의 경로를 저장소 루트 기준으로 지정합니다. 경로 구분자는 `/`입니다. 의존 룰 파일은 `--rule-file`을 반복해서 추가하세요. 룰 파일이 이동해 경로가 달라졌다면 위의 `--before`와 `--after`로 각 파일 경로를 지정하세요. `--promtool`로 실행 파일을 지정할 수 있습니다.
+
+PR의 기준 커밋에 있는 기대 동작으로 비교하려면 `--fixture-ref 'HEAD^1'`을 추가할 수 있습니다. 이 경우 작업 트리에서 파일을 수정했거나 그 경로에 파일이 없어도 지정한 커밋에서 테스트 파일과 선택한 캡처 요약을 읽습니다. 두 파일의 경로는 모두 저장소 루트 기준입니다.
+
+```sh
+python3 incident_to_promtool.py compare tests/fixtures/payment.test.yml \
+  --before-ref 'HEAD^1' --after-ref HEAD --rule-file prometheus/payment.rules.yml \
+  --fixture-ref 'HEAD^1' --capture-summary tests/fixtures/payment.capture.json
+```
 
 ### GitHub Actions에서 PR 검사
 
@@ -141,6 +152,8 @@ jobs:
 | `repo-path` | `.`. 체크아웃한 Git 저장소 경로 |
 | `rule-format` | `prometheus`. 렌더링된 `PrometheusRule`은 `kubernetes` |
 | `before-ref`, `after-ref` | `HEAD^1`, `HEAD`. 다른 Git ref를 쓰려면 두 커밋을 미리 가져옵니다. |
+| `fixture-ref` | 생략하면 작업 트리에서 읽습니다. PR 기준 커밋에 있는 테스트를 쓰려면 `with`에 `fixture-ref: 'HEAD^1'`을 지정합니다. |
+| `capture-summaries` | 검증에 사용할 v1 캡처 요약 경로를 테스트 파일과 같은 순서로 한 줄에 하나씩 지정합니다. `fixture-ref`를 쓰면 같은 커밋의 저장소 루트 기준 경로를 사용합니다. |
 | `gate` | `strict`. 새로 실패한 검사만 단계 실패로 처리하려면 `with`에 `gate: regressions`를 지정합니다. |
 | `promtool-path` | 생략하면 Linux x64에서 고정된 Promtool 3.11.0을 설치합니다. 기존 실행 파일은 작업 디렉터리 기준 경로나 `PATH`에 있는 명령으로 지정합니다. |
 

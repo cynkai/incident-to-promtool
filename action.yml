@@ -7,6 +7,12 @@ inputs:
   fixtures:
     description: Newline-separated generated incident test fixture paths, relative to repo-path. Provide either fixtures or fixture.
     required: false
+  fixture-ref:
+    description: Git revision containing the repository-root-relative fixture and capture summary paths. Omit to read from the checkout.
+    required: false
+  capture-summaries:
+    description: Newline-separated capture summary paths in the same order as the fixtures.
+    required: false
   rule-files:
     description: Newline-separated, repository-root-relative rule paths present in both commits.
     required: true
@@ -47,6 +53,8 @@ runs:
         INCIDENT_ACTION_PATH: ${{ github.action_path }}
         INCIDENT_FIXTURE: ${{ inputs.fixture }}
         INCIDENT_FIXTURES: ${{ inputs.fixtures }}
+        INCIDENT_FIXTURE_REF: ${{ inputs.fixture-ref }}
+        INCIDENT_CAPTURE_SUMMARIES: ${{ inputs.capture-summaries }}
         INCIDENT_RULE_FILES: ${{ inputs.rule-files }}
         INCIDENT_RULE_FORMAT: ${{ inputs.rule-format }}
         INCIDENT_GATE: ${{ inputs.gate }}

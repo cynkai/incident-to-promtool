@@ -22,12 +22,40 @@ fi
 if [[ -n "${INCIDENT_FIXTURE:-}" ]]; then
     fixture_paths+=("$INCIDENT_FIXTURE")
 fi
-for fixture_path in "${fixture_paths[@]}"; do
-    if [[ ! -f "$fixture_path" ]]; then
-        printf 'Incident fixture file not found: %q\n' "$fixture_path" >&2
+
+comparison_arguments=(--before-ref="$INCIDENT_BEFORE_REF" --after-ref="$INCIDENT_AFTER_REF")
+fixture_ref=${INCIDENT_FIXTURE_REF:-}
+if [[ -n "$fixture_ref" ]]; then
+    comparison_arguments+=(--fixture-ref="$fixture_ref")
+else
+    for fixture_path in "${fixture_paths[@]}"; do
+        if [[ ! -f "$fixture_path" ]]; then
+            printf 'Incident fixture file not found: %q\n' "$fixture_path" >&2
+            exit 2
+        fi
+    done
+fi
+
+summary_paths=()
+while IFS= read -r summary_path; do
+    summary_path=${summary_path%$'\r'}
+    if [[ "$summary_path" =~ [^[:space:]] ]]; then
+        summary_paths+=("$summary_path")
+    fi
+done <<< "${INCIDENT_CAPTURE_SUMMARIES:-}"
+if [[ -n "${summary_paths[0]:-}" ]]; then
+    if [[ "${#summary_paths[@]}" -ne "${#fixture_paths[@]}" ]]; then
+        printf 'Provide one capture summary path per fixture.\n' >&2
         exit 2
     fi
-done
+    for summary_path in "${summary_paths[@]}"; do
+        if [[ -z "$fixture_ref" && ! -f "$summary_path" ]]; then
+            printf 'Capture summary file not found: %q\n' "$summary_path" >&2
+            exit 2
+        fi
+        comparison_arguments+=(--capture-summary="$summary_path")
+    done
+fi
 
 rule_arguments=()
 while IFS= read -r rule; do
@@ -82,7 +110,7 @@ command_token=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
 # Prevent diagnostic text from repository content from being read as runner commands.
 printf '::stop-commands::%s\n' "$command_token"
 "$python" "$INCIDENT_ACTION_PATH/incident_to_promtool.py" compare \
-    --before-ref="$INCIDENT_BEFORE_REF" --after-ref="$INCIDENT_AFTER_REF" \
+    "${comparison_arguments[@]}" \
     --promtool="$promtool" --rule-format="$INCIDENT_RULE_FORMAT" --gate "$gate" \
     --json-report "$json_report" "${rule_arguments[@]}" -- "${fixture_paths[@]}" > "$report" || status=$?
 printf '::%s::\n' "$command_token"
