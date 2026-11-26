@@ -33,6 +33,10 @@ ALERT_MISMATCH = re.compile(r"\A[ \t]*alertname: (.+), time: ([^,\n]+),[ \t]*\n[
 MAX_VALUES = 2_000_000
 
 
+class FixtureTooLargeError(ValueError):
+    pass
+
+
 def duration_ms(value):
     if not isinstance(value, str):
         raise ValueError("durations must be strings such as '30s' or '2m30s'")
@@ -144,9 +148,8 @@ def series_name(labels):
     return metric + ("{" + ",".join(matchers) + "}" if matchers else "")
 
 
-def collect_series(matrices, start, end, step, round_up):
+def capture_samples(matrices, start, end):
     samples_by_series = {}
-    largest_shift = 0
     for matrix in matrices:
         if matrix.get("status") != "success" or matrix.get("warnings"):
             raise ValueError("Prometheus capture failed or reported warnings")
@@ -157,7 +160,7 @@ def collect_series(matrices, start, end, step, round_up):
             name = series_name(series["metric"])
             if series.get("histograms"):
                 raise ValueError("native histograms require a different fixture format")
-            slots = samples_by_series.setdefault(name, {})
+            samples = samples_by_series.setdefault(name, {})
             for timestamp, value in series["values"]:
                 milliseconds = Decimal(str(timestamp)) * 1000
                 if not milliseconds.is_finite() or milliseconds != milliseconds.to_integral_value():
@@ -165,44 +168,63 @@ def collect_series(matrices, start, end, step, round_up):
                 offset = int(milliseconds) - start
                 if offset < 0 or offset > end - start:
                     continue
-                slot, remainder = divmod(offset, step)
-                if remainder:
-                    if not round_up:
-                        raise ValueError(
-                            f"a sample is off the {as_duration(step)} grid; "
-                            "choose a finer sample_interval or rerun with --round-up"
-                        )
-                    largest_shift = max(largest_shift, step - remainder)
-                    slot += 1
                 if not isinstance(value, str) or not FLOAT.fullmatch(value) or not math.isfinite(float(value)):
                     raise ValueError("only finite float samples are supported")
-                if slot in slots:
-                    previous_offset, previous_value = slots[slot]
-                    if previous_offset != offset:
-                        raise ValueError("multiple samples land in one fixture slot; choose a finer sample_interval")
-                    if float(previous_value).hex() != float(value).hex():
+                if offset in samples:
+                    if float(samples[offset]).hex() != float(value).hex():
                         raise ValueError(f"conflicting values for {name} at the same timestamp")
                     continue
-                slots[slot] = (offset, value)
+                samples[offset] = value
 
-    active = {name: slots for name, slots in samples_by_series.items() if slots}
+    active = {name: samples for name, samples in samples_by_series.items() if samples}
     if not active:
         raise ValueError("no float samples found in the capture window")
-    if sum(max(slots) + 1 for slots in active.values()) > MAX_VALUES:
-        raise ValueError("capture exceeds 2,000,000 fixture slots; narrow the window or selectors")
+    return active
 
+
+def infer_sample_interval(samples_by_series, evaluation):
+    step = evaluation
+    for samples in samples_by_series.values():
+        for offset in samples:
+            step = math.gcd(step, offset)
+            if step == 1:
+                return step
+    return step
+
+
+def encode_samples(samples_by_series, step, round_up):
     records = []
-    for name, slots in sorted(active.items()):
+    largest_shift = 0
+    expanded_slots = 0
+    for name, samples in sorted(samples_by_series.items()):
         values = []
         next_slot = 0
-        for slot, (_, value) in sorted(slots.items()):
+        for offset, value in sorted(samples.items()):
+            slot, remainder = divmod(offset, step)
+            if remainder:
+                if not round_up:
+                    raise ValueError(
+                        f"a sample is off the {as_duration(step)} grid; "
+                        'set sample_interval to "auto", choose a finer interval, or rerun with --round-up'
+                    )
+                largest_shift = max(largest_shift, step - remainder)
+                slot += 1
             missing = slot - next_slot
+            if missing < 0:
+                raise ValueError("multiple samples land in one fixture slot; choose a finer sample_interval")
             if missing:
                 values.append("_" if missing == 1 else f"_x{missing}")
             values.append(value)
             next_slot = slot + 1
+        expanded_slots += next_slot
+        if expanded_slots > MAX_VALUES:
+            raise FixtureTooLargeError(f"capture exceeds {MAX_VALUES:,} fixture slots; narrow the window or selectors")
         records.append({"series": name, "values": " ".join(values)})
     return records, largest_shift
+
+
+def collect_series(matrices, start, end, step, round_up):
+    return encode_samples(capture_samples(matrices, start, end), step, round_up)
 
 
 def generate(args):
@@ -210,11 +232,12 @@ def generate(args):
     start, begin_ms = timestamp_ms(config["start"])
     end, end_ms = timestamp_ms(config["end"])
     window = end_ms - begin_ms
-    step = duration_ms(config["sample_interval"])
     evaluation = duration_ms(config["evaluation_interval"])
+    automatic = config["sample_interval"] == "auto"
+    step = evaluation if automatic else duration_ms(config["sample_interval"])
     if window <= 0 or step <= 0 or evaluation <= 0 or evaluation % step:
         raise ValueError("end must follow start and evaluation_interval must be a positive multiple of sample_interval")
-    if args.round_up and window % step:
+    if args.round_up and not automatic and window % step:
         raise ValueError("with --round-up, end must fall on the sample grid")
 
     tests = rule_test_cases(config["expectations"], window, evaluation)
@@ -244,7 +267,18 @@ def generate(args):
             raise ValueError("selectors must contain raw metric selectors, such as requests_total{job=\"api\"}")
         matrices = (fetch_matrix(base_url, selector, end, window) for selector in selectors)
 
-    records, shift = collect_series(matrices, begin_ms, end_ms, step, args.round_up)
+    if automatic:
+        samples = capture_samples(matrices, begin_ms, end_ms)
+        step = infer_sample_interval(samples, evaluation)
+        try:
+            records, shift = encode_samples(samples, step, round_up=False)
+        except FixtureTooLargeError as exc:
+            raise ValueError(
+                f"automatic {as_duration(step)} sample interval exceeds {MAX_VALUES:,} fixture slots; "
+                "use a shorter capture window, narrow the selectors, or set a numeric sample_interval with --round-up"
+            ) from exc
+    else:
+        records, shift = collect_series(matrices, begin_ms, end_ms, step, args.round_up)
     fixture = {
         "rule_files": rule_files,
         "evaluation_interval": as_duration(evaluation),
@@ -257,7 +291,7 @@ def generate(args):
     }
     # JSON syntax is also valid YAML, which lets promtool read it without a Python YAML dependency.
     write_new_json(args.output, fixture)
-    return len(records), len(tests), shift
+    return len(records), len(tests), shift, step if automatic else None
 
 
 def git_output(repo, *args):
@@ -628,16 +662,18 @@ def main():
     source.add_argument("--prometheus-url", help="query a Prometheus server for raw historical samples")
     source.add_argument("--matrix", type=Path, action="append", help="read a saved raw query response (repeatable)")
     parser.add_argument("--rule-file", type=Path, action="append", help="override config rule_files (repeatable)")
-    parser.add_argument("--round-up", action="store_true", help="shift off-grid samples to the next fixture slot")
+    parser.add_argument("--round-up", action="store_true", help="shift off-grid samples with a numeric sample interval")
     parser.add_argument("--output", required=True, type=Path, help="new promtool YAML test file")
     args = parser.parse_args()
     try:
-        series, checks, shift = generate(args)
+        series, checks, shift, automatic_interval = generate(args)
     except FileExistsError:
         parser.exit(1, f"error: output file already exists: {args.output}\n")
     except (ValueError, KeyError, TypeError, AttributeError, InvalidOperation, OSError) as exc:
         parser.exit(1, f"error: {exc}\n")
     print(f"Wrote {args.output} ({series} series, {checks} checkpoints).")
+    if automatic_interval is not None:
+        print(f"Automatically selected a {as_duration(automatic_interval)} sample interval.")
     if shift:
         print(f"Shifted off-grid samples forward by up to {shift} ms.", file=sys.stderr)
 
