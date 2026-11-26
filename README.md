@@ -35,7 +35,9 @@ python3 incident_to_promtool.py compare demo/generated/after.test.yml \
 
 비교 입력은 이 CLI가 JSON 문법으로 생성한 `.test.yml` 파일입니다. 파일을 하나 지정하거나 여러 장애 파일을 이어서 지정할 수 있습니다. 같은 파일은 한 번씩 지정합니다. 리포트에는 전체 검사 건수와 장애별 검사 건수, 기대 동작과 달랐던 결과가 표시됩니다. 의존 룰 파일은 `--before`와 `--after`를 각각 반복해서 지정하세요. `--promtool /path/to/promtool`로 실행 파일을 지정할 수 있습니다.
 
-종료 코드 `0`은 수정 룰이 모든 검사를 통과했다는 뜻입니다. 수정 룰에서 기대 동작 불일치가 하나라도 있으면 `1`입니다. 입력 또는 `promtool` 실행 오류가 하나라도 있으면 `2`이고 오류는 로그에 표시됩니다. 기존 룰의 기대 동작 불일치도 리포트에 표시합니다.
+기본 `--gate strict`에서는 수정 룰이 모든 검사를 통과해야 합니다. `--gate regressions`를 지정하면 기존 룰에서 통과하고 수정 룰에서 실패한 검사가 있을 때 게이트가 실패합니다. 같은 검사는 테스트 파일, 테스트 그룹, 알람 이름, 테스트 시작부터의 평가 시점으로 식별합니다.
+
+리포트에는 게이트 결과와 새로 실패한 검사(`Newly failed`), 다시 통과한 검사(`Fixed`), 여전히 실패하는 검사(`Still failing`)가 표시됩니다. `regressions`에서 게이트를 통과해도 기존 실패는 리포트에 남습니다. 종료 코드는 게이트 통과 `0`, 게이트 실패 `1`, 입력 또는 `promtool` 실행 오류 `2`입니다. 실행 오류는 두 모드 모두 로그에 표시됩니다.
 
 ### Git 커밋으로 비교
 
@@ -88,9 +90,10 @@ jobs:
 | `repo-path` | `.`. 체크아웃한 Git 저장소 경로 |
 | `rule-format` | `prometheus`. 렌더링된 `PrometheusRule`은 `kubernetes` |
 | `before-ref`, `after-ref` | `HEAD^1`, `HEAD`. 다른 Git ref를 쓰려면 두 커밋을 미리 가져옵니다. |
+| `gate` | `strict`. 새로 실패한 검사만 단계 실패로 처리하려면 `with`에 `gate: regressions`를 지정합니다. |
 | `promtool-path` | 생략하면 Linux x64에서 고정된 Promtool 3.11.0을 설치합니다. 기존 실행 파일은 작업 디렉터리 기준 경로나 `PATH`에 있는 명령으로 지정합니다. |
 
-`kubernetes` 모드는 PyYAML 6.0.3을 격리된 가상 환경에 설치합니다. 비교 결과는 실행 요약에 표시되며 Markdown 파일 경로를 `steps.compare.outputs.report-path`로 제공합니다. 수정 룰에서 기대 동작 불일치가 하나라도 있으면 리포트를 남기고 단계가 실패합니다. 입력이나 실행 오류는 단계 로그에만 표시됩니다.
+`kubernetes` 모드는 PyYAML 6.0.3을 격리된 가상 환경에 설치합니다. 비교 결과는 실행 요약에 표시되며 Markdown 파일 경로를 `steps.compare.outputs.report-path`로 제공합니다. 게이트를 통과하지 못해도 리포트를 남긴 뒤 단계가 실패합니다. 입력이나 실행 오류는 단계 로그에만 표시됩니다.
 
 ## Kubernetes PrometheusRule로 테스트
 

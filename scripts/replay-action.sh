@@ -41,6 +41,15 @@ if [[ -z "${rule_arguments[0]:-}" ]]; then
     exit 2
 fi
 
+gate=${INCIDENT_GATE-strict}
+case "$gate" in
+    strict|regressions) ;;
+    *)
+        printf 'gate must be strict or regressions.\n' >&2
+        exit 2
+        ;;
+esac
+
 runner_temp=${RUNNER_TEMP:-${TMPDIR:-/tmp}}
 work_dir=$(mktemp -d "$runner_temp/incident-promtool.XXXXXXXX")
 trap 'rm -rf -- "$work_dir"' EXIT
@@ -73,7 +82,7 @@ command_token=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
 printf '::stop-commands::%s\n' "$command_token"
 "$python" "$INCIDENT_ACTION_PATH/incident_to_promtool.py" compare \
     --before-ref="$INCIDENT_BEFORE_REF" --after-ref="$INCIDENT_AFTER_REF" \
-    --promtool="$promtool" --rule-format="$INCIDENT_RULE_FORMAT" \
+    --promtool="$promtool" --rule-format="$INCIDENT_RULE_FORMAT" --gate "$gate" \
     "${rule_arguments[@]}" -- "${fixture_paths[@]}" > "$report" || status=$?
 printf '::%s::\n' "$command_token"
 

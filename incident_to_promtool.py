@@ -22,13 +22,14 @@ from xml.etree import ElementTree
 
 
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
-DURATION_PART = re.compile(r"(\d+)(ms|s|m|h|d)", re.ASCII)
-UNIT_MS = {"ms": 1, "s": 1_000, "m": 60_000, "h": 3_600_000, "d": 86_400_000}
+DURATION_PART = re.compile(r"(\d+)(ms|s|m|h|d|w|y)", re.ASCII)
+UNIT_MS = {"ms": 1, "s": 1_000, "m": 60_000, "h": 3_600_000, "d": 86_400_000,
+           "w": 7 * 86_400_000, "y": 365 * 86_400_000}
 METRIC_NAME = re.compile(r"[a-zA-Z_:][a-zA-Z0-9_:]*")
 LABEL_NAME = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]*")
 SELECTOR = re.compile(r'(?:[a-zA-Z_:][a-zA-Z0-9_:]*)?(?:\{(?:[^{}"\\]|"(?:[^"\\]|\\.)*")*\})?')
 FLOAT = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", re.ASCII)
-ALERT_MISMATCH = re.compile(r"\A(?:[^\S\n]*name:[^\n]*\n)?[^\S\n]*alertname:[^\n]*\n[^\S\n]*exp:")
+ALERT_MISMATCH = re.compile(r"\A[ \t]*alertname: (.+), time: ([^,\n]+),[ \t]*\n[ \t]*exp:")
 MAX_VALUES = 2_000_000
 
 
@@ -291,7 +292,11 @@ def read_committed_rules(repo, revision, paths):
 class ReplayFixture:
     path: Path
     data: dict
-    checkpoints: int
+    checkpoint_keys: list[set[tuple[str, int]]]
+
+    @property
+    def checkpoints(self):
+        return sum(map(len, self.checkpoint_keys))
 
 
 def load_replay_fixture(path):
@@ -308,7 +313,43 @@ def load_replay_fixture(path):
         for group in groups
     ):
         raise ValueError(f"{path}: compare requires a generated fixture with alert checkpoints in every test group")
-    return ReplayFixture(path, data, sum(len(group["alert_rule_test"]) for group in groups))
+    checkpoint_keys = []
+    for number, group in enumerate(groups, start=1):
+        identities = set()
+        for checkpoint in group["alert_rule_test"]:
+            name = checkpoint.get("alertname") if isinstance(checkpoint, dict) else None
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(f"{path}: alert checkpoint in group {number} requires an alertname")
+            try:
+                offset = duration_ms(checkpoint.get("eval_time", "0s"))
+            except ValueError as exc:
+                raise ValueError(f"{path}: alert {name!r} in group {number}: {exc}") from exc
+            if (name, offset) in identities:
+                raise ValueError(f"{path}: duplicate checkpoint for {name!r} in group {number} at {as_duration(offset)}")
+            identities.add((name, offset))
+        checkpoint_keys.append(identities)
+    return ReplayFixture(path, data, checkpoint_keys)
+
+
+def identify_alert_mismatches(fixture, cases):
+    mismatches = {}
+    for number, (case, group, known) in enumerate(
+        zip(cases, fixture.data["tests"], fixture.checkpoint_keys), start=1,
+    ):
+        group_name = group.get("name", "")
+        prefix = f"    name: {group_name},\n" if group_name else ""
+        for failure in case.findall("./failure"):
+            detail = failure.text or ""
+            match = ALERT_MISMATCH.match(detail.removeprefix(prefix))
+            if not match:
+                raise ValueError(detail or "promtool reported an empty failure")
+            name, time = match.groups()
+            offset = duration_ms(time)
+            identity = (number, name, offset)
+            if (name, offset) not in known or identity in mismatches:
+                raise ValueError(f"unexpected checkpoint failure in group {number}:\n{detail}")
+            mismatches[identity] = detail
+    return mismatches
 
 
 def test_rule_version(promtool, fixtures, rules, directory):
@@ -346,27 +387,28 @@ def test_rule_version(promtool, fixtures, rules, directory):
     mismatches = []
     for suite, fixture, test_path in zip(suites, fixtures, test_paths):
         cases = suite.findall("./testcase")
-        failures = [node.text or "" for node in suite.findall(".//failure")]
         errors = [node.text or "" for node in suite.findall(".//error")]
-        # Promtool uses exit 1 for both failed assertions and evaluation errors.
-        # Alert expectation mismatches have distinct expected/actual diagnostics.
         if (suite.get("name") != str(test_path) or len(cases) != len(fixture.data["tests"])
-                or errors or suite.findall(".//skipped") or len(failures) > fixture.checkpoints
-                or any(not ALERT_MISMATCH.match(item) for item in failures)):
+                or errors or suite.findall(".//skipped")):
+            failures = [node.text or "" for node in suite.findall(".//failure")]
             diagnostics = "\n".join(errors + failures).strip() or details
             raise ValueError(f"{directory.name} rules could not be tested for {fixture.path}:\n{diagnostics}")
-        mismatches.append(failures)
+        # Only diagnostics that identify a known alert checkpoint are assertion mismatches.
+        try:
+            mismatches.append(identify_alert_mismatches(fixture, cases))
+        except ValueError as exc:
+            raise ValueError(f"{directory.name} rules could not be tested for {fixture.path}:\n{exc}") from exc
     if result.returncode != int(any(mismatches)):
         raise ValueError(f"{directory.name} rules could not be tested:\n{details}")
     return mismatches
 
 
-def markdown_path(path):
-    escaped = "".join(f"&#{ord(char)};" if char in "<>&|`\r\n[]*_\\~" else char for char in str(path))
+def markdown_code(value):
+    escaped = "".join(f"&#{ord(char)};" if char in "<>&|`\r\n[]*_\\~" else char for char in str(value))
     return f"<code>{escaped}</code>"
 
 
-def compare(fixture_paths, before, after, executable, revisions=None):
+def compare(fixture_paths, before, after, executable, revisions=None, gate="strict"):
     if len({os.path.realpath(path, strict=True) for path in fixture_paths}) != len(fixture_paths):
         raise ValueError("each incident fixture must be supplied only once")
     fixtures = [load_replay_fixture(path) for path in fixture_paths]
@@ -380,9 +422,22 @@ def compare(fixture_paths, before, after, executable, revisions=None):
         before_failures = test_rule_version(promtool, fixtures, before, path / "before")
         after_failures = test_rule_version(promtool, fixtures, after, path / "after")
 
+    changes = []
+    for fixture, baseline, candidate in zip(fixtures, before_failures, after_failures):
+        for identity in sorted(baseline.keys() | candidate.keys()):
+            if identity not in baseline:
+                status = "Newly failed"
+            elif identity not in candidate:
+                status = "Fixed"
+            else:
+                status = "Still failing"
+            changes.append((fixture, identity, status))
+    gate_failed = any(after_failures) if gate == "strict" else any(status == "Newly failed" for _, _, status in changes)
+
     print("## Prometheus alert comparison\n")
     if revisions:
         print(f"Compared Git commits `{revisions[0]}` and `{revisions[1]}` (before and after).\n")
+    print(f"Gate `{gate}`: **{'Failed' if gate_failed else 'Passed'}**\n")
     print("| Rule version | Result | Checkpoints matched |\n| --- | --- | ---: |")
     versions = (("Before", before_failures), ("After", after_failures))
     for version, incident_failures in versions:
@@ -394,7 +449,12 @@ def compare(fixture_paths, before, after, executable, revisions=None):
             checks = fixture.checkpoints
             before_cell = f"{'Failed' if baseline else 'Passed'} ({checks - len(baseline)}/{checks})"
             after_cell = f"{'Failed' if candidate else 'Passed'} ({checks - len(candidate)}/{checks})"
-            print(f"| {markdown_path(fixture.path)} | {before_cell} | {after_cell} |")
+            print(f"| {markdown_code(fixture.path)} | {before_cell} | {after_cell} |")
+    if changes:
+        print("\n### Checkpoint changes\n")
+        print("| Incident fixture | Group | Alert | Offset | Change |\n| --- | ---: | --- | --- | --- |")
+        for fixture, (number, name, offset), status in changes:
+            print(f"| {markdown_code(fixture.path)} | {number} | {markdown_code(name)} | {as_duration(offset)} | {status} |")
     for version, incident_failures in versions:
         if not any(incident_failures):
             continue
@@ -403,12 +463,12 @@ def compare(fixture_paths, before, after, executable, revisions=None):
             if not failures:
                 continue
             if len(fixtures) > 1:
-                print(f"\n#### {markdown_path(fixture.path)}")
-            details = "\n\n".join(item.strip("\n") for item in failures)
+                print(f"\n#### {markdown_code(fixture.path)}")
+            details = "\n\n".join(item.strip("\n") for item in failures.values())
             longest = max((len(run) for run in re.findall(r"`+", details)), default=0)
             fence = "`" * max(3, longest + 1)
             print(f"\n{fence}text\n{details}\n{fence}")
-    return int(any(after_failures))
+    return int(gate_failed)
 
 
 def compare_main(argv):
@@ -428,6 +488,10 @@ def compare_main(argv):
         help="input rule format for both versions (default: prometheus)",
     )
     parser.add_argument("--promtool", default="promtool", help="promtool executable or path")
+    parser.add_argument(
+        "--gate", choices=("strict", "regressions"), default="strict",
+        help="fail on any proposed mismatch or only on newly failing checkpoints (default: strict)",
+    )
     args = parser.parse_args(argv)
     git_mode = any(value is not None for value in (args.before_ref, args.after_ref, args.rule_file, args.repo))
     if git_mode and (args.before or args.after):
@@ -452,9 +516,10 @@ def compare_main(argv):
         if args.rule_format == "kubernetes":
             from kubernetes_rules import convert_manifests
 
-            return compare(args.fixtures, convert_manifests(before), convert_manifests(after), args.promtool, revisions)
+            return compare(args.fixtures, convert_manifests(before), convert_manifests(after), args.promtool,
+                           revisions, gate=args.gate)
         return compare(args.fixtures, [content for _, content in before], [content for _, content in after],
-                       args.promtool, revisions)
+                       args.promtool, revisions, gate=args.gate)
     except (OSError, ValueError, TypeError) as exc:
         parser.exit(2, f"error: {exc}\n")
 

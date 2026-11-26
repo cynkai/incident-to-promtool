@@ -97,6 +97,7 @@ jobs:
           rule-files: |
             rules/payment alert.yml
           rule-format: kubernetes
+          gate: regressions
           before-ref: HEAD
           after-ref: HEAD^1
       - name: Check that the regression failed
@@ -107,7 +108,9 @@ jobs:
           test "$OUTCOME" = failure
           test -f "$REPORT_PATH"
           report=$(cat "$REPORT_PATH")
+          [[ "$report" == *'Gate `regressions`: **Failed**'* ]]
           [[ "$report" == *'| Before | Passed | 4/4 |'* ]]
           [[ "$report" == *'| After | Failed | 3/4 |'* ]]
           [[ "$report" == *'| <code>payment.test.yml</code> | Passed (2/2) | Failed (1/2) |'* ]]
           [[ "$report" == *'| <code>quiet.test.yml</code> | Passed (2/2) | Passed (2/2) |'* ]]
+          [[ "$report" == *'| <code>payment.test.yml</code> | 1 | <code>PaymentErrorsHigh</code> | 420s | Newly failed |'* ]]

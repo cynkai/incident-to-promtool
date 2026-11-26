@@ -13,6 +13,9 @@ inputs:
   rule-format:
     description: Rule format for both versions, either prometheus or kubernetes.
     default: prometheus
+  gate:
+    description: Use strict to fail on any failing proposed checkpoint or regressions to fail only on newly failing checkpoints.
+    default: strict
   repo-path:
     description: Checkout directory, relative to the workflow workspace if not absolute.
     default: '.'
@@ -40,6 +43,7 @@ runs:
         INCIDENT_FIXTURES: ${{ inputs.fixtures }}
         INCIDENT_RULE_FILES: ${{ inputs.rule-files }}
         INCIDENT_RULE_FORMAT: ${{ inputs.rule-format }}
+        INCIDENT_GATE: ${{ inputs.gate }}
         INCIDENT_REPO_PATH: ${{ inputs.repo-path }}
         INCIDENT_BEFORE_REF: ${{ inputs.before-ref }}
         INCIDENT_AFTER_REF: ${{ inputs.after-ref }}
