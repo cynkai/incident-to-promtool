@@ -17,7 +17,7 @@ import shutil
 import stat
 import subprocess
 import sys
-from tempfile import NamedTemporaryFile, TemporaryDirectory
+from tempfile import NamedTemporaryFile, TemporaryDirectory, TemporaryFile
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
@@ -611,10 +611,10 @@ def write_bundle(args):
     return summary
 
 
-def git_output(repo, *args):
+def git_output(repo, *args, stdout=subprocess.PIPE):
     result = subprocess.run(
         ["git", "--no-replace-objects", "--literal-pathspecs", "-C", str(repo), *args],
-        capture_output=True, check=False,
+        stdout=stdout, stderr=subprocess.PIPE, check=False,
     )
     if result.returncode != 0:
         detail = result.stderr.decode("utf-8", errors="replace").strip()
@@ -629,7 +629,7 @@ def resolve_commit(repo, ref):
         raise ValueError(f"cannot resolve Git ref {ref!r}: {exc}") from exc
 
 
-def read_committed_file(repo, revision, path, label):
+def committed_file_id(repo, revision, path, label):
     if "\\" in path or PureWindowsPath(path).drive or any(part in ("", ".", "..") for part in path.split("/")):
         raise ValueError(f"{label} path {path!r} must be relative to the repository root and use '/' separators")
     entries = git_output(repo, "ls-tree", "--full-tree", "-z", revision, "--", path)
@@ -639,7 +639,11 @@ def read_committed_file(repo, revision, path, label):
     mode, kind, object_id = metadata.decode("ascii").split()
     if kind != "blob" or mode not in ("100644", "100755"):
         raise ValueError(f"{label} path {path!r} is not a regular file at Git commit {revision}")
-    return git_output(repo, "cat-file", "blob", object_id)
+    return object_id
+
+
+def read_committed_file(repo, revision, path, label):
+    return git_output(repo, "cat-file", "blob", committed_file_id(repo, revision, path, label))
 
 
 def read_committed_rules(repo, revision, paths):
@@ -742,11 +746,11 @@ def read_bundle_member(archive, path, name):
     return archive.read(entry)
 
 
-def load_bundle_replay(path):
+def load_bundle_replay(path, *, source=None):
     fixture_path = f"{path}!{BUNDLE_FIXTURE}"
     summary_path = f"{path}!{BUNDLE_CAPTURE_SUMMARY}"
     try:
-        with ZipFile(path) as archive:
+        with ZipFile(path if source is None else source) as archive:
             names = archive.namelist()
             if len(names) != len(set(names)):
                 raise ValueError(f"{path}: ZIP archive contains duplicate member names")
@@ -764,6 +768,14 @@ def load_bundle_replay(path):
     except (BadZipFile, EOFError, RuntimeError, zlib.error) as exc:
         raise ValueError(f"{path}: could not read the incident bundle ZIP: {exc}") from exc
     return fixture, rules, {"path": str(path), "rule_files": rule_paths}
+
+
+def load_committed_bundle_replay(repo, revision, path):
+    object_id = committed_file_id(repo, revision, path, "bundle")
+    with TemporaryFile() as source:
+        git_output(repo, "cat-file", "blob", object_id, stdout=source)
+        source.seek(0)
+        return load_bundle_replay(path, source=source)
 
 
 def identify_alert_mismatches(fixture, cases):
@@ -973,12 +985,16 @@ def print_markdown_report(report):
     fixtures = report["fixtures"]
     versions = ("before", "after")
     print("## Prometheus alert comparison\n")
-    if commits := report["commits"]:
+    commits = report["commits"]
+    if bundle := report.get("bundle"):
+        anchor = f" at Git commit `{commits['before']}`" if commits else ""
+        print(f"Loaded the baseline rules and fixture from bundle {markdown_code(bundle['path'])}{anchor}.\n")
+        if commits:
+            print(f"Read proposed rules from Git commit `{commits['after']}`.\n")
+    elif commits:
         print(f"Compared Git commits `{commits['before']}` and `{commits['after']}` (before and after).\n")
     if fixture_commit := report.get("fixture_commit"):
         print(f"Loaded fixtures from Git commit `{fixture_commit}`.\n")
-    if bundle := report.get("bundle"):
-        print(f"Loaded the baseline rules and fixture from bundle {markdown_code(bundle['path'])}.\n")
     if "capture_summary" in fixtures[0]:
         print(f"Verified SHA-256 against capture summaries for {len(fixtures)} fixture(s).\n")
     gate = report["gate"]
@@ -1123,19 +1139,37 @@ def compare_bundle_main(argv):
         prog=f"{Path(sys.argv[0]).name} compare-bundle",
         description="Compare proposed rules with an incident bundle's archived baseline and fixture.",
     )
-    parser.add_argument("bundle", type=Path, help="ZIP archive created with bundle")
-    parser.add_argument("--after", required=True, type=Path, action="append", help="proposed rule file (repeatable)")
+    parser.add_argument("bundle", help="ZIP archive created with bundle (repository-root-relative in Git mode)")
+    parser.add_argument("--after", type=Path, action="append", help="proposed rule file in the working tree (repeatable)")
+    parser.add_argument("--bundle-ref", help="Git ref or commit containing the bundle")
+    parser.add_argument("--after-ref", help="Git ref or commit containing the proposed rules")
+    parser.add_argument("--rule-file", action="append", help="repository-root-relative rule path at --after-ref (repeatable)")
+    parser.add_argument("--repo", type=Path, help="Git repository for ref comparison (default: current directory)")
     parser.add_argument(
         "--rule-format", choices=("prometheus", "kubernetes"), default="prometheus",
         help="input format of the proposed rule files (default: prometheus)",
     )
     add_comparison_report_options(parser)
     args = parser.parse_args(argv)
+    git_mode = any(value is not None for value in (args.bundle_ref, args.after_ref, args.rule_file, args.repo))
+    if git_mode and args.after:
+        parser.error("choose either --after files or Git ref comparison options")
+    if git_mode and not (args.bundle_ref and args.after_ref and args.rule_file):
+        parser.error("Git bundle comparison requires --bundle-ref, --after-ref and at least one --rule-file")
+    if not git_mode and not args.after:
+        parser.error("file bundle comparison requires at least one --after rule file")
     try:
-        fixture, before, bundle = load_bundle_replay(args.bundle)
-        after = comparison_rule_bytes(read_rule_sources(args.after), args.rule_format)
+        revisions = None
+        if git_mode:
+            repo = args.repo or Path.cwd()
+            revisions = (resolve_commit(repo, args.bundle_ref), resolve_commit(repo, args.after_ref))
+            fixture, before, bundle = load_committed_bundle_replay(repo, revisions[0], args.bundle)
+            after = read_committed_rules(repo, revisions[1], args.rule_file)
+        else:
+            fixture, before, bundle = load_bundle_replay(Path(args.bundle))
+            after = read_rule_sources(args.after)
         return compare(
-            [fixture], before, after, args.promtool, revisions=None,
+            [fixture], before, comparison_rule_bytes(after, args.rule_format), args.promtool, revisions=revisions,
             gate=args.gate, json_report=args.json_report, fixture_commit=None, bundle=bundle,
         )
     except (OSError, ValueError, TypeError) as exc:

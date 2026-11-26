@@ -6,6 +6,10 @@ set -euo pipefail
 cd -- "${GITHUB_WORKSPACE:-.}"
 cd -- "$INCIDENT_REPO_PATH"
 
+bundle=${INCIDENT_BUNDLE:-}
+fixture=${INCIDENT_FIXTURE:-}
+fixture_ref=${INCIDENT_FIXTURE_REF:-}
+capture_summaries=${INCIDENT_CAPTURE_SUMMARIES:-}
 fixture_paths=()
 while IFS= read -r fixture_path; do
     fixture_path=${fixture_path%$'\r'}
@@ -14,47 +18,65 @@ while IFS= read -r fixture_path; do
     fi
 done <<< "${INCIDENT_FIXTURES:-}"
 
-if [[ -n "${INCIDENT_FIXTURE:-}" && -n "${fixture_paths[0]:-}" ]] ||
-   [[ -z "${INCIDENT_FIXTURE:-}" && -z "${fixture_paths[0]:-}" ]]; then
-    printf 'Provide exactly one of fixture or fixtures.\n' >&2
+source_count=0
+if [[ -n "$bundle" ]]; then
+    source_count=$((source_count + 1))
+fi
+if [[ -n "$fixture" ]]; then
+    source_count=$((source_count + 1))
+fi
+if [[ -n "${fixture_paths[0]:-}" ]]; then
+    source_count=$((source_count + 1))
+fi
+if [[ "$source_count" -ne 1 ]]; then
+    printf 'Provide exactly one of fixture, fixtures, or bundle.\n' >&2
     exit 2
 fi
-if [[ -n "${INCIDENT_FIXTURE:-}" ]]; then
-    fixture_paths+=("$INCIDENT_FIXTURE")
-fi
 
-comparison_arguments=(--before-ref="$INCIDENT_BEFORE_REF" --after-ref="$INCIDENT_AFTER_REF")
-fixture_ref=${INCIDENT_FIXTURE_REF:-}
-if [[ -n "$fixture_ref" ]]; then
-    comparison_arguments+=(--fixture-ref="$fixture_ref")
-else
-    for fixture_path in "${fixture_paths[@]}"; do
-        if [[ ! -f "$fixture_path" ]]; then
-            printf 'Incident fixture file not found: %q\n' "$fixture_path" >&2
-            exit 2
-        fi
-    done
-fi
-
-summary_paths=()
-while IFS= read -r summary_path; do
-    summary_path=${summary_path%$'\r'}
-    if [[ "$summary_path" =~ [^[:space:]] ]]; then
-        summary_paths+=("$summary_path")
-    fi
-done <<< "${INCIDENT_CAPTURE_SUMMARIES:-}"
-if [[ -n "${summary_paths[0]:-}" ]]; then
-    if [[ "${#summary_paths[@]}" -ne "${#fixture_paths[@]}" ]]; then
-        printf 'Provide one capture summary path per fixture.\n' >&2
+if [[ -n "$bundle" ]]; then
+    if [[ -n "$fixture_ref" || -n "$capture_summaries" ]]; then
+        printf 'bundle cannot be combined with fixture-ref or capture-summaries.\n' >&2
         exit 2
     fi
-    for summary_path in "${summary_paths[@]}"; do
-        if [[ -z "$fixture_ref" && ! -f "$summary_path" ]]; then
-            printf 'Capture summary file not found: %q\n' "$summary_path" >&2
+    comparison_arguments=(compare-bundle --bundle-ref="$INCIDENT_BEFORE_REF" --after-ref="$INCIDENT_AFTER_REF")
+    input_paths=("$bundle")
+else
+    if [[ -n "$fixture" ]]; then
+        fixture_paths+=("$fixture")
+    fi
+    comparison_arguments=(compare --before-ref="$INCIDENT_BEFORE_REF" --after-ref="$INCIDENT_AFTER_REF")
+    input_paths=("${fixture_paths[@]}")
+    if [[ -n "$fixture_ref" ]]; then
+        comparison_arguments+=(--fixture-ref="$fixture_ref")
+    else
+        for fixture_path in "${fixture_paths[@]}"; do
+            if [[ ! -f "$fixture_path" ]]; then
+                printf 'Incident fixture file not found: %q\n' "$fixture_path" >&2
+                exit 2
+            fi
+        done
+    fi
+
+    summary_paths=()
+    while IFS= read -r summary_path; do
+        summary_path=${summary_path%$'\r'}
+        if [[ "$summary_path" =~ [^[:space:]] ]]; then
+            summary_paths+=("$summary_path")
+        fi
+    done <<< "$capture_summaries"
+    if [[ -n "${summary_paths[0]:-}" ]]; then
+        if [[ "${#summary_paths[@]}" -ne "${#fixture_paths[@]}" ]]; then
+            printf 'Provide one capture summary path per fixture.\n' >&2
             exit 2
         fi
-        comparison_arguments+=(--capture-summary="$summary_path")
-    done
+        for summary_path in "${summary_paths[@]}"; do
+            if [[ -z "$fixture_ref" && ! -f "$summary_path" ]]; then
+                printf 'Capture summary file not found: %q\n' "$summary_path" >&2
+                exit 2
+            fi
+            comparison_arguments+=(--capture-summary="$summary_path")
+        done
+    fi
 fi
 
 rule_arguments=()
@@ -109,10 +131,10 @@ status=0
 command_token=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
 # Prevent diagnostic text from repository content from being read as runner commands.
 printf '::stop-commands::%s\n' "$command_token"
-"$python" "$INCIDENT_ACTION_PATH/incident_to_promtool.py" compare \
+"$python" "$INCIDENT_ACTION_PATH/incident_to_promtool.py" \
     "${comparison_arguments[@]}" \
     --promtool="$promtool" --rule-format="$INCIDENT_RULE_FORMAT" --gate "$gate" \
-    --json-report "$json_report" "${rule_arguments[@]}" -- "${fixture_paths[@]}" > "$report" || status=$?
+    --json-report "$json_report" "${rule_arguments[@]}" -- "${input_paths[@]}" > "$report" || status=$?
 printf '::%s::\n' "$command_token"
 
 if [[ "$status" -le 1 ]]; then

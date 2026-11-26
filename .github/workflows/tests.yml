@@ -120,10 +120,14 @@ jobs:
         run: |
           repo="$RUNNER_TEMP/composite-repo"
           rule="rules/payment alert.yml"
+          candidate="rules/payment candidate.yml"
+          bundle="incidents/payment baseline.zip"
           git init --quiet "$repo"
           git -C "$repo" config user.name 'Integration Test'
           git -C "$repo" config user.email 'test@example.invalid'
-          mkdir "$repo/rules"
+          mkdir "$repo/rules" "$repo/incidents"
+          python3 incident_to_promtool.py bundle demo/demo.json --matrix demo/incident.matrix.json \
+            --rule-file demo/before.rules.yml --output "$repo/$bundle"
           (
             cd "$repo"
             python3 "$GITHUB_WORKSPACE/incident_to_promtool.py" "$GITHUB_WORKSPACE/demo/demo.json" \
@@ -144,13 +148,15 @@ jobs:
           (repo / "quiet.test.yml").write_text(json.dumps(fixture), encoding="utf-8")
           PY
           cp demo/kubernetes/before.yml "$repo/$rule"
-          git -C "$repo" add -- "$rule" payment.test.yml payment.capture.json quiet.test.yml
+          git -C "$repo" add -- "$rule" "$bundle" payment.test.yml payment.capture.json quiet.test.yml
           git -C "$repo" commit --quiet -m 'Add original payment alert'
           cp demo/kubernetes/after.yml "$repo/$rule"
-          git -C "$repo" add -- "$rule"
+          cp demo/kubernetes/after.yml "$repo/$candidate"
+          printf 'invalid replacement bundle\n' > "$repo/$bundle"
+          git -C "$repo" add -- "$rule" "$candidate" "$bundle"
           git -C "$repo" commit --quiet -m 'Fix late payment alert'
           printf 'invalid fixture\n' > "$repo/payment.test.yml"
-          rm -- "$repo/payment.capture.json" "$repo/quiet.test.yml"
+          rm -- "$repo/payment.capture.json" "$repo/quiet.test.yml" "$repo/$candidate" "$repo/$bundle"
       - name: Compare the fixed rule
         id: fixed
         uses: ./
@@ -235,4 +241,46 @@ jobs:
                   summary = json.loads(committed_bytes("payment.capture.json"))
                   fixture_sha256 = hashlib.sha256(committed_bytes("payment.test.yml")).hexdigest()
                   assert fixture["sha256"] == summary["fixture_sha256"] == fixture_sha256
+          PY
+      - name: Compare a committed bundle to a proposed Kubernetes rule
+        id: bundled
+        uses: ./
+        with:
+          repo-path: ${{ runner.temp }}/composite-repo
+          bundle: incidents/payment baseline.zip
+          rule-files: |
+            rules/payment candidate.yml
+          rule-format: kubernetes
+      - name: Check the committed bundle comparison
+        env:
+          REPORT_PATH: ${{ steps.bundled.outputs.report-path }}
+          JSON_REPORT_PATH: ${{ steps.bundled.outputs.json-report-path }}
+          NEWLY_FAILED: ${{ steps.bundled.outputs.newly-failed }}
+        run: |
+          report=$(cat "$REPORT_PATH")
+          [[ "$report" == *'| Before | Failed | 1/2 |'* ]]
+          [[ "$report" == *'| After | Passed | 2/2 |'* ]]
+          [[ "$NEWLY_FAILED" == '0' ]]
+          python3 - <<'PY'
+          import hashlib
+          from io import BytesIO
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          from zipfile import ZipFile
+
+          repo = Path(os.environ["RUNNER_TEMP"]) / "composite-repo"
+          before, after = subprocess.check_output(["git", "rev-parse", "HEAD^1", "HEAD"], cwd=repo, text=True).splitlines()
+          bundle_path = "incidents/payment baseline.zip"
+          archive_bytes = subprocess.check_output(["git", "show", f"{before}:{bundle_path}"], cwd=repo)
+          with ZipFile(BytesIO(archive_bytes)) as archive:
+              fixture_sha256 = hashlib.sha256(archive.read("incident.test.yml")).hexdigest()
+
+          report = json.loads(Path(os.environ["JSON_REPORT_PATH"]).read_text(encoding="utf-8"))
+          assert report["commits"] == {"before": before, "after": after}
+          assert report["bundle"] == {"path": bundle_path, "rule_files": ["rules/rules-1.yml"]}
+          assert report["gate"] == {"mode": "strict", "passed": True}
+          fixture, = report["fixtures"]
+          assert fixture["sha256"] == fixture_sha256
           PY

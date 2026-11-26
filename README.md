@@ -145,21 +145,37 @@ jobs:
             prometheus/checkout.rules.yml
 ```
 
-테스트 파일을 하나 검사하면 `fixture`, 여러 개 검사하면 `fixtures`를 사용합니다. 두 입력 중 하나를 선택하고 `rule-files`를 함께 지정하세요. 테스트 파일은 `repo-path` 기준 경로이며 `fixtures`에서는 한 줄에 하나씩 적습니다. `rule-files`에는 두 커밋에 모두 있는 룰 경로를 저장소 루트 기준으로 한 줄에 하나씩 적습니다.
+테스트 파일을 하나 검사하면 `fixture`, 여러 개 검사하면 `fixtures`를 사용합니다. 테스트 파일은 `repo-path` 기준 경로이며 `fixtures`에서는 한 줄에 하나씩 적습니다. 이 경우 `rule-files`에는 두 커밋에 모두 있는 룰 경로를 저장소 루트 기준으로 한 줄에 하나씩 적습니다.
 
 | 선택 입력 | 기본값과 용도 |
 | --- | --- |
 | `repo-path` | `.`. 체크아웃한 Git 저장소 경로 |
-| `rule-format` | `prometheus`. 렌더링된 `PrometheusRule`은 `kubernetes` |
+| `rule-format` | `prometheus`. 렌더링된 `PrometheusRule`은 `kubernetes`. 번들 비교에서는 수정 룰에만 적용합니다. |
 | `before-ref`, `after-ref` | `HEAD^1`, `HEAD`. 다른 Git ref를 쓰려면 두 커밋을 미리 가져옵니다. |
-| `fixture-ref` | 생략하면 작업 트리에서 읽습니다. PR 기준 커밋에 있는 테스트를 쓰려면 `with`에 `fixture-ref: 'HEAD^1'`을 지정합니다. |
-| `capture-summaries` | 검증에 사용할 v1 캡처 요약 경로를 테스트 파일과 같은 순서로 한 줄에 하나씩 지정합니다. `fixture-ref`를 쓰면 같은 커밋의 저장소 루트 기준 경로를 사용합니다. |
+| `fixture-ref` | `fixture` 또는 `fixtures`에서 사용합니다. 기본은 작업 트리이며, PR 기준 커밋의 테스트를 쓰려면 `with`에 `fixture-ref: 'HEAD^1'`을 지정합니다. |
+| `capture-summaries` | `fixture` 또는 `fixtures`에서 사용합니다. v1 캡처 요약 경로를 테스트 파일과 같은 순서로 한 줄에 하나씩 지정합니다. `fixture-ref`를 쓰면 같은 커밋의 저장소 루트 기준 경로를 사용합니다. |
 | `gate` | `strict`. 새로 실패한 검사만 단계 실패로 처리하려면 `with`에 `gate: regressions`를 지정합니다. |
 | `promtool-path` | 생략하면 Linux x64에서 고정된 Promtool 3.11.0을 설치합니다. 기존 실행 파일은 작업 디렉터리 기준 경로나 `PATH`에 있는 명령으로 지정합니다. |
 
 `kubernetes` 모드는 PyYAML 6.0.3을 격리된 가상 환경에 설치합니다. 완료된 비교는 실행 요약을 남기며 `steps.compare.outputs.report-path`로 Markdown 경로, `steps.compare.outputs.json-report-path`로 JSON 경로, `steps.compare.outputs.newly-failed`로 새로 실패한 검사 건수(문자열)를 제공합니다. 게이트를 통과하지 못해도 이 출력들은 제공됩니다. 입력이나 실행 오류는 단계 로그에만 표시됩니다.
 
 게이트가 실패한 경우에도 후속 단계에서 JSON을 읽으려면 해당 단계에 `if: ${{ always() && steps.compare.outputs.json-report-path != '' }}`를 지정합니다.
+
+#### 기준 번들로 PR 검사
+
+기준 커밋에 장애 번들 ZIP이 있으면 ZIP의 테스트와 기준 룰을 적용할 수 있습니다. 위 워크플로의 `fetch-depth: 0` 체크아웃을 유지하고 비교 단계를 다음과 같이 설정합니다.
+
+```yaml
+- name: Compare alert rules from a bundle
+  id: compare
+  uses: cynkai/incident-to-promtool@main
+  with:
+    bundle: tests/fixtures/payment-baseline.zip
+    rule-files: |
+      prometheus/payment.rules.yml
+```
+
+`bundle`, `fixture`, `fixtures` 중 하나를 선택하고 `rule-files`를 함께 지정합니다. `bundle`에서는 ZIP을 `before-ref`(기본 `HEAD^1`)에서 읽고 수정 룰을 `after-ref`(기본 `HEAD`)에서 읽습니다. 두 경로는 저장소 루트 기준이며, 이 경우 룰 파일은 수정 커밋에 있으면 됩니다. [장애 재현 번들](#장애-재현-번들)
 
 ## Kubernetes PrometheusRule로 테스트
 
@@ -300,6 +316,16 @@ python3 incident_to_promtool.py compare-bundle demo/generated/payment-baseline.z
 Markdown은 표준 출력으로 보내고, `--json-report`를 지정하면 JSON도 저장합니다. 게이트는 `compare`와 같은 `strict`와 `regressions`를 지원합니다. 종료 코드는 게이트 통과 `0`, 게이트 실패 `1`, 입력 또는 실행 오류 `2`입니다. [룰 변경 전후 비교](#룰-변경-전후-비교)
 
 JSON 리포트의 `bundle`에는 ZIP 경로 `path`와 ZIP 내부의 기준 룰 경로 목록 `rule_files`가 들어갑니다. `fixtures` 항목의 `path`와 `capture_summary`는 각각 `ZIP!incident.test.yml`, `ZIP!capture.json` 형식입니다.
+
+기준 ZIP과 수정 룰을 Git에서 읽으려면 `--bundle-ref`, `--after-ref`, `--rule-file`을 함께 지정합니다. ZIP과 룰 경로는 저장소 루트 기준입니다. 수정 룰이 여러 개면 `--rule-file`을 반복하고, 다른 저장소에서 읽으려면 `--repo DIR`을 지정합니다.
+
+```sh
+python3 incident_to_promtool.py compare-bundle tests/fixtures/payment-baseline.zip \
+  --bundle-ref 'HEAD^1' --after-ref HEAD --rule-file prometheus/payment.rules.yml \
+  --json-report review.json
+```
+
+이때 JSON의 `commits.before`는 ZIP을 읽은 커밋, `commits.after`는 수정 룰을 읽은 커밋입니다. 앞에서 설명한 `bundle` 요약도 포함합니다.
 
 ### 시계열 표본 간격 확인
 
