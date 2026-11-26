@@ -1,0 +1,21 @@
+{
+  "version": "4",
+  "status": "firing",
+  "receiver": "demo",
+  "truncatedAlerts": 0,
+  "alerts": [
+    {
+      "status": "firing",
+      "labels": {
+        "alertname": "PaymentErrorsHigh",
+        "severity": "page",
+        "cluster": "demo-cluster"
+      },
+      "annotations": {
+        "summary": "Payment service is returning HTTP 500 responses"
+      },
+      "startsAt": "2025-01-01T00:07:00Z",
+      "endsAt": "2025-01-01T00:11:00Z"
+    }
+  ]
+}

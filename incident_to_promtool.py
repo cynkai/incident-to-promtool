@@ -91,7 +91,58 @@ def read_rule_sources(paths):
     return [(str(path), path.read_bytes()) for path in paths]
 
 
-def rule_test_cases(expectations, window, evaluation):
+def webhook_test_alerts(item, config_dir):
+    source = item["alertmanager_webhook"]
+    if not isinstance(source, str) or not source.strip():
+        raise ValueError("alertmanager_webhook must name a JSON file")
+    path = config_dir / source
+    try:
+        webhook = read_json(path)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"cannot read Alertmanager webhook {path}: {exc}") from exc
+    if not isinstance(webhook, dict) or webhook.get("version") != "4":
+        raise ValueError(f"{path}: expected an Alertmanager webhook with version '4'")
+    truncated = webhook.get("truncatedAlerts", 0)
+    if type(truncated) is not int or truncated < 0:
+        raise ValueError(f"{path}: truncatedAlerts must be a nonnegative integer")
+    if truncated:
+        raise ValueError(f"{path}: Alertmanager webhook was truncated ({truncated} alerts omitted)")
+    alerts = webhook.get("alerts")
+    if not isinstance(alerts, list):
+        raise ValueError(f"{path}: Alertmanager webhook requires an alerts array")
+
+    drop_labels = item.get("drop_labels", [])
+    if not isinstance(drop_labels, list) or any(
+        not isinstance(label, str) or not LABEL_NAME.fullmatch(label) for label in drop_labels
+    ):
+        raise ValueError("drop_labels must be a list of valid label names")
+    excluded = {"alertname", *drop_labels}
+    alertname = item["alertname"]
+    expected = {}
+    for index, alert in enumerate(alerts, start=1):
+        location = f"{path}: alert {index}"
+        if not isinstance(alert, dict) or alert.get("status") not in ("firing", "resolved"):
+            raise ValueError(f"{location} requires a firing or resolved status")
+        labels = alert.get("labels")
+        if not isinstance(labels, dict):
+            raise ValueError(f"{location} requires a labels object")
+        if labels.get("alertname") != alertname or alert["status"] != "firing":
+            continue
+        labels = string_map(
+            {label: value for label, value in labels.items() if label not in excluded},
+            f"{location} labels", check_names=True,
+        )
+        annotations = string_map(alert.get("annotations", {}), f"{location} annotations")
+        identity = tuple(sorted(labels.items()))
+        entry = {"exp_labels": labels, "exp_annotations": annotations}
+        if expected.setdefault(identity, entry) != entry:
+            raise ValueError(f"{location} has conflicting annotations for the same labels after import")
+    if not expected:
+        raise ValueError(f"{path}: no firing alerts named {alertname!r}")
+    return list(expected.values())
+
+
+def rule_test_cases(expectations, window, evaluation, config_dir):
     if not isinstance(expectations, list) or not expectations:
         raise ValueError("expectations must contain at least one firing or silent checkpoint")
     tests = []
@@ -106,15 +157,20 @@ def rule_test_cases(expectations, window, evaluation):
         if (offset, alertname) in checkpoints:
             raise ValueError(f"duplicate expectation for {alertname} at {item['at']}")
         checkpoints.add((offset, alertname))
-        if not isinstance(item["alerts"], list):
-            raise ValueError("alerts must be a list (use [] for no firing alerts)")
-        expected = [
-            {
-                "exp_labels": string_map(alert["labels"], "labels", check_names=True),
-                "exp_annotations": string_map(alert.get("annotations", {}), "annotations"),
-            }
-            for alert in item["alerts"]
-        ]
+        if "alertmanager_webhook" in item:
+            if "alerts" in item:
+                raise ValueError("each expectation must use either alerts or alertmanager_webhook")
+            expected = webhook_test_alerts(item, config_dir)
+        else:
+            if not isinstance(item["alerts"], list):
+                raise ValueError("alerts must be a list (use [] for no firing alerts)")
+            expected = [
+                {
+                    "exp_labels": string_map(alert["labels"], "labels", check_names=True),
+                    "exp_annotations": string_map(alert.get("annotations", {}), "annotations"),
+                }
+                for alert in item["alerts"]
+            ]
         tests.append({"eval_time": as_duration(offset), "alertname": alertname, "exp_alerts": expected})
     return tests
 
@@ -322,7 +378,7 @@ def generate(args):
     if args.round_up and not automatic and window % step:
         raise ValueError("with --round-up, end must fall on the sample grid")
 
-    tests = rule_test_cases(config["expectations"], window, evaluation)
+    tests = rule_test_cases(config["expectations"], window, evaluation, args.config.parent)
     if args.rule_file:
         paths = args.rule_file
     else:

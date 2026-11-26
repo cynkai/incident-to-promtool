@@ -16,7 +16,7 @@ The demo replays synthetic payment metrics without a Prometheus server. It check
 
 Use Python 3.10+ and `promtool` 3.9+. With no local `promtool`, the demo downloads and verifies a pinned binary on Linux x64. Set `PROMTOOL=/path/to/promtool` to use a specific executable.
 
-Commit a fixture for your own incident, compare rule changes between Git refs, and add the same check to CI. Detailed examples are available in Korean. [Capture an incident](#내-prometheus로-실행) · [Native Prometheus rules](#룰-변경-전후-비교) · [Git ref comparison](#git-커밋으로-비교) · [Kubernetes PrometheusRule](#kubernetes-prometheusrule로-테스트) · [GitHub Action](#github-actions에서-pr-검사)
+Commit a fixture for your own incident, compare rule changes between Git refs, and add the same check to CI. Detailed examples are available in Korean. [Capture an incident](#내-prometheus로-실행) · [Alertmanager webhook](#alertmanager-웹훅으로-기대-동작-만들기) · [Native Prometheus rules](#룰-변경-전후-비교) · [Git ref comparison](#git-커밋으로-비교) · [Kubernetes PrometheusRule](#kubernetes-prometheusrule로-테스트) · [GitHub Action](#github-actions에서-pr-검사)
 
 ### Install the CLI from GitHub
 
@@ -219,6 +219,38 @@ python3 incident_to_promtool.py incident.json --prometheus-url http://localhost:
 `"30s"`처럼 간격을 직접 지정하면 평가 간격은 그 배수여야 하며, 기본 변환은 표본 시각이 격자에 맞아야 합니다. 명시적으로 `--round-up`을 쓰면 표본을 다음 격자로 미루고 최대 이동 시간을 표시합니다. 이때 `end`도 격자에 맞춰야 하고, 같은 시계열의 두 타임스탬프가 한 칸에 들어가면 더 촘촘한 간격이 필요합니다.
 
 입력은 유한한 스칼라 표본입니다. Prometheus 원본 조회 API는 stale 표식을 제외하므로, `absent()`처럼 시계열이 stale 상태가 된 시각에 의존하는 룰은 이 방식으로 정확히 재현하기 어렵습니다.
+
+### Alertmanager 웹훅으로 기대 동작 만들기
+
+저장해 둔 Alertmanager v4 일반 웹훅 JSON에서 발화 알람의 라벨과 주석을 읽어 기대 동작을 만들 수 있습니다. `expectations`의 해당 항목에 `alertmanager_webhook`을 지정합니다. 상대 경로는 설정 파일 기준입니다. 같은 설정을 로컬 `--matrix`와 `--prometheus-url` 캡처에 모두 사용할 수 있습니다. [Alertmanager 웹훅 문서](https://prometheus.io/docs/alerting/latest/configuration/#webhook_config)
+
+```json
+{
+  "at": "7m",
+  "alertname": "PaymentErrorsHigh",
+  "alertmanager_webhook": "alertmanager.webhook.json",
+  "drop_labels": ["cluster"]
+}
+```
+
+- `at`는 `startsAt`, `endsAt`과 별도로 지정합니다. 캡처 시작부터의 시간이며 캡처 구간 안의 평가 시점이어야 합니다.
+- 상태가 `firing`이고 `alertname`이 일치하는 항목의 라벨과 주석을 기대 동작에 사용합니다. `alertname` 라벨은 항상 제거합니다. `drop_labels`는 웹훅에서만 붙은 외부 라벨이나 라우팅용 라벨을 제외하는 선택 항목입니다.
+- 라벨을 제외한 뒤 라벨과 주석이 같은 알람은 하나로 합칩니다. 라벨이 같고 주석이 다르면 오류로 처리합니다.
+- `resolved` 항목은 건너뜁니다. 일치하는 발화 알람이 없거나 `truncatedAlerts`가 0보다 큰 웹훅은 오류로 처리합니다. 조용해야 하는 시점은 `alerts: []`로 지정하세요.
+
+라우팅, 사일런스, 억제 설정은 웹훅에 포함된 알람 집합에 영향을 줍니다. 선택한 평가 시점에 해당 알람에서 기대하는 발화 인스턴스 전체를 담은 웹훅을 사용하세요.
+
+결제 예제는 조용한 시점을 수동으로 지정하고, 장애 시작 5분 시점의 발화 기대값은 합성 웹훅에서 읽습니다.
+
+```sh
+mkdir -p demo/generated
+python3 incident_to_promtool.py demo/alertmanager.incident.json \
+  --matrix demo/incident.matrix.json --output demo/generated/alertmanager.test.yml \
+  --summary-format json > demo/generated/alertmanager.capture.json
+python3 incident_to_promtool.py compare demo/generated/alertmanager.test.yml \
+  --before demo/before.rules.yml --after demo/after.rules.yml \
+  --capture-summary demo/generated/alertmanager.capture.json
+```
 
 ### 캡처 요약 JSON
 

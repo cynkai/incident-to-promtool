@@ -51,7 +51,7 @@ jobs:
           cd "$smoke"
           demo="$GITHUB_WORKSPACE/demo"
           cli="$smoke/venv/bin/incident-to-promtool"
-          "$cli" "$demo/demo.json" --matrix "$demo/incident.matrix.json" \
+          "$cli" "$demo/alertmanager.incident.json" --matrix "$demo/incident.matrix.json" \
             --output payment.test.yml --summary-format json > summary.json
           "$smoke/venv/bin/python" - <<'PY'
           import hashlib
@@ -60,6 +60,7 @@ jobs:
 
           summary = json.loads(Path("summary.json").read_text(encoding="utf-8"))
           assert summary["schema_version"] == 1
+          assert summary["series_count"] == 1 and summary["checkpoint_count"] == 2
           assert summary["fixture_sha256"] == hashlib.sha256(Path("payment.test.yml").read_bytes()).hexdigest()
           PY
 
