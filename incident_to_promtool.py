@@ -799,18 +799,24 @@ def identify_alert_mismatches(fixture, cases):
     return mismatches
 
 
-def test_rule_version(promtool, fixtures, rules, directory):
+def test_rule_version(promtool, fixtures, rule_sets, directory):
     directory.mkdir()
-    rule_files = []
-    for index, content in enumerate(rules, start=1):
-        filename = f"rules-{index}.yml"
-        (directory / filename).write_bytes(content)
-        rule_files.append(filename)
+    staged_rules = {}
+    next_rule = 1
     test_paths = []
-    for index, fixture in enumerate(fixtures, start=1):
+    for index, (fixture, rules) in enumerate(zip(fixtures, rule_sets, strict=True), start=1):
+        rules = tuple(rules)
+        if rules not in staged_rules:
+            rule_files = []
+            for content in rules:
+                filename = f"rules-{next_rule}.yml"
+                (directory / filename).write_bytes(content)
+                rule_files.append(filename)
+                next_rule += 1
+            staged_rules[rules] = rule_files
         test_path = directory / f"incident-{index}.test.yml"
         try:
-            document = json.dumps({**fixture.data, "rule_files": rule_files}, ensure_ascii=False)
+            document = json.dumps({**fixture.data, "rule_files": staged_rules[rules]}, ensure_ascii=False)
         except TypeError as exc:
             raise ValueError(f"{fixture.path}: cannot stage fixture data: {exc}") from exc
         test_path.write_text(document, encoding="utf-8")
@@ -986,9 +992,14 @@ def print_markdown_report(report):
     versions = ("before", "after")
     print("## Prometheus alert comparison\n")
     commits = report["commits"]
-    if bundle := report.get("bundle"):
+    bundle = report.get("bundle")
+    bundles = report.get("bundles")
+    if bundle or bundles:
         anchor = f" at Git commit `{commits['before']}`" if commits else ""
-        print(f"Loaded the baseline rules and fixture from bundle {markdown_code(bundle['path'])}{anchor}.\n")
+        if bundle:
+            print(f"Loaded the baseline rules and fixture from bundle {markdown_code(bundle['path'])}{anchor}.\n")
+        else:
+            print(f"Loaded baseline rules and fixtures from {len(bundles)} bundles{anchor}.\n")
         if commits:
             print(f"Read proposed rules from Git commit `{commits['after']}`.\n")
     elif commits:
@@ -1036,19 +1047,21 @@ def print_markdown_report(report):
             print(f"\n{fence}text\n{details}\n{fence}")
 
 
-def compare(fixtures, before, after, executable, revisions, gate, json_report, fixture_commit, *, bundle=None):
+def compare(fixtures, baseline_rule_sets, after, executable, revisions, gate, json_report, fixture_commit, *, bundles=()):
     promtool = shutil.which(executable)
     if not promtool:
         raise ValueError(f"promtool executable not found: {executable}")
 
     with TemporaryDirectory() as temporary:
         path = Path(temporary)
-        before_failures = test_rule_version(promtool, fixtures, before, path / "before")
-        after_failures = test_rule_version(promtool, fixtures, after, path / "after")
+        before_failures = test_rule_version(promtool, fixtures, baseline_rule_sets, path / "before")
+        after_failures = test_rule_version(promtool, fixtures, [after] * len(fixtures), path / "after")
 
     report = build_comparison_report(fixtures, before_failures, after_failures, revisions, gate, fixture_commit)
-    if bundle is not None:
-        report["bundle"] = bundle
+    if len(bundles) == 1:
+        report["bundle"] = bundles[0]
+    elif bundles:
+        report["bundles"] = list(bundles)
     if json_report is not None:
         try:
             write_new_json(json_report, report)
@@ -1127,7 +1140,7 @@ def compare_main(argv):
         before_rules = comparison_rule_bytes(before, args.rule_format)
         after_rules = comparison_rule_bytes(after, args.rule_format)
         return compare(
-            fixtures, before_rules, after_rules, args.promtool, revisions=revisions,
+            fixtures, [before_rules] * len(fixtures), after_rules, args.promtool, revisions=revisions,
             gate=args.gate, json_report=args.json_report, fixture_commit=fixture_commit,
         )
     except (OSError, ValueError, TypeError) as exc:
@@ -1137,11 +1150,11 @@ def compare_main(argv):
 def compare_bundle_main(argv):
     parser = argparse.ArgumentParser(
         prog=f"{Path(sys.argv[0]).name} compare-bundle",
-        description="Compare proposed rules with an incident bundle's archived baseline and fixture.",
+        description="Compare proposed rules with the archived baseline and fixture in each incident bundle.",
     )
-    parser.add_argument("bundle", help="ZIP archive created with bundle (repository-root-relative in Git mode)")
+    parser.add_argument("bundles", metavar="bundle", nargs="+", help="ZIP archives created with bundle (repository-root-relative in Git mode)")
     parser.add_argument("--after", type=Path, action="append", help="proposed rule file in the working tree (repeatable)")
-    parser.add_argument("--bundle-ref", help="Git ref or commit containing the bundle")
+    parser.add_argument("--bundle-ref", help="Git ref or commit containing the bundles")
     parser.add_argument("--after-ref", help="Git ref or commit containing the proposed rules")
     parser.add_argument("--rule-file", action="append", help="repository-root-relative rule path at --after-ref (repeatable)")
     parser.add_argument("--repo", type=Path, help="Git repository for ref comparison (default: current directory)")
@@ -1159,18 +1172,22 @@ def compare_bundle_main(argv):
     if not git_mode and not args.after:
         parser.error("file bundle comparison requires at least one --after rule file")
     try:
+        identities = args.bundles if git_mode else [os.path.realpath(path, strict=True) for path in args.bundles]
+        if len(identities) != len(set(identities)):
+            raise ValueError("each incident bundle must be supplied only once")
         revisions = None
         if git_mode:
             repo = args.repo or Path.cwd()
             revisions = (resolve_commit(repo, args.bundle_ref), resolve_commit(repo, args.after_ref))
-            fixture, before, bundle = load_committed_bundle_replay(repo, revisions[0], args.bundle)
+            replays = [load_committed_bundle_replay(repo, revisions[0], path) for path in args.bundles]
             after = read_committed_rules(repo, revisions[1], args.rule_file)
         else:
-            fixture, before, bundle = load_bundle_replay(Path(args.bundle))
+            replays = [load_bundle_replay(Path(path)) for path in args.bundles]
             after = read_rule_sources(args.after)
+        fixtures, baseline_rule_sets, bundles = zip(*replays)
         return compare(
-            [fixture], before, comparison_rule_bytes(after, args.rule_format), args.promtool, revisions=revisions,
-            gate=args.gate, json_report=args.json_report, fixture_commit=None, bundle=bundle,
+            fixtures, baseline_rule_sets, comparison_rule_bytes(after, args.rule_format), args.promtool, revisions=revisions,
+            gate=args.gate, json_report=args.json_report, fixture_commit=None, bundles=bundles,
         )
     except (OSError, ValueError, TypeError) as exc:
         parser.exit(2, f"error: {exc}\n")

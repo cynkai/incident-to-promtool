@@ -163,19 +163,22 @@ jobs:
 
 #### 기준 번들로 PR 검사
 
-기준 커밋에 장애 번들 ZIP이 있으면 ZIP의 테스트와 기준 룰을 적용할 수 있습니다. 위 워크플로의 `fetch-depth: 0` 체크아웃을 유지하고 비교 단계를 다음과 같이 설정합니다.
+기준 커밋에 장애 번들 ZIP이 있으면 각 ZIP의 테스트와 기준 룰을 적용할 수 있습니다. 위 워크플로의 `fetch-depth: 0` 체크아웃을 유지하고 비교 단계를 다음과 같이 설정합니다.
 
 ```yaml
-- name: Compare alert rules from a bundle
+- name: Compare alert rules from bundles
   id: compare
   uses: cynkai/incident-to-promtool@main
   with:
-    bundle: tests/fixtures/payment-baseline.zip
+    bundles: |
+      tests/fixtures/payment-baseline.zip
+      tests/fixtures/checkout-baseline.zip
     rule-files: |
       prometheus/payment.rules.yml
+      prometheus/checkout.rules.yml
 ```
 
-`bundle`, `fixture`, `fixtures` 중 하나를 선택하고 `rule-files`를 함께 지정합니다. `bundle`에서는 ZIP을 `before-ref`(기본 `HEAD^1`)에서 읽고 수정 룰을 `after-ref`(기본 `HEAD`)에서 읽습니다. 두 경로는 저장소 루트 기준이며, 이 경우 룰 파일은 수정 커밋에 있으면 됩니다. [장애 재현 번들](#장애-재현-번들)
+ZIP 하나를 비교할 때는 `bundle`, 여러 개면 `bundles`에 한 줄에 하나씩 경로를 적습니다. `bundle`, `bundles`, `fixture`, `fixtures` 중 하나를 선택하고 `rule-files`를 함께 지정합니다. 번들 비교에서는 ZIP을 `before-ref`(기본 `HEAD^1`)에서 읽고 공통 수정 룰을 `after-ref`(기본 `HEAD`)에서 읽습니다. 두 경로는 저장소 루트 기준이며, 이 경우 룰 파일은 수정 커밋에 있으면 됩니다. [장애 재현 번들](#장애-재현-번들)
 
 ## Kubernetes PrometheusRule로 테스트
 
@@ -313,19 +316,23 @@ python3 incident_to_promtool.py compare-bundle demo/generated/payment-baseline.z
 
 결제 예제에서 기준 룰은 검사 2개 중 1개를 충족하고, 수정 룰은 2개 모두 충족합니다. 수정 룰 파일이 여러 개면 `--after`를 반복합니다. 수정 룰이 Kubernetes `PrometheusRule`이면 `--rule-format kubernetes`를 추가합니다. ZIP의 기준 룰은 Prometheus 룰 형식으로 읽습니다.
 
-Markdown은 표준 출력으로 보내고, `--json-report`를 지정하면 JSON도 저장합니다. 게이트는 `compare`와 같은 `strict`와 `regressions`를 지원합니다. 종료 코드는 게이트 통과 `0`, 게이트 실패 `1`, 입력 또는 실행 오류 `2`입니다. [룰 변경 전후 비교](#룰-변경-전후-비교)
+파일 비교와 Git 비교 모두 ZIP 경로를 위치 인자로 여러 개 지정할 수 있습니다. 지정한 순서대로 각 ZIP에 보관된 테스트와 기준 룰을 사용하고, 모든 ZIP에 동일한 수정 룰을 적용합니다. 같은 ZIP 경로를 반복하거나 배치에 잘못된 입력이 있으면 종료 코드 `2`로 처리합니다. 리포트는 비교를 완료한 배치에 대해 생성됩니다.
 
-JSON 리포트의 `bundle`에는 ZIP 경로 `path`와 ZIP 내부의 기준 룰 경로 목록 `rule_files`가 들어갑니다. `fixtures` 항목의 `path`와 `capture_summary`는 각각 `ZIP!incident.test.yml`, `ZIP!capture.json` 형식입니다.
+전체 집계와 번들별 결과를 Markdown으로 표준 출력에 보내고, `--json-report`를 지정하면 JSON도 저장합니다. 게이트는 `compare`와 같은 `strict`와 `regressions`를 지원합니다. 종료 코드는 게이트 통과 `0`, 게이트 실패 `1`, 입력 또는 실행 오류 `2`입니다. [룰 변경 전후 비교](#룰-변경-전후-비교)
+
+JSON에는 ZIP 하나를 비교할 때 기존 `bundle` 객체를, 여러 개면 `bundles` 배열을 기록합니다. `bundles`와 `fixtures`는 입력 순서대로 대응합니다. 각 번들 항목에는 ZIP 경로 `path`와 ZIP 내부의 기준 룰 경로 목록 `rule_files`가 있습니다. `fixtures` 항목의 `path`와 `capture_summary`는 각각 `ZIP!incident.test.yml`, `ZIP!capture.json` 형식입니다.
 
 기준 ZIP과 수정 룰을 Git에서 읽으려면 `--bundle-ref`, `--after-ref`, `--rule-file`을 함께 지정합니다. ZIP과 룰 경로는 저장소 루트 기준입니다. 수정 룰이 여러 개면 `--rule-file`을 반복하고, 다른 저장소에서 읽으려면 `--repo DIR`을 지정합니다.
 
 ```sh
-python3 incident_to_promtool.py compare-bundle tests/fixtures/payment-baseline.zip \
-  --bundle-ref 'HEAD^1' --after-ref HEAD --rule-file prometheus/payment.rules.yml \
+python3 incident_to_promtool.py compare-bundle \
+  tests/fixtures/payment-baseline.zip tests/fixtures/checkout-baseline.zip \
+  --bundle-ref 'HEAD^1' --after-ref HEAD \
+  --rule-file prometheus/payment.rules.yml --rule-file prometheus/checkout.rules.yml \
   --json-report review.json
 ```
 
-이때 JSON의 `commits.before`는 ZIP을 읽은 커밋, `commits.after`는 수정 룰을 읽은 커밋입니다. 앞에서 설명한 `bundle` 요약도 포함합니다.
+이때 JSON의 `commits.before`는 ZIP을 읽은 커밋, `commits.after`는 수정 룰을 읽은 커밋입니다.
 
 ### 시계열 표본 간격 확인
 

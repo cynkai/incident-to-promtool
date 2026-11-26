@@ -6,40 +6,50 @@ set -euo pipefail
 cd -- "${GITHUB_WORKSPACE:-.}"
 cd -- "$INCIDENT_REPO_PATH"
 
+nonempty_path_lines() {
+    local path
+    while IFS= read -r path; do
+        path=${path%$'\r'}
+        if [[ "$path" =~ [^[:space:]] ]]; then
+            printf '%s\n' "$path"
+        fi
+    done <<< "$1"
+}
+
 bundle=${INCIDENT_BUNDLE:-}
 fixture=${INCIDENT_FIXTURE:-}
 fixture_ref=${INCIDENT_FIXTURE_REF:-}
 capture_summaries=${INCIDENT_CAPTURE_SUMMARIES:-}
 fixture_paths=()
 while IFS= read -r fixture_path; do
-    fixture_path=${fixture_path%$'\r'}
-    if [[ "$fixture_path" =~ [^[:space:]] ]]; then
-        fixture_paths+=("$fixture_path")
-    fi
-done <<< "${INCIDENT_FIXTURES:-}"
+    fixture_paths+=("$fixture_path")
+done < <(nonempty_path_lines "${INCIDENT_FIXTURES:-}")
+bundle_paths=()
+while IFS= read -r bundle_path; do
+    bundle_paths+=("$bundle_path")
+done < <(nonempty_path_lines "${INCIDENT_BUNDLES:-}")
 
 source_count=0
-if [[ -n "$bundle" ]]; then
-    source_count=$((source_count + 1))
-fi
-if [[ -n "$fixture" ]]; then
-    source_count=$((source_count + 1))
-fi
-if [[ -n "${fixture_paths[0]:-}" ]]; then
-    source_count=$((source_count + 1))
-fi
+for source in "$fixture" "${fixture_paths[0]:-}" "$bundle" "${bundle_paths[0]:-}"; do
+    if [[ -n "$source" ]]; then
+        source_count=$((source_count + 1))
+    fi
+done
 if [[ "$source_count" -ne 1 ]]; then
-    printf 'Provide exactly one of fixture, fixtures, or bundle.\n' >&2
+    printf 'Provide exactly one of fixture, fixtures, bundle, or bundles.\n' >&2
     exit 2
 fi
 
-if [[ -n "$bundle" ]]; then
+if [[ -n "$bundle" || -n "${bundle_paths[0]:-}" ]]; then
     if [[ -n "$fixture_ref" || -n "$capture_summaries" ]]; then
-        printf 'bundle cannot be combined with fixture-ref or capture-summaries.\n' >&2
+        printf 'fixture-ref and capture-summaries require fixture or fixtures.\n' >&2
         exit 2
     fi
+    if [[ -n "$bundle" ]]; then
+        bundle_paths+=("$bundle")
+    fi
     comparison_arguments=(compare-bundle --bundle-ref="$INCIDENT_BEFORE_REF" --after-ref="$INCIDENT_AFTER_REF")
-    input_paths=("$bundle")
+    input_paths=("${bundle_paths[@]}")
 else
     if [[ -n "$fixture" ]]; then
         fixture_paths+=("$fixture")
@@ -59,11 +69,8 @@ else
 
     summary_paths=()
     while IFS= read -r summary_path; do
-        summary_path=${summary_path%$'\r'}
-        if [[ "$summary_path" =~ [^[:space:]] ]]; then
-            summary_paths+=("$summary_path")
-        fi
-    done <<< "$capture_summaries"
+        summary_paths+=("$summary_path")
+    done < <(nonempty_path_lines "$capture_summaries")
     if [[ -n "${summary_paths[0]:-}" ]]; then
         if [[ "${#summary_paths[@]}" -ne "${#fixture_paths[@]}" ]]; then
             printf 'Provide one capture summary path per fixture.\n' >&2
@@ -81,11 +88,8 @@ fi
 
 rule_arguments=()
 while IFS= read -r rule; do
-    rule=${rule%$'\r'}
-    if [[ "$rule" =~ [^[:space:]] ]]; then
-        rule_arguments+=(--rule-file="$rule")
-    fi
-done <<< "$INCIDENT_RULE_FILES"
+    rule_arguments+=(--rule-file="$rule")
+done < <(nonempty_path_lines "$INCIDENT_RULE_FILES")
 if [[ -z "${rule_arguments[0]:-}" ]]; then
     printf 'Provide at least one repository-relative path in rule-files.\n' >&2
     exit 2

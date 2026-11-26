@@ -2,13 +2,16 @@ name: Incident to Promtool
 description: Replay captured incidents against Prometheus alert rules before and after a Git change.
 inputs:
   fixture:
-    description: Path to one generated incident test fixture, relative to repo-path. Provide exactly one of fixture, fixtures, or bundle.
+    description: Path to one generated incident test fixture, relative to repo-path. Provide exactly one of fixture, fixtures, bundle, or bundles.
     required: false
   fixtures:
     description: Newline-separated generated incident test fixture paths, relative to repo-path.
     required: false
   bundle:
-    description: Repository-root-relative incident ZIP path in before-ref. Provide exactly one of fixture, fixtures, or bundle.
+    description: Repository-root-relative incident ZIP path in before-ref.
+    required: false
+  bundles:
+    description: Newline-separated repository-root-relative incident ZIP paths in before-ref.
     required: false
   fixture-ref:
     description: Git revision containing the repository-root-relative fixture and capture summary paths. Use with fixture or fixtures. Omit to read from the checkout.
@@ -17,7 +20,7 @@ inputs:
     description: Newline-separated capture summary paths in the same order as the fixtures. Use with fixture or fixtures.
     required: false
   rule-files:
-    description: Newline-separated, repository-root-relative rule paths present in both commits or only in after-ref for bundle mode.
+    description: Newline-separated rule paths from the repository root. Fixture mode reads these from both refs. Bundle mode reads these from after-ref.
     required: true
   rule-format:
     description: Either prometheus or kubernetes. Applies to both versions in fixture mode and proposed rules in bundle mode.
@@ -29,7 +32,7 @@ inputs:
     description: Checkout directory, relative to the workflow workspace if not absolute.
     default: '.'
   before-ref:
-    description: Git revision containing the baseline rules or the bundle. The default is the first parent of the PR merge candidate.
+    description: Git revision containing the baseline rules or bundles. The default is the first parent of the PR merge candidate.
     default: 'HEAD^1'
   after-ref:
     description: Proposed Git revision. The default is the checked-out PR merge candidate.
@@ -57,6 +60,7 @@ runs:
         INCIDENT_FIXTURE: ${{ inputs.fixture }}
         INCIDENT_FIXTURES: ${{ inputs.fixtures }}
         INCIDENT_BUNDLE: ${{ inputs.bundle }}
+        INCIDENT_BUNDLES: ${{ inputs.bundles }}
         INCIDENT_FIXTURE_REF: ${{ inputs.fixture-ref }}
         INCIDENT_CAPTURE_SUMMARIES: ${{ inputs.capture-summaries }}
         INCIDENT_RULE_FILES: ${{ inputs.rule-files }}
