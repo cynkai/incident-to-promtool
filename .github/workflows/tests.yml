@@ -31,6 +31,13 @@ jobs:
       - name: Run tests
         run: |
           PROMTOOL="$RUNNER_TEMP/promtool" "$RUNNER_TEMP/test-venv/bin/python" -m unittest discover -s tests -v
+      - name: Run the quickstart from outside the checkout
+        run: |
+          cd "$RUNNER_TEMP"
+          report=$(PROMTOOL="$RUNNER_TEMP/promtool" bash "$GITHUB_WORKSPACE/scripts/demo.sh")
+          [[ "$report" == '## Prometheus alert comparison'* ]]
+          [[ "$report" == *'| Before | Failed | 1/2 |'* ]]
+          [[ "$report" == *'| After | Passed | 2/2 |'* ]]
 
   composite-action:
     name: Composite Action smoke test

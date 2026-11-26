@@ -1,12 +1,28 @@
 # Incident to Promtool
 
-Turn past Prometheus incidents into offline alert-rule regression tests.
+Turn a past Prometheus incident into a pull request check.
+
+## Quickstart
+
+Clone the repository and run the demo.
+
+```sh
+git clone https://github.com/cynkai/incident-to-promtool.git
+cd incident-to-promtool
+bash scripts/demo.sh
+```
+
+The demo replays synthetic payment metrics without a Prometheus server. It checks that the alert stays quiet before the outage and is firing five minutes after it starts. The original rule matches **1/2** checkpoints. The revised rule matches **2/2** and passes the check.
+
+Use Python 3.10+ and `promtool` 3.9+. With no local `promtool`, the demo downloads and verifies a pinned binary on Linux x64. Set `PROMTOOL=/path/to/promtool` to use a specific executable.
+
+Commit a fixture for your own incident, compare rule changes between Git refs, and add the same check to CI. Detailed examples are available in Korean. [Capture an incident](#내-prometheus로-실행) · [Native Prometheus rules](#룰-변경-전후-비교) · [Git ref comparison](#git-커밋으로-비교) · [Kubernetes PrometheusRule](#kubernetes-prometheusrule로-테스트) · [GitHub Action](#github-actions에서-pr-검사)
 
 장애 구간의 시계열과 팀이 정한 알람 기대 동작으로 `promtool` 테스트 파일을 만듭니다. 같은 데이터에서 기존 룰과 수정 룰을 비교해 PR에 붙일 Markdown 리포트를 만들고, 테스트 파일을 커밋해 이후 변경에도 같은 검사를 실행할 수 있습니다.
 
 ## 결제 장애 예제 실행
 
-저장소 루트에서 실행합니다. Python 3.10 이상과 `promtool` 3.9 이상이 필요합니다. 예제는 `alarm-study`의 결제 장애에서 착안한 합성 데이터입니다. [alarm-study](https://github.com/cynkai/alarm-study)
+저장소 루트에서 `bash scripts/demo.sh`로 데모를 바로 실행하거나 아래 단계를 차례로 실행할 수 있습니다. 수동 실행에는 Python 3.10 이상과 `promtool` 3.9 이상이 필요합니다. 예제는 `alarm-study`의 결제 장애에서 착안한 합성 데이터입니다. [alarm-study](https://github.com/cynkai/alarm-study)
 
 ```sh
 mkdir -p demo/generated
