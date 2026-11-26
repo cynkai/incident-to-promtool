@@ -16,7 +16,7 @@ The demo replays synthetic payment metrics without a Prometheus server. It check
 
 Use Python 3.10+ and `promtool` 3.9+. With no local `promtool`, the demo downloads and verifies a pinned binary on Linux x64. Set `PROMTOOL=/path/to/promtool` to use a specific executable.
 
-Commit a fixture for your own incident, compare rule changes between Git refs, and add the same check to CI. Detailed examples are available in Korean. [Capture an incident](#내-prometheus로-실행) · [Raw metric snapshot](#원본-시계열-스냅샷) · [Alertmanager webhook](#alertmanager-웹훅으로-기대-동작-만들기) · [Native Prometheus rules](#룰-변경-전후-비교) · [Git ref comparison](#git-커밋으로-비교) · [Kubernetes PrometheusRule](#kubernetes-prometheusrule로-테스트) · [GitHub Action](#github-actions에서-pr-검사)
+Commit a fixture for your own incident, compare rule changes between Git refs, and add the same check to CI. Detailed examples are available in Korean. [Capture an incident](#내-prometheus로-실행) · [Raw metric snapshot](#원본-시계열-스냅샷) · [Inspect sample gaps](#시계열-표본-간격-확인) · [Alertmanager webhook](#alertmanager-웹훅으로-기대-동작-만들기) · [Native Prometheus rules](#룰-변경-전후-비교) · [Git ref comparison](#git-커밋으로-비교) · [Kubernetes PrometheusRule](#kubernetes-prometheusrule로-테스트) · [GitHub Action](#github-actions에서-pr-검사)
 
 ### Install the CLI from GitHub
 
@@ -234,6 +234,19 @@ python3 incident_to_promtool.py incident.json \
 스냅샷 설정에는 시간대가 포함된 `start`와 `end`가 필요합니다. 서버에서 가져올 때는 `selectors`도 지정합니다. `sample_interval`, `evaluation_interval`, `rule_files`, `expectations`는 두 번째 명령에서 테스트를 생성할 때 채웁니다. 같은 구간을 재현할 수 있도록 `incident.json`도 스냅샷과 함께 보관합니다.
 
 저장 파일은 Prometheus `matrix` 응답 형식이며, 지정 구간의 표본 시각을 밀리초 정밀도로 보존하고 라벨과 값을 그대로 담습니다. 저장된 응답을 합치려면 `snapshot`에 `--matrix part-a.matrix.json --matrix part-b.matrix.json`과 같이 입력을 반복 지정합니다. 같은 시계열에서 시각과 값이 일치하는 표본은 하나로 합칩니다. 구간 안에 표본이 없거나 같은 시각의 값이 충돌하거나, 응답에 경고 또는 네이티브 히스토그램이 있으면 오류로 처리합니다.
+
+### 시계열 표본 간격 확인
+
+`inspect`는 캡처 구간에서 관측된 시계열별로 표본 수, 첫 표본과 마지막 표본의 UTC 시각, 구간 양끝의 공백, 연속된 두 표본 사이의 최장 간격을 보고합니다. 간격은 실제 표본 시각으로 계산합니다. 기본 출력은 Markdown이고, `--format json`은 간격의 시작과 끝도 기록합니다.
+
+```sh
+python3 incident_to_promtool.py inspect demo/demo.json \
+  --matrix demo/incident.matrix.json --max-gap 30s
+```
+
+저장 응답은 `--matrix`를 반복해 지정할 수 있습니다. 서버에서 조회할 때는 시간대가 있는 `start`와 `end`, `selectors`를 설정하고 `--prometheus-url`을 사용합니다.
+
+`--max-gap`을 지정하면 첫 표본 전, 표본 사이, 마지막 표본 후의 공백 중 하나라도 제한을 초과할 때 실패합니다. 구간에 표본이 하나도 없을 때도 이 검사는 실패합니다. 옵션을 생략하면 빈 구간을 포함한 관측 결과를 그대로 보고합니다. 종료 코드는 검사 통과 또는 제한 없이 보고할 때 `0`, 간격 검사 실패 `1`, 잘못된 입력 `2`입니다.
 
 ### Alertmanager 웹훅으로 기대 동작 만들기
 

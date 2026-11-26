@@ -4,9 +4,10 @@
 import argparse
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
+from itertools import pairwise
 import json
 import math
 import os
@@ -58,6 +59,14 @@ def timestamp_ms(value):
         raise ValueError("timestamps require a timezone and at most millisecond precision")
     delta = instant - EPOCH
     return instant.astimezone(timezone.utc), (delta.days * 86_400 + delta.seconds) * 1000 + delta.microseconds // 1000
+
+
+def capture_window(config):
+    start, begin_ms = timestamp_ms(config["start"])
+    end, end_ms = timestamp_ms(config["end"])
+    if end_ms <= begin_ms:
+        raise ValueError("end must follow start")
+    return (start, begin_ms), (end, end_ms)
 
 
 def string_map(value, option, check_names=False):
@@ -231,7 +240,7 @@ class CapturedSeries:
     samples: dict[int, str]
 
 
-def capture_samples(matrices, start, end):
+def capture_samples(matrices, start, end, *, allow_empty=False):
     samples_by_series = {}
     for matrix in matrices:
         if matrix.get("status") != "success" or matrix.get("warnings"):
@@ -267,7 +276,7 @@ def capture_samples(matrices, start, end):
                 samples[offset] = value
 
     active = {name: series for name, series in samples_by_series.items() if series.samples}
-    if not active:
+    if not active and not allow_empty:
         raise ValueError("no float samples found in the capture window")
     return active
 
@@ -683,6 +692,75 @@ def markdown_code(value):
     return f"<code>{escaped}</code>"
 
 
+def build_coverage_report(samples, start, end, max_gap_ms):
+    window = (end - start) // timedelta(milliseconds=1)
+
+    def timestamp_at(offset):
+        return (start + timedelta(milliseconds=offset)).isoformat()
+
+    details = []
+    for name, series in sorted(samples.items()):
+        offsets = sorted(series.samples)
+        first, last = offsets[0], offsets[-1]
+        largest = max(pairwise(offsets), key=lambda pair: pair[1] - pair[0], default=None)
+        gap = None
+        if largest is not None:
+            left, right = largest
+            gap = {"start": timestamp_at(left), "end": timestamp_at(right), "duration_ms": right - left}
+        detail = {
+            "series": name,
+            "sample_count": len(offsets),
+            "first_sample": timestamp_at(first),
+            "last_sample": timestamp_at(last),
+            "leading_gap_ms": first,
+            "trailing_gap_ms": window - last,
+            "max_sample_gap": gap,
+        }
+        if max_gap_ms is not None:
+            detail["gap_exceeded"] = max(first, window - last, gap["duration_ms"] if gap else 0) > max_gap_ms
+        details.append(detail)
+    gate = None
+    if max_gap_ms is not None:
+        gate = {"max_gap_ms": max_gap_ms, "passed": bool(details) and not any(row["gap_exceeded"] for row in details)}
+    return {
+        "schema_version": 1,
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "series_count": len(details),
+        "sample_count": sum(row["sample_count"] for row in details),
+        "series": details,
+        "gate": gate,
+    }
+
+
+def print_coverage_report(report):
+    print("## Prometheus sample coverage\n")
+    print(f"Capture window `{report['start']}` to `{report['end']}`.\n")
+    print(f"{report['series_count']} observed series, {report['sample_count']} samples.\n")
+    gate = report["gate"]
+    if gate is not None:
+        result = "Passed" if gate["passed"] else "Failed"
+        print(f"Gap limit `{as_duration(gate['max_gap_ms'])}` **{result}**.\n")
+    if not report["series"]:
+        print("No samples found in the capture window.")
+        return
+    columns = ["Series", "Samples", "First sample (UTC)", "Last sample (UTC)", "Start gap", "Longest sample gap", "End gap"]
+    if gate is not None:
+        columns.append("Gap check")
+    print("| " + " | ".join(columns) + " |")
+    print("| " + " | ".join(["---"] * len(columns)) + " |")
+    for row in report["series"]:
+        gap = row["max_sample_gap"]
+        cells = [
+            markdown_code(row["series"]), str(row["sample_count"]), row["first_sample"], row["last_sample"],
+            as_duration(row["leading_gap_ms"]), as_duration(gap["duration_ms"]) if gap else "—",
+            as_duration(row["trailing_gap_ms"]),
+        ]
+        if gate is not None:
+            cells.append("Exceeded" if row["gap_exceeded"] else "Within limit")
+        print("| " + " | ".join(cells) + " |")
+
+
 def build_comparison_report(fixtures, before_failures, after_failures, revisions, gate, fixture_commit):
     count = sum(fixture.checkpoints for fixture in fixtures)
     summary = {
@@ -927,10 +1005,7 @@ def snapshot_main(argv):
     args = parser.parse_args(argv)
     try:
         config = read_json(args.config)
-        _, begin_ms = timestamp_ms(config["start"])
-        end, end_ms = timestamp_ms(config["end"])
-        if end_ms <= begin_ms:
-            raise ValueError("end must follow start")
+        (_, begin_ms), (end, end_ms) = capture_window(config)
         matrices = capture_matrices(args, config, end, end_ms - begin_ms)
         samples = capture_samples(matrices, begin_ms, end_ms)
         write_matrix_snapshot(args.output, samples, begin_ms)
@@ -942,16 +1017,48 @@ def snapshot_main(argv):
     print(f"Wrote {args.output} ({len(samples)} series, {sample_count} samples).")
 
 
+def inspect_main(argv):
+    parser = argparse.ArgumentParser(
+        prog=f"{Path(sys.argv[0]).name} inspect",
+        description="Report observed sample coverage and time gaps in a Prometheus capture window.",
+    )
+    parser.add_argument("config", type=Path, help="capture window and selectors (JSON)")
+    add_capture_source_options(parser)
+    parser.add_argument("--format", choices=("markdown", "json"), default="markdown", help="report format (default: markdown)")
+    parser.add_argument("--max-gap", metavar="DURATION", help="fail on empty captures or gaps exceeding this positive duration")
+    args = parser.parse_args(argv)
+    try:
+        max_gap_ms = None
+        if args.max_gap is not None:
+            max_gap_ms = duration_ms(args.max_gap)
+            if max_gap_ms <= 0:
+                raise ValueError("--max-gap requires a positive duration")
+        config = read_json(args.config)
+        (start, begin_ms), (end, end_ms) = capture_window(config)
+        matrices = capture_matrices(args, config, end, end_ms - begin_ms)
+        samples = capture_samples(matrices, begin_ms, end_ms, allow_empty=True)
+        report = build_coverage_report(samples, start, end, max_gap_ms)
+    except (ValueError, KeyError, TypeError, AttributeError, InvalidOperation, OSError, OverflowError) as exc:
+        parser.exit(2, f"error: {exc}\n")
+    if args.format == "json":
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        print_coverage_report(report)
+    return int(report["gate"] is not None and not report["gate"]["passed"])
+
+
 def main():
     if sys.argv[1:2] == ["snapshot"]:
         return snapshot_main(sys.argv[2:])
+    if sys.argv[1:2] == ["inspect"]:
+        return inspect_main(sys.argv[2:])
     if sys.argv[1:2] == ["compare"]:
         return compare_main(sys.argv[2:])
     if sys.argv[1:2] == ["export-rules"]:
         return export_rules_main(sys.argv[2:])
     parser = argparse.ArgumentParser(
-        description=__doc__, epilog="See snapshot --help for sample capture, compare --help for rule comparisons, "
-        "or export-rules --help for Kubernetes manifests."
+        description=__doc__, epilog="See snapshot --help for sample capture, inspect --help for sample coverage, "
+        "compare --help for rule comparisons, or export-rules --help for Kubernetes manifests."
     )
     parser.add_argument("config", type=Path, help="incident window and expected alert states (JSON)")
     add_capture_source_options(parser)

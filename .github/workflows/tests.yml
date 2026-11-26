@@ -53,12 +53,21 @@ jobs:
           cli="$smoke/venv/bin/incident-to-promtool"
           "$cli" snapshot "$demo/alertmanager.incident.json" --matrix "$demo/incident.matrix.json" \
             --output payment.matrix.json
+          "$cli" inspect "$demo/alertmanager.incident.json" --matrix payment.matrix.json \
+            --format json --max-gap 30s > coverage.json
           "$cli" "$demo/alertmanager.incident.json" --matrix payment.matrix.json \
             --output payment.test.yml --summary-format json > summary.json
           "$smoke/venv/bin/python" - <<'PY'
           import hashlib
           import json
           from pathlib import Path
+
+          coverage = json.loads(Path("coverage.json").read_text(encoding="utf-8"))
+          assert coverage["gate"] == {"max_gap_ms": 30_000, "passed": True}
+          assert coverage["series_count"] == 1 and coverage["sample_count"] == 21
+          series, = coverage["series"]
+          assert (series["first_sample"], series["last_sample"]) == (coverage["start"], coverage["end"])
+          assert series["max_sample_gap"]["duration_ms"] == 30_000
 
           summary = json.loads(Path("summary.json").read_text(encoding="utf-8"))
           assert summary["schema_version"] == 1
