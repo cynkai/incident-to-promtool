@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "incident-to-promtool"
+version = "0.1.0"
+description = "Turn captured Prometheus incidents into offline alert-rule regression tests."
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+kubernetes = ["PyYAML>=6,<7"]
+
+[project.scripts]
+incident-to-promtool = "incident_to_promtool:main"
+
+[project.urls]
+Repository = "https://github.com/cynkai/incident-to-promtool"
+Issues = "https://github.com/cynkai/incident-to-promtool/issues"
+
+[tool.setuptools]
+py-modules = ["incident_to_promtool", "kubernetes_rules"]

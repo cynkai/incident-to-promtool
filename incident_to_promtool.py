@@ -6,6 +6,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+import hashlib
 import json
 import math
 import os
@@ -74,8 +75,8 @@ def read_json(path):
 
 
 def write_new_json(path, data):
-    document = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
-    temporary = NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False)
+    document = (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    temporary = NamedTemporaryFile("wb", dir=path.parent, delete=False)
     staged = Path(temporary.name)
     try:
         with temporary:
@@ -83,6 +84,7 @@ def write_new_json(path, data):
         os.link(staged, path)
     finally:
         staged.unlink()
+    return document
 
 
 def read_rule_sources(paths):
@@ -234,8 +236,19 @@ def bounded_sample_interval(samples_by_series, evaluation, window, exact_step, m
     return None
 
 
+@dataclass(frozen=True)
+class EncodedSamples:
+    series: list[dict[str, str]]
+    sample_count: int
+    shifted_sample_count: int
+    max_shift_ms: int
+    expanded_slots: int
+
+
 def encode_samples(samples_by_series, step, round_up):
     records = []
+    sample_count = 0
+    shifted_sample_count = 0
     largest_shift = 0
     expanded_slots = 0
     for name, samples in sorted(samples_by_series.items()):
@@ -251,6 +264,7 @@ def encode_samples(samples_by_series, step, round_up):
                         'set sample_interval to "auto", choose a finer interval, or rerun with --round-up'
                     )
                 largest_shift = max(largest_shift, delay)
+                shifted_sample_count += 1
             missing = slot - next_slot
             if missing < 0:
                 raise ValueError("multiple samples land in one fixture slot; choose a finer sample_interval")
@@ -258,15 +272,17 @@ def encode_samples(samples_by_series, step, round_up):
                 values.append("_" if missing == 1 else f"_x{missing}")
             values.append(value)
             next_slot = slot + 1
+        sample_count += len(samples)
         expanded_slots += next_slot
         if expanded_slots > MAX_VALUES:
             raise ValueError(f"capture exceeds {MAX_VALUES:,} fixture slots; narrow the window or selectors")
         records.append({"series": name, "values": " ".join(values)})
-    return records, largest_shift
+    return EncodedSamples(records, sample_count, shifted_sample_count, largest_shift, expanded_slots)
 
 
 def collect_series(matrices, start, end, step, round_up):
-    return encode_samples(capture_samples(matrices, start, end), step, round_up)
+    capture = encode_samples(capture_samples(matrices, start, end), step, round_up)
+    return capture.series, capture.max_shift_ms
 
 
 def encode_automatic_samples(samples, evaluation, window, max_shift):
@@ -285,8 +301,7 @@ def encode_automatic_samples(samples, evaluation, window, max_shift):
                 f"no automatic interval fits {MAX_VALUES:,} fixture slots with --max-shift {as_duration(max_shift)} "
                 "while keeping distinct samples within the capture window; use a shorter window or narrower selectors"
             )
-    records, shift = encode_samples(samples, step, round_up=step != exact_step)
-    return records, shift, step
+    return encode_samples(samples, step, round_up=step != exact_step), step
 
 
 def generate(args):
@@ -334,24 +349,44 @@ def generate(args):
             raise ValueError("selectors must contain raw metric selectors, such as requests_total{job=\"api\"}")
         matrices = (fetch_matrix(base_url, selector, end, window) for selector in selectors)
 
+    samples = capture_samples(matrices, begin_ms, end_ms)
     if automatic:
-        samples = capture_samples(matrices, begin_ms, end_ms)
-        records, shift, step = encode_automatic_samples(samples, evaluation, window, max_shift)
+        capture, step = encode_automatic_samples(samples, evaluation, window, max_shift)
+        sampling_mode = "auto_bounded" if capture.shifted_sample_count else "auto_exact"
+        shift_limit = max_shift if args.max_shift is not None else None
     else:
-        records, shift = collect_series(matrices, begin_ms, end_ms, step, args.round_up)
+        capture = encode_samples(samples, step, args.round_up)
+        sampling_mode = "fixed_round_up" if args.round_up else "fixed_exact"
+        shift_limit = step - 1 if args.round_up else None
     fixture = {
         "rule_files": rule_files,
         "evaluation_interval": as_duration(evaluation),
         "tests": [{
             "start_timestamp": start.isoformat(),
             "interval": as_duration(step),
-            "input_series": records,
+            "input_series": capture.series,
             "alert_rule_test": tests,
         }],
     }
     # JSON syntax is also valid YAML, which lets promtool read it without a Python YAML dependency.
-    write_new_json(args.output, fixture)
-    return len(records), len(tests), shift, step if automatic else None
+    document = write_new_json(args.output, fixture)
+    return {
+        "schema_version": 1,
+        "fixture_path": str(args.output),
+        "fixture_sha256": hashlib.sha256(document).hexdigest(),
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "evaluation_interval_ms": evaluation,
+        "sample_interval_ms": step,
+        "sampling_mode": sampling_mode,
+        "max_shift_ms": capture.max_shift_ms,
+        "max_shift_limit_ms": shift_limit,
+        "series_count": len(capture.series),
+        "sample_count": capture.sample_count,
+        "shifted_sample_count": capture.shifted_sample_count,
+        "checkpoint_count": len(tests),
+        "expanded_slots": capture.expanded_slots,
+    }
 
 
 def git_output(repo, *args):
@@ -724,17 +759,23 @@ def main():
     parser.add_argument("--rule-file", type=Path, action="append", help="override config rule_files (repeatable)")
     parser.add_argument("--round-up", action="store_true", help="shift off-grid samples with a numeric sample interval")
     parser.add_argument("--max-shift", metavar="DURATION", help="allow bounded forward shifts if the exact auto grid is too large")
+    parser.add_argument("--summary-format", choices=("text", "json"), default="text",
+                        help="write a plain-text or JSON capture summary to stdout (default: text)")
     parser.add_argument("--output", required=True, type=Path, help="new promtool YAML test file")
     args = parser.parse_args()
     try:
-        series, checks, shift, automatic_interval = generate(args)
+        summary = generate(args)
     except FileExistsError:
         parser.exit(1, f"error: output file already exists: {args.output}\n")
     except (ValueError, KeyError, TypeError, AttributeError, InvalidOperation, OSError) as exc:
         parser.exit(1, f"error: {exc}\n")
-    print(f"Wrote {args.output} ({series} series, {checks} checkpoints).")
-    if automatic_interval is not None:
-        print(f"Automatically selected a {as_duration(automatic_interval)} sample interval.")
+    if args.summary_format == "json":
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return
+    print(f"Wrote {summary['fixture_path']} ({summary['series_count']} series, {summary['checkpoint_count']} checkpoints).")
+    if summary["sampling_mode"].startswith("auto_"):
+        print(f"Automatically selected a {as_duration(summary['sample_interval_ms'])} sample interval.")
+    shift = summary["max_shift_ms"]
     if shift:
         print(f"Shifted off-grid samples forward by up to {shift} ms.", file=sys.stderr)
 

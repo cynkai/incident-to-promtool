@@ -18,6 +18,26 @@ Use Python 3.10+ and `promtool` 3.9+. With no local `promtool`, the demo downloa
 
 Commit a fixture for your own incident, compare rule changes between Git refs, and add the same check to CI. Detailed examples are available in Korean. [Capture an incident](#내-prometheus로-실행) · [Native Prometheus rules](#룰-변경-전후-비교) · [Git ref comparison](#git-커밋으로-비교) · [Kubernetes PrometheusRule](#kubernetes-prometheusrule로-테스트) · [GitHub Action](#github-actions에서-pr-검사)
 
+### Install the CLI from GitHub
+
+Install the command in a Python virtual environment.
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python3 -m pip install 'git+https://github.com/cynkai/incident-to-promtool.git'
+```
+
+For Kubernetes manifests, install the `kubernetes` extra with `python3 -m pip install 'incident-to-promtool[kubernetes] @ git+https://github.com/cynkai/incident-to-promtool.git'`. Install `promtool` 3.9+ separately for rule comparisons. From the cloned repository, try the installed command on the demo files.
+
+```sh
+mkdir -p demo/generated
+incident-to-promtool demo/demo.json --matrix demo/incident.matrix.json \
+  --output demo/generated/installed.test.yml
+incident-to-promtool compare demo/generated/installed.test.yml \
+  --before demo/before.rules.yml --after demo/after.rules.yml
+```
+
 장애 구간의 시계열과 팀이 정한 알람 기대 동작으로 `promtool` 테스트 파일을 만듭니다. 같은 데이터에서 기존 룰과 수정 룰을 비교해 PR에 붙일 Markdown 리포트를 만들고, 테스트 파일을 커밋해 이후 변경에도 같은 검사를 실행할 수 있습니다.
 
 ## 결제 장애 예제 실행
@@ -186,6 +206,19 @@ python3 incident_to_promtool.py incident.json --prometheus-url http://localhost:
 `"30s"`처럼 간격을 직접 지정하면 평가 간격은 그 배수여야 하며, 기본 변환은 표본 시각이 격자에 맞아야 합니다. 명시적으로 `--round-up`을 쓰면 표본을 다음 격자로 미루고 최대 이동 시간을 표시합니다. 이때 `end`도 격자에 맞춰야 하고, 같은 시계열의 두 타임스탬프가 한 칸에 들어가면 더 촘촘한 간격이 필요합니다.
 
 입력은 유한한 스칼라 표본입니다. Prometheus 원본 조회 API는 stale 표식을 제외하므로, `absent()`처럼 시계열이 stale 상태가 된 시각에 의존하는 룰은 이 방식으로 정확히 재현하기 어렵습니다.
+
+### 캡처 요약 JSON
+
+`--summary-format json`을 지정하면 기본 텍스트 요약 대신 JSON을 표준 출력으로 보냅니다. `--output`은 생성할 테스트 파일 경로입니다.
+
+```sh
+python3 incident_to_promtool.py incident.json --prometheus-url http://localhost:9090 \
+  --output incident.capture.test.yml --summary-format json > capture.json
+```
+
+- `schema_version`은 `1`입니다. `fixture_path`와 `fixture_sha256`은 출력 파일의 경로와 SHA-256 해시입니다. `start`와 `end`는 UTC입니다.
+- `evaluation_interval_ms`, `sample_interval_ms`, `max_shift_ms`, `max_shift_limit_ms`는 평가 간격, 선택한 표본 간격, 실제 최대 이동, 이동 허용치를 밀리초로 기록합니다. 허용치는 `--max-shift`에 지정한 값, 수치 간격에 `--round-up`을 쓴 경우에는 간격에서 1ms를 뺀 값, 그 외에는 `null`입니다. `sampling_mode`는 `fixed_exact`, `fixed_round_up`, `auto_exact`, `auto_bounded` 중 하나입니다.
+- `series_count`, `sample_count`, `shifted_sample_count`, `checkpoint_count`, `expanded_slots`는 시계열, 표본, 이동한 표본, 기대 동작 검사, 빈 칸을 펼친 전체 슬롯 수입니다. 선택자가 겹쳐 같은 표본을 여러 번 받아도 `sample_count`에는 한 번만 셉니다.
 
 ## 실제 변경에 적용하기
 

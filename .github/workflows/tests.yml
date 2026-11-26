@@ -38,6 +38,37 @@ jobs:
           [[ "$report" == '## Prometheus alert comparison'* ]]
           [[ "$report" == *'| Before | Failed | 1/2 |'* ]]
           [[ "$report" == *'| After | Passed | 2/2 |'* ]]
+      - name: Smoke test the installed wheel
+        if: matrix.version == '3.11.0'
+        run: |
+          smoke=$(mktemp -d "$RUNNER_TEMP/wheel-smoke.XXXXXXXX")
+          "$RUNNER_TEMP/test-venv/bin/python" -m pip wheel --no-deps --wheel-dir "$smoke/wheels" .
+          wheels=("$smoke"/wheels/*.whl)
+          [[ ${#wheels[@]} -eq 1 && -f ${wheels[0]} ]]
+          python3 -m venv "$smoke/venv"
+          "$smoke/venv/bin/python" -m pip install "${wheels[0]}[kubernetes]"
+
+          cd "$smoke"
+          demo="$GITHUB_WORKSPACE/demo"
+          cli="$smoke/venv/bin/incident-to-promtool"
+          "$cli" "$demo/demo.json" --matrix "$demo/incident.matrix.json" \
+            --output payment.test.yml --summary-format json > summary.json
+          "$smoke/venv/bin/python" - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          summary = json.loads(Path("summary.json").read_text(encoding="utf-8"))
+          assert summary["schema_version"] == 1
+          assert summary["fixture_sha256"] == hashlib.sha256(Path("payment.test.yml").read_bytes()).hexdigest()
+          PY
+
+          report=$("$cli" compare payment.test.yml --before "$demo/before.rules.yml" \
+            --after "$demo/after.rules.yml" --promtool "$RUNNER_TEMP/promtool")
+          [[ "$report" == *'| Before | Failed | 1/2 |'* ]]
+          [[ "$report" == *'| After | Passed | 2/2 |'* ]]
+          "$cli" export-rules "$demo/kubernetes/after.yml" --output-dir rules
+          "$RUNNER_TEMP/promtool" check rules rules/rules-1.yml
 
   composite-action:
     name: Composite Action smoke test

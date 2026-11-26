@@ -1,2 +1,6 @@
 __pycache__/
 demo/generated/
+.venv/
+build/
+dist/
+*.egg-info/
