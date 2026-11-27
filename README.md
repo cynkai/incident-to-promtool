@@ -14,7 +14,7 @@ bash scripts/demo.sh
 
 The demo replays synthetic payment metrics without a Prometheus server. It checks that the alert stays quiet before the outage and is firing five minutes after it starts. The original rule matches **1/2** checkpoints. The revised rule matches **2/2** and passes the check.
 
-Use `timeline` to compare when the alert first fires at two Git commits and fail CI if the proposed rule exceeds a delay limit. [Git-backed timing check](#git-커밋의-룰로-타임라인-재생)
+Use `timeline` to compare an alert's first firing across Git revisions. The GitHub Action also offers an optional delay limit alongside checkpoint checks. [GitHub Action timing gate](#pr에서-최초-발화-지연-검사)
 
 Use Python 3.10+ and `promtool` 3.9+. With no local `promtool`, the demo downloads and verifies a pinned binary on Linux x64. Set `PROMTOOL=/path/to/promtool` to use a specific executable.
 
@@ -112,6 +112,8 @@ python3 incident_to_promtool.py timeline demo/generated/after.test.yml \
 `--max-delay`와 `--format json`을 같이 사용하면 JSON의 `gate`에 `mode`(`max-delay`), `max_delay_ms`, `passed`, `checked_groups`, `groups`가 들어갑니다. `groups`의 각 항목은 `group`, `status`, `before_first_firing_offset_ms`, `after_first_firing_offset_ms`, `first_firing_delta_ms`를 기록합니다. 이 시점과 차이는 `0s`부터 관측한 결과입니다. `status`는 `passed`, `delayed`, `missing_after`, `no_baseline` 중 하나입니다.
 
 종료 코드는 게이트 없이 보고를 완료했거나 게이트를 통과했을 때 `0`, 게이트 실패 `1`, 입력 또는 실행 오류 `2`입니다.
+
+`compare`에서 체크포인트와 발화 지연을 함께 검사하려면 `--timeline-alertname`, `--timeline-end`, `--timeline-max-delay`를 추가합니다. 테스트가 여러 개면 `--timeline-fixture`로 대상 경로도 지정합니다. [PR에서 최초 발화 지연 검사](#pr에서-최초-발화-지연-검사)
 
 #### Git 커밋의 룰로 타임라인 재생
 
@@ -251,6 +253,29 @@ with:
 `kubernetes` 모드는 PyYAML 6.0.3을 격리된 가상 환경에 설치합니다. 완료된 비교는 실행 요약을 남기며 `steps.compare.outputs.report-path`로 Markdown 경로, `steps.compare.outputs.json-report-path`로 JSON 경로, `steps.compare.outputs.junit-report-path`로 JUnit XML 경로, `steps.compare.outputs.newly-failed`로 새로 실패한 검사 건수(문자열)를 제공합니다. 게이트를 통과하지 못해도 이 출력들은 제공됩니다. 입력이나 실행 오류는 단계 로그에만 표시됩니다.
 
 게이트가 실패한 경우에도 후속 단계에서 JSON을 읽으려면 해당 단계에 `if: ${{ always() && steps.compare.outputs.json-report-path != '' }}`를 지정합니다. JUnit XML에는 같은 조건에서 `junit-report-path`를 사용합니다.
+
+#### PR에서 최초 발화 지연 검사
+
+생성된 테스트를 `fixture`나 `fixtures`로 지정한 경우 `timeline-alertname`, `timeline-end`, `timeline-max-delay`를 모두 설정해 최초 발화 지연도 검사할 수 있습니다. 테스트가 하나면 기본으로 선택합니다. 여러 개면 `timeline-fixture`가 필요합니다. 지정한 `timeline-fixture`는 설정한 테스트 경로 중 하나와 같아야 합니다.
+
+체크포인트 검사에서 읽은 테스트와 룰을 사용해 `0s`부터 `timeline-end`까지의 최초 발화를 비교합니다. `timeline-end`는 선택한 테스트의 평가 간격에 맞춥니다. 선택한 체크포인트 게이트(`strict` 또는 `regressions`)와 지연 게이트가 모두 통과하면 단계가 성공합니다.
+
+```yaml
+with:
+  fixture: tests/fixtures/payment.test.yml
+  fixture-ref: 'HEAD^1'
+  capture-summaries: |
+    tests/fixtures/payment.capture.json
+  rule-files: |
+    prometheus/payment.rules.yml
+  timeline-alertname: PaymentErrorsHigh
+  timeline-end: '10m'
+  timeline-max-delay: '0s'
+```
+
+Markdown은 체크포인트 결과와 발화 타임라인을 함께 보여줍니다. JSON의 `timeline`은 `timeline` 명령과 같은 구조이며 최상위 `gate`는 체크포인트 판정입니다. JUnit XML에는 검사 하나를 담은 `Alert firing delay` 스위트가 추가되고 전체 검사 수에도 반영됩니다.
+
+지연 검사를 켜면 `steps.compare.outputs.timeline-passed`에 문자열 `true` 또는 `false`를 제공합니다. 게이트가 실패해도 이 값을 읽을 수 있습니다. `newly-failed`는 새로 실패한 체크포인트 수입니다.
 
 #### 기준 번들로 PR 검사
 

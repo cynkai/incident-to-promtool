@@ -34,6 +34,18 @@ inputs:
   gate:
     description: Use strict to fail on any failing proposed checkpoint or regressions to fail only on newly failing checkpoints.
     default: strict
+  timeline-alertname:
+    description: Alert name for the optional first-firing timing gate. Provide with timeline-end and timeline-max-delay.
+    required: false
+  timeline-end:
+    description: Last inclusive evaluation offset for the timing gate, such as 10m.
+    required: false
+  timeline-max-delay:
+    description: Maximum allowed delay of the proposed rule's first firing, such as 0s or 1m.
+    required: false
+  timeline-fixture:
+    description: Choose the timing gate fixture by its exact fixture path. Required for the timing gate when comparing multiple fixtures.
+    required: false
   repo-path:
     description: Checkout directory, relative to the workflow workspace if not absolute.
     default: '.'
@@ -58,6 +70,9 @@ outputs:
   newly-failed:
     description: Number of checkpoints that passed before and failed after the rule changes.
     value: ${{ steps.replay.outputs.newly-failed }}
+  timeline-passed:
+    description: The string true or false when the optional first-firing timing gate runs.
+    value: ${{ steps.replay.outputs.timeline-passed }}
 runs:
   using: composite
   steps:
@@ -77,6 +92,10 @@ runs:
         INCIDENT_AFTER_RULE_FILES: ${{ inputs.after-rule-files }}
         INCIDENT_RULE_FORMAT: ${{ inputs.rule-format }}
         INCIDENT_GATE: ${{ inputs.gate }}
+        INCIDENT_TIMELINE_ALERTNAME: ${{ inputs.timeline-alertname }}
+        INCIDENT_TIMELINE_END: ${{ inputs.timeline-end }}
+        INCIDENT_TIMELINE_MAX_DELAY: ${{ inputs.timeline-max-delay }}
+        INCIDENT_TIMELINE_FIXTURE: ${{ inputs.timeline-fixture }}
         INCIDENT_REPO_PATH: ${{ inputs.repo-path }}
         INCIDENT_BEFORE_REF: ${{ inputs.before-ref }}
         INCIDENT_AFTER_REF: ${{ inputs.after-ref }}

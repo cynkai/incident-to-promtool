@@ -211,23 +211,37 @@ jobs:
               --summary-format json > payment.capture.json
           )
           python3 - "$repo" <<'PY'
+          from copy import deepcopy
+          import hashlib
           import json
           from pathlib import Path
           import sys
 
           repo = Path(sys.argv[1])
           fixture = json.loads((repo / "payment.test.yml").read_text(encoding="utf-8"))
+          summary = json.loads((repo / "payment.capture.json").read_text(encoding="utf-8"))
+
+          def save_fixture(name, fixture):
+              fixture_path = f"{name}.test.yml"
+              document = (json.dumps(fixture, indent=2) + "\n").encode("utf-8")
+              (repo / fixture_path).write_bytes(document)
+              capture = {**summary, "fixture_path": fixture_path, "fixture_sha256": hashlib.sha256(document).hexdigest()}
+              (repo / f"{name}.capture.json").write_text(json.dumps(capture), encoding="utf-8")
+
+          timing = deepcopy(fixture)
+          timing["tests"][0]["alert_rule_test"][-1]["eval_time"] = "10m"
+          save_fixture("timing", timing)
           group = fixture["tests"][0]
           group["input_series"][0]["values"] = "0+0x20"
           for checkpoint in group["alert_rule_test"]:
               checkpoint["exp_alerts"] = []
-          (repo / "quiet.test.yml").write_text(json.dumps(fixture), encoding="utf-8")
+          save_fixture("quiet", fixture)
           PY
           cp demo/kubernetes/before.yml "$repo/$rule"
           cp demo/kubernetes/before.yml "$repo/$scoped_baseline"
           cp demo/kubernetes/after.yml "$repo/$bundle_baseline"
           git -C "$repo" add -- "$rule" "$scoped_baseline" "$bundle" "$second_bundle" "$bundle_baseline" \
-            payment.test.yml payment.capture.json quiet.test.yml
+            payment.test.yml payment.capture.json quiet.test.yml quiet.capture.json timing.test.yml timing.capture.json
           git -C "$repo" commit --quiet -m 'Add original payment alert'
           cp demo/kubernetes/after.yml "$repo/$rule"
           cp demo/kubernetes/after.yml "$repo/$candidate"
@@ -253,7 +267,8 @@ jobs:
           git -C "$repo" rm --quiet -- "$second_bundle" "$scoped_baseline" "$bundle_baseline"
           git -C "$repo" commit --quiet -m 'Fix late payment alert'
           printf 'invalid fixture\n' > "$repo/payment.test.yml"
-          rm -- "$repo/payment.capture.json" "$repo/quiet.test.yml" \
+          printf 'invalid fixture\n' > "$repo/timing.test.yml"
+          rm -- "$repo/payment.capture.json" "$repo/quiet.test.yml" "$repo/quiet.capture.json" "$repo/timing.capture.json" \
             "$repo/$candidate" "$repo/$renamed_rule" "$repo/$recording_rule" \
             "$repo/$bundle" "$repo/$bundle_regression"
       - name: Compare the fixed rule
@@ -267,14 +282,19 @@ jobs:
           rule-files: |
             rules/payment alert.yml
           rule-format: kubernetes
+          timeline-alertname: PaymentErrorsHigh
+          timeline-end: 10m
+          timeline-max-delay: 0s
       - name: Check the successful report
         env:
           REPORT_PATH: ${{ steps.fixed.outputs.report-path }}
+          TIMELINE_PASSED: ${{ steps.fixed.outputs.timeline-passed }}
         run: |
           test -f "$REPORT_PATH"
           report=$(cat "$REPORT_PATH")
           [[ "$report" == *'| Before | Failed | 1/2 |'* ]]
           [[ "$report" == *'| After | Passed | 2/2 |'* ]]
+          [[ "$TIMELINE_PASSED" == true ]]
       - name: Compare two incidents with refs reversed
         id: regression
         continue-on-error: true
@@ -328,7 +348,7 @@ jobs:
           def committed_bytes(path):
               return subprocess.check_output(["git", "show", f"{fixture_commit}:{path}"], cwd=repo)
 
-          for comparison, gate, tests, newly_failed in (("FIXED", "strict", 2, 0), ("REGRESSION", "regressions", 4, 1)):
+          for comparison, gate, tests, newly_failed in (("FIXED", "strict", 3, 0), ("REGRESSION", "regressions", 4, 1)):
               assert os.environ[f"{comparison}_COUNT"] == str(newly_failed)
               path = Path(os.environ[f"{comparison}_JSON"])
               report = json.loads(path.read_text(encoding="utf-8"))
@@ -344,6 +364,11 @@ jobs:
               assert junit.attrib["errors"] == junit.attrib["skipped"] == "0"
               suites = junit.findall("testsuite")
               fixtures = report["fixtures"]
+              if comparison == "FIXED":
+                  assert report["timeline"]["gate"]["passed"] is True
+                  timing_suite = junit.find("testsuite[@name='Alert firing delay']")
+                  assert timing_suite is not None and len(timing_suite.findall("testcase")) == 1
+                  suites.remove(timing_suite)
               assert [suite.attrib["name"] for suite in suites] == [fixture["path"] for fixture in fixtures]
               for suite, fixture in zip(suites, fixtures):
                   assert int(suite.attrib["tests"]) == len(suite.findall("testcase")) == fixture["after"]["total"]
@@ -356,6 +381,77 @@ jobs:
                   summary = json.loads(committed_bytes("payment.capture.json"))
                   fixture_sha256 = hashlib.sha256(committed_bytes("payment.test.yml")).hexdigest()
                   assert fixture["sha256"] == summary["fixture_sha256"] == fixture_sha256
+          PY
+      - name: Compare alert timing with refs reversed
+        id: timing-regression
+        continue-on-error: true
+        uses: ./
+        with:
+          repo-path: ${{ runner.temp }}/composite-repo
+          fixtures: |
+            quiet.test.yml
+            timing.test.yml
+          fixture-ref: HEAD^1
+          capture-summaries: |
+            quiet.capture.json
+            timing.capture.json
+          before-rule-files: |
+            rules/payment candidate.yml
+          after-rule-files: |
+            rules/legacy payment alert.yml
+          rule-format: kubernetes
+          gate: regressions
+          before-ref: HEAD
+          after-ref: HEAD^1
+          timeline-alertname: PaymentErrorsHigh
+          timeline-end: 10m
+          timeline-max-delay: 1m
+          timeline-fixture: timing.test.yml
+      - name: Check the alert timing regression reports
+        env:
+          OUTCOME: ${{ steps.timing-regression.outcome }}
+          REPORT_PATH: ${{ steps.timing-regression.outputs.report-path }}
+          JSON_REPORT_PATH: ${{ steps.timing-regression.outputs.json-report-path }}
+          JUNIT_REPORT_PATH: ${{ steps.timing-regression.outputs.junit-report-path }}
+          NEWLY_FAILED: ${{ steps.timing-regression.outputs.newly-failed }}
+          TIMELINE_PASSED: ${{ steps.timing-regression.outputs.timeline-passed }}
+        run: |
+          [[ "$OUTCOME" == failure ]]
+          [[ "$NEWLY_FAILED" == '0' && "$TIMELINE_PASSED" == false ]]
+          report=$(cat "$REPORT_PATH")
+          [[ "$report" == *'Gate `regressions`: **Passed**'* ]]
+          [[ "$report" == *'| Before | Passed | 4/4 |'* ]]
+          [[ "$report" == *'| After | Passed | 4/4 |'* ]]
+          [[ "$report" == *'Timing gate `max-delay 60s` **Failed**'* ]]
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          from xml.etree import ElementTree
+
+          report = json.loads(Path(os.environ["JSON_REPORT_PATH"]).read_text(encoding="utf-8"))
+          assert report["gate"] == {"mode": "regressions", "passed": True}
+          assert report["summary"]["before"] == report["summary"]["after"] == {"matched": 4, "total": 4}
+          assert report["summary"]["newly_failed"] == 0
+          repo = Path(os.environ["RUNNER_TEMP"], "composite-repo")
+          pinned = subprocess.check_output(["git", "rev-parse", "HEAD^1"], cwd=repo, text=True).strip()
+          assert report["fixture_commit"] == pinned
+          _, fixture = report["fixtures"]
+          assert fixture["path"] == "timing.test.yml" and fixture["capture_summary"] == "timing.capture.json"
+          assert report["timeline"]["fixture_path"] == "timing.test.yml"
+          gate = report["timeline"]["gate"]
+          assert gate["max_delay_ms"] == 60_000 and gate["passed"] is False
+          group, = gate["groups"]
+          assert group["status"] == "delayed" and group["first_firing_delta_ms"] == 240_000
+          assert group["before_first_firing_offset_ms"] == 330_000
+          assert group["after_first_firing_offset_ms"] == 570_000
+
+          junit = ElementTree.parse(os.environ["JUNIT_REPORT_PATH"]).getroot()
+          assert junit.attrib["tests"] == "5" and junit.attrib["failures"] == "1"
+          assert len(junit.findall("testsuite/testcase/failure")) == 1
+          failure = junit.find("testsuite[@name='Alert firing delay']/testcase/failure")
+          assert failure is not None and failure.attrib["type"] == "max-delay"
           PY
       - name: Compare a renamed alert and added recording rule
         id: split-paths

@@ -1182,8 +1182,10 @@ def print_markdown_report(report):
 
 def build_junit_report(fixtures, report):
     zero_counts = {"errors": "0", "skipped": "0"}
+    timeline = report.get("timeline")
+    test_count = report["summary"]["after"]["total"] + int(timeline is not None)
     root = ElementTree.Element("testsuites", {
-        "name": "incident-to-promtool", "tests": str(report["summary"]["after"]["total"]), **zero_counts,
+        "name": "incident-to-promtool", "tests": str(test_count), **zero_counts,
     })
     strict = report["gate"]["mode"] == "strict"
     failures = 0
@@ -1217,6 +1219,21 @@ def build_junit_report(fixtures, report):
                     ElementTree.SubElement(case, "system-out").text = XML_INVALID.sub("\ufffd", f"{message}\n\n{details}")
         suite.set("failures", str(suite_failures))
         failures += suite_failures
+    if timeline is not None:
+        timing_gate = timeline["gate"]
+        timing_failed = int(not timing_gate["passed"])
+        suite = ElementTree.SubElement(root, "testsuite", {
+            "name": "Alert firing delay", "tests": "1", "failures": str(timing_failed), **zero_counts,
+        })
+        title = f"{timeline['alertname']} (max delay {as_duration(timing_gate['max_delay_ms'])})"
+        case = ElementTree.SubElement(suite, "testcase", {
+            "classname": XML_INVALID.sub("\ufffd", timeline["fixture_path"]),
+            "name": XML_INVALID.sub("\ufffd", title),
+        })
+        if timing_failed:
+            failure = ElementTree.SubElement(case, "failure", {"message": "Alert firing delay gate failed", "type": "max-delay"})
+            failure.text = json.dumps(timing_gate, indent=2)
+        failures += timing_failed
     root.set("failures", str(failures))
     ElementTree.indent(root)
     return ElementTree.tostring(root, encoding="utf-8", xml_declaration=True) + b"\n"
@@ -1248,25 +1265,37 @@ def write_comparison_reports(reports):
 
 def compare(
     fixtures, baseline_rule_sets, after, executable, revisions, gate, json_report, fixture_commit,
-    *, bundles=(), junit_report=None, rule_paths=None,
+    *, bundles=(), junit_report=None, rule_paths=None, show_rule_paths=True, timeline=None,
 ):
     if (json_report is not None and junit_report is not None
             and os.path.realpath(json_report) == os.path.realpath(junit_report)):
         raise ValueError("JSON and JUnit reports require distinct output paths")
     promtool = require_promtool(executable)
 
+    replay_fixtures = fixtures
+    if timeline is not None:
+        # Stage timing probes beside the checkpoint fixtures using the same rule bytes.
+        baseline = baseline_rule_sets[fixtures.index(timeline.fixture)]
+        replay_fixtures = [*fixtures, timeline.probes]
+        baseline_rule_sets = [*baseline_rule_sets, baseline]
     with TemporaryDirectory() as temporary:
         path = Path(temporary)
-        before_failures = test_rule_version(promtool, fixtures, baseline_rule_sets, path / "before")
-        after_failures = test_rule_version(promtool, fixtures, [after] * len(fixtures), path / "after")
+        before_failures = test_rule_version(promtool, replay_fixtures, baseline_rule_sets, path / "before")
+        after_failures = test_rule_version(promtool, replay_fixtures, [after] * len(replay_fixtures), path / "after")
 
+    timing_report = None
+    if timeline is not None:
+        timing_report = build_timeline_report(timeline, before_failures.pop(), after_failures.pop())
+        add_timeline_provenance(timing_report, timeline.fixture, revisions, rule_paths, fixture_commit)
     report = build_comparison_report(fixtures, before_failures, after_failures, revisions, gate, fixture_commit)
     if len(bundles) == 1:
         report["bundle"] = bundles[0]
     elif bundles:
         report["bundles"] = list(bundles)
-    if rule_paths is not None:
+    if show_rule_paths and rule_paths is not None:
         report["rule_files"] = rule_paths
+    if timing_report is not None:
+        report["timeline"] = timing_report
     reports = []
     if json_report is not None:
         reports.append(("JSON", json_report, json_document(report)))
@@ -1275,7 +1304,10 @@ def compare(
     if reports:
         write_comparison_reports(reports)
     print_markdown_report(report)
-    return int(not report["gate"]["passed"])
+    if timing_report is not None:
+        print()
+        print_timeline_report(timing_report)
+    return int(not report["gate"]["passed"] or (timing_report is not None and not timing_report["gate"]["passed"]))
 
 
 def add_comparison_report_options(parser):
@@ -1437,21 +1469,28 @@ def timeline_delay_result(group, baseline, candidate, max_delay):
     }
 
 
-def build_timeline_report(args, sources):
-    fixture, = load_replay_fixtures([args.fixture], args.capture_summary, sources.repo, sources.fixture_commit)
-    start, end = duration_ms(args.start), duration_ms(args.end)
-    max_delay = duration_ms(args.max_delay) if args.max_delay is not None else None
-    probes, group_numbers, evaluation = timeline_probes(
-        fixture, args.alertname, start, end, probe_from_zero=max_delay is not None,
-    )
-    before_rules = comparison_rule_bytes(sources.before, args.rule_format)
-    after_rules = comparison_rule_bytes(sources.after, args.rule_format)
-    promtool = require_promtool(args.promtool)
-    with TemporaryDirectory() as temporary:
-        path = Path(temporary)
-        before, = test_rule_version(promtool, [probes], [before_rules], path / "before")
-        after, = test_rule_version(promtool, [probes], [after_rules], path / "after")
+@dataclass(frozen=True)
+class TimelineReplay:
+    fixture: ReplayFixture
+    probes: ReplayFixture
+    group_numbers: list[int]
+    evaluation: int
+    alertname: str
+    start: int
+    end: int
+    max_delay: int | None
 
+
+def prepare_timeline(fixture, alertname, start, end, max_delay):
+    probes, group_numbers, evaluation = timeline_probes(
+        fixture, alertname, start, end, probe_from_zero=max_delay is not None,
+    )
+    return TimelineReplay(fixture, probes, group_numbers, evaluation, alertname, start, end, max_delay)
+
+
+def build_timeline_report(timeline, before, after):
+    group_numbers = timeline.group_numbers
+    start, evaluation, max_delay = timeline.start, timeline.evaluation, timeline.max_delay
     groups = []
     gate_groups = []
     for number, before_offsets, after_offsets in zip(
@@ -1467,11 +1506,11 @@ def build_timeline_report(args, sources):
             gate_groups.append(timeline_delay_result(number, before_offsets, after_offsets, max_delay))
     report = {
         "schema_version": 1,
-        "fixture_path": str(fixture.path),
-        "alertname": args.alertname,
+        "fixture_path": str(timeline.fixture.path),
+        "alertname": timeline.alertname,
         "evaluation_interval_ms": evaluation,
         "start_offset_ms": start,
-        "end_offset_ms": end,
+        "end_offset_ms": timeline.end,
         "groups": groups,
     }
     if max_delay is not None:
@@ -1483,17 +1522,20 @@ def build_timeline_report(args, sources):
             "checked_groups": checked,
             "groups": gate_groups,
         }
-    if sources.revisions is not None:
-        before_commit, after_commit = sources.revisions
+    return report
+
+
+def add_timeline_provenance(report, fixture, revisions, rule_paths, fixture_commit):
+    if revisions is not None:
+        before_commit, after_commit = revisions
         report["commits"] = {"before": before_commit, "after": after_commit}
-        report["rule_files"] = sources.rule_paths
-    if sources.fixture_commit is not None:
-        report["fixture_commit"] = sources.fixture_commit
+        report["rule_files"] = rule_paths
+    if fixture_commit is not None:
+        report["fixture_commit"] = fixture_commit
     if fixture.sha256 is not None:
         report["fixture_sha256"] = fixture.sha256
     if fixture.capture_summary is not None:
         report["capture_summary"] = str(fixture.capture_summary)
-    return report
 
 
 def format_observed_offset(offset):
@@ -1593,7 +1635,19 @@ def timeline_main(argv):
         parser.error("provide only one --capture-summary for the timeline fixture")
     try:
         sources = load_comparison_rules(parser, args)
-        report = build_timeline_report(args, sources)
+        fixture, = load_replay_fixtures([args.fixture], args.capture_summary, sources.repo, sources.fixture_commit)
+        start, end = duration_ms(args.start), duration_ms(args.end)
+        max_delay = duration_ms(args.max_delay) if args.max_delay is not None else None
+        timeline = prepare_timeline(fixture, args.alertname, start, end, max_delay)
+        before_rules = comparison_rule_bytes(sources.before, args.rule_format)
+        after_rules = comparison_rule_bytes(sources.after, args.rule_format)
+        promtool = require_promtool(args.promtool)
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary)
+            before, = test_rule_version(promtool, [timeline.probes], [before_rules], path / "before")
+            after, = test_rule_version(promtool, [timeline.probes], [after_rules], path / "after")
+        report = build_timeline_report(timeline, before, after)
+        add_timeline_provenance(report, fixture, sources.revisions, sources.rule_paths, sources.fixture_commit)
     except (OSError, ValueError, TypeError) as exc:
         parser.exit(2, f"error: {exc}\n")
     if args.format == "json":
@@ -1615,22 +1669,51 @@ def compare_main(argv):
         "--capture-summary", type=Path, action="append",
         help="verify the fixture hash against this capture summary (one per fixture, in the same order)",
     )
+    parser.add_argument("--timeline-alertname", help="alert to check for first-firing delay")
+    parser.add_argument("--timeline-end", metavar="DURATION", help="last offset to observe for the first-firing check")
+    parser.add_argument("--timeline-max-delay", metavar="DURATION", help="maximum allowed first-firing delay")
+    parser.add_argument("--timeline-fixture", type=Path, help="one of the listed fixtures (required for timing with multiple fixtures)")
     add_comparison_report_options(parser)
     args = parser.parse_args(argv)
     if args.capture_summary is not None and len(args.capture_summary) != len(args.fixtures):
         parser.error("provide one --capture-summary per incident fixture, in the same order")
+    timing_index = comparison_timeline_index(parser, args)
     try:
         sources = load_comparison_rules(parser, args)
         fixtures = load_replay_fixtures(args.fixtures, args.capture_summary, sources.repo, sources.fixture_commit)
+        timeline = None
+        if timing_index is not None:
+            timeline = prepare_timeline(
+                fixtures[timing_index], args.timeline_alertname, 0,
+                duration_ms(args.timeline_end), duration_ms(args.timeline_max_delay),
+            )
         before_rules = comparison_rule_bytes(sources.before, args.rule_format)
         after_rules = comparison_rule_bytes(sources.after, args.rule_format)
         return compare(
             fixtures, [before_rules] * len(fixtures), after_rules, args.promtool, revisions=sources.revisions,
             gate=args.gate, json_report=args.json_report, fixture_commit=sources.fixture_commit,
-            junit_report=args.junit_report, rule_paths=sources.rule_paths if args.before_rule_file else None,
+            junit_report=args.junit_report, rule_paths=sources.rule_paths,
+            show_rule_paths=args.before_rule_file is not None, timeline=timeline,
         )
     except (OSError, ValueError, TypeError) as exc:
         parser.exit(2, f"error: {exc}\n")
+
+
+def comparison_timeline_index(parser, args):
+    options = (args.timeline_alertname, args.timeline_end, args.timeline_max_delay)
+    if all(option is None for option in options) and args.timeline_fixture is None:
+        return None
+    if not all(option is not None for option in options):
+        parser.error("--timeline-alertname, --timeline-end, and --timeline-max-delay are required together")
+    if not args.timeline_alertname.strip():
+        parser.error("--timeline-alertname must not be empty")
+    if args.timeline_fixture is None:
+        if len(args.fixtures) != 1:
+            parser.error("--timeline-fixture is required when comparing multiple fixtures")
+        return 0
+    if args.timeline_fixture not in args.fixtures:
+        parser.error("--timeline-fixture must match one of the supplied incident fixtures")
+    return args.fixtures.index(args.timeline_fixture)
 
 
 def compare_bundle_main(argv):

@@ -40,6 +40,24 @@ if [[ "$source_count" -ne 1 ]]; then
     exit 2
 fi
 
+timeline_alertname=${INCIDENT_TIMELINE_ALERTNAME:-}
+timeline_end=${INCIDENT_TIMELINE_END:-}
+timeline_max_delay=${INCIDENT_TIMELINE_MAX_DELAY:-}
+timeline_fixture=${INCIDENT_TIMELINE_FIXTURE:-}
+timeline_enabled=0
+if [[ -n "$timeline_alertname" || -n "$timeline_end" || -n "$timeline_max_delay" || -n "$timeline_fixture" ]]; then
+    if [[ -n "$bundle" || -n "${bundle_paths[0]:-}" ]]; then
+        printf 'Timeline inputs require fixture or fixtures.\n' >&2
+        exit 2
+    fi
+    if [[ ! "$timeline_alertname" =~ [^[:space:]] || ! "$timeline_end" =~ [^[:space:]] ||
+          ! "$timeline_max_delay" =~ [^[:space:]] ]]; then
+        printf 'Provide timeline-alertname, timeline-end, and timeline-max-delay together.\n' >&2
+        exit 2
+    fi
+    timeline_enabled=1
+fi
+
 if [[ -n "$bundle" || -n "${bundle_paths[0]:-}" ]]; then
     if [[ -n "$fixture_ref" || -n "$capture_summaries" ]]; then
         printf 'fixture-ref and capture-summaries require fixture or fixtures.\n' >&2
@@ -83,6 +101,14 @@ else
             fi
             comparison_arguments+=(--capture-summary="$summary_path")
         done
+    fi
+fi
+
+if [[ "$timeline_enabled" -eq 1 ]]; then
+    comparison_arguments+=(--timeline-alertname="$timeline_alertname" --timeline-end="$timeline_end"
+        --timeline-max-delay="$timeline_max_delay")
+    if [[ -n "$timeline_fixture" ]]; then
+        comparison_arguments+=(--timeline-fixture="$timeline_fixture")
     fi
 fi
 
@@ -163,23 +189,33 @@ printf '::stop-commands::%s\n' "$command_token"
 printf '::%s::\n' "$command_token"
 
 if [[ "$status" -le 1 ]]; then
-    if [[ -s "$report" && -s "$json_report" && -s "$junit_report" ]] && newly_failed=$("$python" - "$json_report" <<'PY'
+    if [[ -s "$report" && -s "$json_report" && -s "$junit_report" ]] &&
+        report_values=$("$python" - "$json_report" "$timeline_enabled" <<'PY'
 import json
 import sys
 
 try:
-    with open(sys.argv[1], encoding="utf-8") as report:
-        count = json.load(report)["summary"]["newly_failed"]
+    with open(sys.argv[1], encoding="utf-8") as source:
+        report = json.load(source)
+    count = report["summary"]["newly_failed"]
+    timeline_enabled = sys.argv[2] == "1"
+    timeline_passed = report["timeline"]["gate"]["passed"] if timeline_enabled else None
 except (OSError, ValueError, KeyError, TypeError):
     sys.exit(1)
-if type(count) is not int or count < 0:
+if type(count) is not int or count < 0 or (timeline_enabled and type(timeline_passed) is not bool):
     sys.exit(1)
-print(count)
+print(count, str(timeline_passed).lower() if timeline_enabled else "")
 PY
     ); then
+        read -r newly_failed timeline_passed <<< "$report_values"
         cat -- "$report" >> "$GITHUB_STEP_SUMMARY"
-        printf 'report-path=%s\njson-report-path=%s\njunit-report-path=%s\nnewly-failed=%s\n' \
-            "$report" "$json_report" "$junit_report" "$newly_failed" >> "$GITHUB_OUTPUT"
+        {
+            printf 'report-path=%s\njson-report-path=%s\njunit-report-path=%s\nnewly-failed=%s\n' \
+                "$report" "$json_report" "$junit_report" "$newly_failed"
+            if [[ -n "$timeline_passed" ]]; then
+                printf 'timeline-passed=%s\n' "$timeline_passed"
+            fi
+        } >> "$GITHUB_OUTPUT"
         exit "$status"
     fi
     printf 'Could not read complete Markdown, JSON, and JUnit XML comparison reports.\n' >&2
