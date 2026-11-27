@@ -210,7 +210,7 @@ jobs:
             "schema_version": 1,
             "checks": [
               {"source": "incidents/payment baseline.zip", "alertname": "PaymentErrorsHigh",
-               "end": "10m", "max_delay": "0s"},
+               "end": "10m", "max_delay": "0s", "fire_by": "5m30s"},
               {"source": "incidents/alternative baseline.zip", "alertname": "PaymentErrorsHigh",
                "end": "10m", "max_delay": "0s"}
             ]
@@ -418,7 +418,7 @@ jobs:
           after-ref: HEAD^1
           timeline-alertname: PaymentErrorsHigh
           timeline-end: 10m
-          timeline-max-delay: 1m
+          timeline-fire-by: 7m
           timeline-fixture: timing.test.yml
       - name: Check the alert timing regression reports
         env:
@@ -435,7 +435,7 @@ jobs:
           [[ "$report" == *'Gate `regressions`: **Passed**'* ]]
           [[ "$report" == *'| Before | Passed | 4/4 |'* ]]
           [[ "$report" == *'| After | Passed | 4/4 |'* ]]
-          [[ "$report" == *'Timing gate `max-delay 60s` **Failed**'* ]]
+          [[ "$report" == *'Timing gate `fire-by 420s` **Failed**. Measured from 0s through 600s.'* ]]
           python3 - <<'PY'
           import json
           import os
@@ -452,19 +452,22 @@ jobs:
           assert report["fixture_commit"] == pinned
           _, fixture = report["fixtures"]
           assert fixture["path"] == "timing.test.yml" and fixture["capture_summary"] == "timing.capture.json"
-          assert report["timeline"]["fixture_path"] == "timing.test.yml"
-          gate = report["timeline"]["gate"]
-          assert gate["max_delay_ms"] == 60_000 and gate["passed"] is False
-          group, = gate["groups"]
-          assert group["status"] == "delayed" and group["first_firing_delta_ms"] == 240_000
-          assert group["before_first_firing_offset_ms"] == 330_000
-          assert group["after_first_firing_offset_ms"] == 570_000
+          timeline = report["timeline"]
+          assert timeline["fixture_path"] == "timing.test.yml" and timeline["passed"] is False
+          assert "gate" not in timeline
+          group, = timeline["groups"]
+          assert group["before"]["first_firing_offset_ms"] == 330_000
+          assert group["after"]["first_firing_offset_ms"] == 570_000
+          assert timeline["deadline_gate"] == {
+              "mode": "fire-by", "fire_by_ms": 420_000, "passed": False, "checked_groups": 1,
+              "groups": [{"group": 1, "status": "late", "after_first_firing_offset_ms": 570_000}],
+          }
 
           junit = ElementTree.parse(os.environ["JUNIT_REPORT_PATH"]).getroot()
           assert junit.attrib["tests"] == "5" and junit.attrib["failures"] == "1"
           assert len(junit.findall("testsuite/testcase/failure")) == 1
           failure = junit.find("testsuite[@name='Alert firing delay']/testcase/failure")
-          assert failure is not None and failure.attrib["type"] == "max-delay"
+          assert failure is not None and failure.attrib["type"] == "fire-by"
           PY
       - name: Compare a renamed alert and added recording rule
         id: split-paths
@@ -633,6 +636,7 @@ jobs:
           [[ "$NEWLY_FAILED" == '0' ]]
           [[ "$report" == *'**Passed** (2/2 checks)'* ]]
           [[ "$report" == *'Timing gate `max-delay 0s` **Passed**'* && "$TIMELINE_PASSED" == true ]]
+          [[ "$report" == *'Timing gate `fire-by 330s` **Passed**'* ]]
           python3 - <<'PY'
           import hashlib
           import json
@@ -670,6 +674,12 @@ jobs:
               assert group["status"] == "passed" and group["first_firing_delta_ms"] == 330_000 - before
               assert group["before_first_firing_offset_ms"] == before
               assert group["after_first_firing_offset_ms"] == 330_000
+
+          assert policy["checks"][0]["passed"] is True
+          assert policy["checks"][0]["deadline_gate"] == {
+              "mode": "fire-by", "fire_by_ms": 330_000, "passed": True, "checked_groups": 1,
+              "groups": [{"group": 1, "status": "passed", "after_first_firing_offset_ms": 330_000}],
+          }
 
           junit = ElementTree.parse(os.environ["JUNIT_REPORT_PATH"]).getroot()
           assert junit.attrib["tests"] == "6" and junit.attrib["failures"] == "0"

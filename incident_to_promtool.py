@@ -1222,24 +1222,40 @@ def build_junit_report(fixtures, report):
         suite.set("failures", str(suite_failures))
         failures += suite_failures
     if timelines:
-        timing_failures = sum(not timeline["gate"]["passed"] for timeline in timelines)
+        timing_failures = sum(not timeline_passed(timeline) for timeline in timelines)
         suite = ElementTree.SubElement(root, "testsuite", {
             "name": "Alert firing delay", "tests": str(len(timelines)), "failures": str(timing_failures), **zero_counts,
         })
         for timeline in timelines:
-            timing_gate = timeline["gate"]
-            title = f"{timeline['alertname']} (max delay {as_duration(timing_gate['max_delay_ms'])})"
-            case = ElementTree.SubElement(suite, "testcase", {
-                "classname": XML_INVALID.sub("\ufffd", timeline["fixture_path"]),
-                "name": XML_INVALID.sub("\ufffd", title),
-            })
-            if not timing_gate["passed"]:
-                failure = ElementTree.SubElement(case, "failure", {"message": "Alert firing delay gate failed", "type": "max-delay"})
-                failure.text = json.dumps(timing_gate, indent=2)
+            add_timeline_junit_case(suite, timeline)
         failures += timing_failures
     root.set("failures", str(failures))
     ElementTree.indent(root)
     return ElementTree.tostring(root, encoding="utf-8", xml_declaration=True) + b"\n"
+
+
+def add_timeline_junit_case(suite, timeline):
+    limits = []
+    if delay := timeline.get("gate"):
+        limits.append(f"max delay {as_duration(delay['max_delay_ms'])}")
+    if deadline := timeline.get("deadline_gate"):
+        limits.append(f"fire by {as_duration(deadline['fire_by_ms'])}")
+    title = f"{timeline['alertname']} ({', '.join(limits)})"
+    case = ElementTree.SubElement(suite, "testcase", {
+        "classname": XML_INVALID.sub("\ufffd", timeline["fixture_path"]),
+        "name": XML_INVALID.sub("\ufffd", title),
+    })
+    if timeline_passed(timeline):
+        return
+    if delay and deadline:
+        message, kind = "Alert timing gate failed", "timing"
+        details = {"gate": delay, "deadline_gate": deadline, "passed": False}
+    elif deadline:
+        message, kind, details = "Alert firing deadline gate failed", "fire-by", deadline
+    else:
+        message, kind, details = "Alert firing delay gate failed", "max-delay", delay
+    failure = ElementTree.SubElement(case, "failure", {"message": message, "type": kind})
+    failure.text = json.dumps(details, indent=2)
 
 
 def write_comparison_reports(reports):
@@ -1296,7 +1312,7 @@ def compare(
             bundle=bundles[index] if bundles else None,
         )
         timing_reports.append(timing_report)
-    timing_passed = all(timing_report["gate"]["passed"] for timing_report in timing_reports)
+    timing_passed = all(timeline_passed(timing_report) for timing_report in timing_reports)
     report = build_comparison_report(
         fixtures, before_failures[:fixture_count], after_failures[:fixture_count], revisions, gate, fixture_commit,
     )
@@ -1489,6 +1505,17 @@ def timeline_delay_result(group, baseline, candidate, max_delay):
     }
 
 
+def timeline_deadline_result(group, candidate, fire_by):
+    first_after = candidate[0] if candidate else None
+    if first_after is None:
+        status = "missing_after"
+    elif first_after > fire_by:
+        status = "late"
+    else:
+        status = "passed"
+    return {"group": group, "status": status, "after_first_firing_offset_ms": first_after}
+
+
 @dataclass(frozen=True)
 class TimelineReplay:
     fixture: ReplayFixture
@@ -1500,13 +1527,33 @@ class TimelineReplay:
     start: int
     end: int
     max_delay: int | None
+    fire_by: int | None
+    deadline_groups: set[int]
 
 
-def prepare_timeline(fixture, alertname, start, end, max_delay, *, tick_budget=None):
+def prepare_timeline(fixture, alertname, start, end, max_delay, *, fire_by=None, tick_budget=None):
+    deadline_groups = set()
+    if fire_by is not None:
+        if fire_by > end:
+            raise ValueError("the fire-by deadline must be at or before the timeline end")
+        deadline_groups = {
+            number for number, group in enumerate(fixture.data["tests"], start=1)
+            if any(
+                checkpoint["alertname"] == alertname
+                and isinstance(checkpoint.get("exp_alerts"), list) and checkpoint["exp_alerts"]
+                for checkpoint in group["alert_rule_test"]
+            )
+        }
+        if not deadline_groups:
+            raise ValueError(f"{fixture.path}: fire-by requires at least one positive checkpoint for alert {alertname!r}")
     probes, group_numbers, evaluation, evaluation_ticks = timeline_probes(
-        fixture, alertname, start, end, probe_from_zero=max_delay is not None, tick_budget=tick_budget,
+        fixture, alertname, start, end, probe_from_zero=max_delay is not None or fire_by is not None,
+        tick_budget=tick_budget,
     )
-    return TimelineReplay(fixture, probes, group_numbers, evaluation, evaluation_ticks, alertname, start, end, max_delay)
+    return TimelineReplay(
+        fixture, probes, group_numbers, evaluation, evaluation_ticks, alertname, start, end, max_delay,
+        fire_by, deadline_groups,
+    )
 
 
 def build_timeline_report(timeline, before, after):
@@ -1514,6 +1561,7 @@ def build_timeline_report(timeline, before, after):
     start, evaluation, max_delay = timeline.start, timeline.evaluation, timeline.max_delay
     groups = []
     gate_groups = []
+    deadline_results = []
     for number, before_offsets, after_offsets in zip(
         group_numbers, firing_offsets(before, len(group_numbers)), firing_offsets(after, len(group_numbers)), strict=True,
     ):
@@ -1525,6 +1573,8 @@ def build_timeline_report(timeline, before, after):
         })
         if max_delay is not None:
             gate_groups.append(timeline_delay_result(number, before_offsets, after_offsets, max_delay))
+        if number in timeline.deadline_groups:
+            deadline_results.append(timeline_deadline_result(number, after_offsets, timeline.fire_by))
     report = {
         "schema_version": 1,
         "fixture_path": str(timeline.fixture.path),
@@ -1543,7 +1593,20 @@ def build_timeline_report(timeline, before, after):
             "checked_groups": checked,
             "groups": gate_groups,
         }
+    if timeline.fire_by is not None:
+        report["deadline_gate"] = {
+            "mode": "fire-by",
+            "fire_by_ms": timeline.fire_by,
+            "passed": all(group["status"] == "passed" for group in deadline_results),
+            "checked_groups": len(deadline_results),
+            "groups": deadline_results,
+        }
+        report["passed"] = timeline_passed(report)
     return report
+
+
+def timeline_passed(report):
+    return all(report[key]["passed"] for key in ("gate", "deadline_gate") if key in report)
 
 
 def add_timeline_provenance(report, fixture, revisions, rule_paths, fixture_commit, *, bundle=None):
@@ -1604,6 +1667,22 @@ def print_timeline_gate(gate, end):
         print("| " + " | ".join(cells) + " |")
 
 
+def print_deadline_gate(gate, end):
+    limit = as_duration(gate["fire_by_ms"])
+    verdict = "Passed" if gate["passed"] else "Failed"
+    print(f"\nTiming gate `fire-by {limit}` **{verdict}**. Measured from 0s through {end}.\n")
+    statuses = {
+        "passed": "Fired by deadline",
+        "late": "Fired after deadline",
+        "missing_after": "No candidate firing through end",
+    }
+    print("| Group | Candidate first firing | Gate result |")
+    print("| ---: | --- | --- |")
+    for group in gate["groups"]:
+        offset = format_observed_offset(group["after_first_firing_offset_ms"])
+        print(f"| {group['group']} | {offset} | {statuses[group['status']]} |")
+
+
 def print_timeline_report(report, *, heading="##"):
     print(f"{heading} Prometheus alert firing timeline\n")
     print(f"{markdown_code(report['alertname'])} in {markdown_code(report['fixture_path'])}.\n")
@@ -1645,11 +1724,13 @@ def print_timeline_report(report, *, heading="##"):
         print("| " + " | ".join(cells) + " |")
     if "gate" in report:
         print_timeline_gate(report["gate"], end)
+    if "deadline_gate" in report:
+        print_deadline_gate(report["deadline_gate"], end)
 
 
 def print_timeline_policy(policy):
     checks = policy["checks"]
-    passed = sum(check["gate"]["passed"] for check in checks)
+    passed = sum(timeline_passed(check) for check in checks)
     verdict = "Passed" if policy["passed"] else "Failed"
     print(f"\n## Alert firing delay policy\n\n**{verdict}** ({passed}/{len(checks)} checks) "
           f"for {markdown_code(policy['path'])}.\n")
@@ -1676,6 +1757,7 @@ def timeline_main(argv):
     parser.add_argument("--start", default="0s", metavar="DURATION", help="first offset to observe (default: 0s)")
     parser.add_argument("--end", required=True, metavar="DURATION", help="last offset to observe (inclusive)")
     parser.add_argument("--max-delay", metavar="DURATION", help="gate the first proposed firing against the baseline from 0s")
+    parser.add_argument("--fire-by", metavar="DURATION", help="latest allowed first proposed firing from the test group start")
     parser.add_argument("--promtool", default="promtool", help="promtool executable or path")
     parser.add_argument("--format", choices=("markdown", "json"), default="markdown", help="report format (default: markdown)")
     args = parser.parse_args(argv)
@@ -1688,7 +1770,8 @@ def timeline_main(argv):
         fixture, = load_replay_fixtures([args.fixture], args.capture_summary, sources.repo, sources.fixture_commit)
         start, end = duration_ms(args.start), duration_ms(args.end)
         max_delay = duration_ms(args.max_delay) if args.max_delay is not None else None
-        timeline = prepare_timeline(fixture, args.alertname, start, end, max_delay)
+        fire_by = duration_ms(args.fire_by) if args.fire_by is not None else None
+        timeline = prepare_timeline(fixture, args.alertname, start, end, max_delay, fire_by=fire_by)
         before_rules = comparison_rule_bytes(sources.before, args.rule_format)
         after_rules = comparison_rule_bytes(sources.after, args.rule_format)
         promtool = require_promtool(args.promtool)
@@ -1704,15 +1787,15 @@ def timeline_main(argv):
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
         print_timeline_report(report)
-    gate = report.get("gate")
-    return int(gate is not None and not gate["passed"])
+    return int(not timeline_passed(report))
 
 
 def add_comparison_timeline_options(parser, source, *, path_type):
-    parser.add_argument("--timeline-policy", type=Path, help="JSON file with one or more first-firing delay checks")
-    parser.add_argument("--timeline-alertname", help="alert to check for first-firing delay")
+    parser.add_argument("--timeline-policy", type=Path, help="JSON file with one or more first-firing timing checks")
+    parser.add_argument("--timeline-alertname", help="alert to check for first-firing timing")
     parser.add_argument("--timeline-end", metavar="DURATION", help="last offset to observe for the first-firing check")
     parser.add_argument("--timeline-max-delay", metavar="DURATION", help="maximum allowed first-firing delay")
+    parser.add_argument("--timeline-fire-by", metavar="DURATION", help="latest allowed first proposed firing from the test group start")
     parser.add_argument(
         f"--timeline-{source}", type=path_type,
         help=f"one of the listed {source}s (required for timing with multiple {source}s)",
@@ -1720,13 +1803,14 @@ def add_comparison_timeline_options(parser, source, *, path_type):
 
 
 def comparison_timeline_index(parser, args, paths, selection, source):
-    options = (args.timeline_alertname, args.timeline_end, args.timeline_max_delay)
+    limits = (args.timeline_max_delay, args.timeline_fire_by)
+    options = (args.timeline_alertname, args.timeline_end, *limits)
     if args.timeline_policy is not None and (any(option is not None for option in options) or selection is not None):
         parser.error("--timeline-policy cannot be combined with individual timeline options")
     if all(option is None for option in options) and selection is None:
         return None
-    if not all(option is not None for option in options):
-        parser.error("--timeline-alertname, --timeline-end, and --timeline-max-delay are required together")
+    if args.timeline_alertname is None or args.timeline_end is None or all(limit is None for limit in limits):
+        parser.error("--timeline-alertname and --timeline-end are required together with --timeline-max-delay or --timeline-fire-by")
     if not args.timeline_alertname.strip():
         parser.error("--timeline-alertname must not be empty")
     if selection is None:
@@ -1761,15 +1845,16 @@ def load_timeline_policy(path, repo, commit):
 def prepare_policy_timelines(path, fixtures, paths, repo, commit):
     checks, origin = load_timeline_policy(path, repo, commit)
     positions = {source: index for index, source in enumerate(paths)}
-    required = {"alertname", "end", "max_delay"}
-    allowed = required | {"source"}
+    required = {"alertname", "end"}
+    limits = {"max_delay", "fire_by"}
+    allowed = required | limits | {"source"}
     seen = set()
     timelines = []
     remaining_ticks = MAX_TIMELINE_TICKS
     for number, check in enumerate(checks, start=1):
         try:
-            if not isinstance(check, dict) or not required <= check.keys():
-                raise ValueError("requires alertname, end, and max_delay")
+            if not isinstance(check, dict) or not required <= check.keys() or not limits.intersection(check):
+                raise ValueError("requires alertname, end, and at least one of max_delay or fire_by")
             if check.keys() - allowed:
                 raise ValueError("contains unknown fields")
             alertname = check["alertname"]
@@ -1790,8 +1875,11 @@ def prepare_policy_timelines(path, fixtures, paths, repo, commit):
             identity = (index, alertname)
             if identity in seen:
                 raise ValueError(f"duplicate check for {alertname!r} in {paths[index]}")
-            end, max_delay = duration_ms(check["end"]), duration_ms(check["max_delay"])
-            timeline = prepare_timeline(fixtures[index], alertname, 0, end, max_delay, tick_budget=remaining_ticks)
+            end = duration_ms(check["end"])
+            max_delay = duration_ms(check["max_delay"]) if "max_delay" in check else None
+            fire_by = duration_ms(check["fire_by"]) if "fire_by" in check else None
+            timeline = prepare_timeline(fixtures[index], alertname, 0, end, max_delay,
+                                        fire_by=fire_by, tick_budget=remaining_ticks)
         except ValueError as exc:
             raise ValueError(f"{path}: check {number}: {exc}") from exc
         seen.add(identity)
@@ -1805,9 +1893,10 @@ def prepare_comparison_timelines(args, fixtures, index, paths, *, repo=None, com
         return prepare_policy_timelines(args.timeline_policy, fixtures, paths, repo, commit)
     if index is None:
         return (), None
+    max_delay = duration_ms(args.timeline_max_delay) if args.timeline_max_delay is not None else None
+    fire_by = duration_ms(args.timeline_fire_by) if args.timeline_fire_by is not None else None
     timeline = prepare_timeline(
-        fixtures[index], args.timeline_alertname, 0,
-        duration_ms(args.timeline_end), duration_ms(args.timeline_max_delay),
+        fixtures[index], args.timeline_alertname, 0, duration_ms(args.timeline_end), max_delay, fire_by=fire_by,
     )
     return ((index, timeline),), None
 

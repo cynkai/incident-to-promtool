@@ -35,13 +35,16 @@ inputs:
     description: Use strict to fail on any failing proposed checkpoint or regressions to fail only on newly failing checkpoints.
     default: strict
   timeline-alertname:
-    description: Alert name for the optional first-firing timing gate. Provide with timeline-end and timeline-max-delay.
+    description: Alert name for the optional first-firing timing gate. Provide with timeline-end and at least one of timeline-max-delay or timeline-fire-by.
     required: false
   timeline-end:
     description: Last inclusive evaluation offset for the timing gate, such as 10m.
     required: false
   timeline-max-delay:
     description: Maximum allowed delay of the proposed rule's first firing, such as 0s or 1m.
+    required: false
+  timeline-fire-by:
+    description: Latest allowed evaluation offset for the proposed rule's first firing, such as 5m.
     required: false
   timeline-fixture:
     description: Choose the timing gate fixture by its exact fixture path. Required for the timing gate when comparing multiple fixtures.
@@ -101,6 +104,7 @@ runs:
         INCIDENT_TIMELINE_ALERTNAME: ${{ inputs.timeline-alertname }}
         INCIDENT_TIMELINE_END: ${{ inputs.timeline-end }}
         INCIDENT_TIMELINE_MAX_DELAY: ${{ inputs.timeline-max-delay }}
+        INCIDENT_TIMELINE_FIRE_BY: ${{ inputs.timeline-fire-by }}
         INCIDENT_TIMELINE_FIXTURE: ${{ inputs.timeline-fixture }}
         INCIDENT_TIMELINE_BUNDLE: ${{ inputs.timeline-bundle }}
         INCIDENT_TIMELINE_POLICY: ${{ inputs.timeline-policy }}

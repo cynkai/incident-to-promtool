@@ -43,6 +43,7 @@ fi
 timeline_alertname=${INCIDENT_TIMELINE_ALERTNAME:-}
 timeline_end=${INCIDENT_TIMELINE_END:-}
 timeline_max_delay=${INCIDENT_TIMELINE_MAX_DELAY:-}
+timeline_fire_by=${INCIDENT_TIMELINE_FIRE_BY:-}
 timeline_fixture=${INCIDENT_TIMELINE_FIXTURE:-}
 timeline_bundle=${INCIDENT_TIMELINE_BUNDLE:-}
 timeline_policy=${INCIDENT_TIMELINE_POLICY:-}
@@ -55,7 +56,7 @@ timeline_mode=disabled
 if [[ -n "$timeline_policy" ]]; then
     timeline_mode=policy
 fi
-if [[ -n "$timeline_alertname" || -n "$timeline_end" || -n "$timeline_max_delay" ||
+if [[ -n "$timeline_alertname" || -n "$timeline_end" || -n "$timeline_max_delay" || -n "$timeline_fire_by" ||
       -n "$timeline_fixture" || -n "$timeline_bundle" ]]; then
     if [[ "$timeline_mode" == policy ]]; then
         printf 'Provide timeline-policy or individual timeline inputs.\n' >&2
@@ -70,8 +71,8 @@ if [[ -n "$timeline_alertname" || -n "$timeline_end" || -n "$timeline_max_delay"
         exit 2
     fi
     if [[ ! "$timeline_alertname" =~ [^[:space:]] || ! "$timeline_end" =~ [^[:space:]] ||
-          ! "$timeline_max_delay" =~ [^[:space:]] ]]; then
-        printf 'Provide timeline-alertname, timeline-end, and timeline-max-delay together.\n' >&2
+          ( ! "$timeline_max_delay" =~ [^[:space:]] && ! "$timeline_fire_by" =~ [^[:space:]] ) ]]; then
+        printf 'Provide timeline-alertname, timeline-end, and at least one of timeline-max-delay or timeline-fire-by.\n' >&2
         exit 2
     fi
     timeline_mode=single
@@ -126,8 +127,13 @@ fi
 if [[ "$timeline_mode" == policy ]]; then
     comparison_arguments+=(--timeline-policy="$timeline_policy")
 elif [[ "$timeline_mode" == single ]]; then
-    comparison_arguments+=(--timeline-alertname="$timeline_alertname" --timeline-end="$timeline_end"
-        --timeline-max-delay="$timeline_max_delay")
+    comparison_arguments+=(--timeline-alertname="$timeline_alertname" --timeline-end="$timeline_end")
+    if [[ -n "$timeline_max_delay" ]]; then
+        comparison_arguments+=(--timeline-max-delay="$timeline_max_delay")
+    fi
+    if [[ -n "$timeline_fire_by" ]]; then
+        comparison_arguments+=(--timeline-fire-by="$timeline_fire_by")
+    fi
     if [[ -n "$timeline_fixture" ]]; then
         comparison_arguments+=(--timeline-fixture="$timeline_fixture")
     elif [[ -n "$timeline_bundle" ]]; then
@@ -226,7 +232,8 @@ try:
     if timeline_mode == "policy":
         timeline_passed = report["timeline_policy"]["passed"]
     elif timeline_mode == "single":
-        timeline_passed = report["timeline"]["gate"]["passed"]
+        timeline = report["timeline"]
+        timeline_passed = timeline["passed"] if "passed" in timeline else timeline["gate"]["passed"]
 except (OSError, ValueError, KeyError, TypeError):
     sys.exit(1)
 if type(count) is not int or count < 0 or (timeline_mode != "disabled" and type(timeline_passed) is not bool):

@@ -14,7 +14,7 @@ bash scripts/demo.sh
 
 The demo replays synthetic payment metrics without a Prometheus server. It checks that the alert stays quiet before the outage and is firing five minutes after it starts. The original rule matches **1/2** checkpoints. The revised rule matches **2/2** and passes the check.
 
-Use `timeline` to compare an alert's first firing across Git revisions. The GitHub Action can enforce delay limits from a committed timing policy alongside checkpoint checks. [GitHub Action timing policy](#발화-지연-정책)
+Use `timeline` to compare an alert's first firing across Git revisions. The GitHub Action can enforce delay limits and firing deadlines from a committed timing policy alongside checkpoint checks. [GitHub Action timing policy](#발화-지연-정책)
 
 Use Python 3.10+ and `promtool` 3.9+. With no local `promtool`, the demo downloads and verifies a pinned binary on Linux x64. Set `PROMTOOL=/path/to/promtool` to use a specific executable.
 
@@ -113,7 +113,23 @@ python3 incident_to_promtool.py timeline demo/generated/after.test.yml \
 
 종료 코드는 게이트 없이 보고를 완료했거나 게이트를 통과했을 때 `0`, 게이트 실패 `1`, 입력 또는 실행 오류 `2`입니다.
 
-`compare`와 `compare-bundle`에서 체크포인트와 발화 지연을 함께 검사하려면 `--timeline-alertname`, `--timeline-end`, `--timeline-max-delay`를 추가합니다. 입력이 여러 개면 `compare`는 `--timeline-fixture`, `compare-bundle`은 `--timeline-bundle`로 대상 경로를 지정합니다. 여러 발화 지연 검사는 `--timeline-policy`로 구성할 수 있습니다. [발화 지연 정책](#발화-지연-정책)
+`compare`와 `compare-bundle`에서 체크포인트와 최초 발화를 함께 검사하려면 `--timeline-alertname`, `--timeline-end`와 함께 `--timeline-max-delay`나 `--timeline-fire-by`를 지정합니다. 두 조건을 함께 적용할 수도 있습니다. 입력이 여러 개면 `compare`는 `--timeline-fixture`, `compare-bundle`은 `--timeline-bundle`로 대상을 지정합니다. 여러 발화 검사는 `--timeline-policy`로 구성할 수 있습니다. [발화 지연 정책](#발화-지연-정책)
+
+#### 최초 발화 기한
+
+`--fire-by`는 테스트 그룹 시작을 기준으로 수정 룰의 최초 발화 기한을 정합니다. 기한은 `--end` 이하여야 하며, 기한과 같은 시점에 발화해도 통과합니다. 게이트는 `0s`부터 `--end`까지 관측한 최초 발화를 사용합니다. `--start`는 표시 범위의 시작입니다.
+
+선택한 알람에서 `exp_alerts`가 비어 있지 않은 체크포인트가 있는 그룹만 검사합니다. 발화를 기대하는 그룹이 하나도 없으면 입력 오류(`2`)입니다. 기준 룰의 발화 여부와 관계없이 수정 룰의 발화 시점으로 판정합니다.
+
+```sh
+python3 incident_to_promtool.py timeline demo/generated/after.test.yml \
+  --before demo/before.rules.yml --after demo/before.rules.yml \
+  --alertname PaymentErrorsHigh --end 10m --max-delay 0s --fire-by 7m
+```
+
+두 룰의 최초 발화 시점이 `570s`로 같으므로 상대 지연 검사는 통과합니다. 수정 룰은 `7m` 기한을 넘겨 기한 검사가 실패하며, 명령은 `1`로 종료합니다.
+
+`--format json`에서 `gate`는 `--max-delay` 판정입니다. `--fire-by`를 지정하면 `deadline_gate`에 `mode`(`fire-by`), `fire_by_ms`, `passed`, `checked_groups`, `groups`를 추가합니다. 각 그룹에는 `after_first_firing_offset_ms`와 `passed`, `late`, `missing_after` 중 하나인 `status`가 들어갑니다. `--fire-by`를 지정한 리포트의 최상위 `passed`는 발화 조건 전체의 판정입니다.
 
 #### Git 커밋의 룰로 타임라인 재생
 
@@ -256,9 +272,9 @@ with:
 
 #### PR에서 최초 발화 지연 검사
 
-`timeline-alertname`, `timeline-end`, `timeline-max-delay`를 모두 설정하면 최초 발화 지연도 검사합니다. `fixture` 또는 `fixtures`에서는 `timeline-fixture`, `bundle` 또는 `bundles`에서는 `timeline-bundle`로 대상을 선택합니다. 입력이 하나면 그 파일을 기본으로 선택합니다. 여러 개면 해당 선택 옵션이 필요합니다. 선택할 때는 입력에 적은 경로를 그대로 사용합니다.
+`timeline-alertname`, `timeline-end`와 함께 `timeline-max-delay` 또는 `timeline-fire-by`를 설정합니다. 두 조건을 함께 지정할 수도 있습니다. `fixture` 또는 `fixtures`에서는 `timeline-fixture`, `bundle` 또는 `bundles`에서는 `timeline-bundle`로 대상을 선택합니다. 입력이 하나면 그 파일을 기본으로 선택합니다. 여러 개면 해당 선택 옵션이 필요합니다. 선택할 때는 입력에 적은 경로를 그대로 사용합니다.
 
-체크포인트 검사에서 읽은 테스트와 룰을 사용해 `0s`부터 `timeline-end`까지의 최초 발화를 비교합니다. `timeline-end`는 선택한 테스트의 평가 간격에 맞춥니다. 선택한 체크포인트 게이트(`strict` 또는 `regressions`)와 지연 게이트가 모두 통과하면 단계가 성공합니다.
+체크포인트 검사에서 읽은 테스트와 룰을 사용해 `0s`부터 `timeline-end`까지의 최초 발화를 봅니다. `timeline-end`는 선택한 테스트의 평가 간격에 맞춥니다. 선택한 체크포인트 게이트(`strict` 또는 `regressions`)와 지정한 발화 조건을 모두 통과하면 단계가 성공합니다.
 
 ```yaml
 with:
@@ -271,11 +287,12 @@ with:
   timeline-alertname: PaymentErrorsHigh
   timeline-end: '10m'
   timeline-max-delay: '0s'
+  timeline-fire-by: '7m'
 ```
 
-Markdown은 체크포인트 결과와 발화 타임라인을 함께 보여줍니다. JSON의 `timeline`에는 발화 타임라인과 지연 판정을 담고, 최상위 `gate`는 체크포인트 판정을 담습니다. JUnit XML에는 검사 하나를 담은 `Alert firing delay` 스위트가 추가되고 전체 검사 수에도 반영됩니다.
+Markdown은 체크포인트 결과와 발화 타임라인을 함께 보여줍니다. JSON의 `timeline`에는 발화 타임라인과 지정한 발화 조건의 판정을 담고, 최상위 `gate`는 체크포인트 판정을 담습니다. JUnit XML에는 `Alert firing delay` 스위트가 추가되며 타임라인 검사 하나당 테스트 케이스 하나가 전체 검사 수에 반영됩니다.
 
-지연 검사를 켜면 `steps.compare.outputs.timeline-passed`에 문자열 `true` 또는 `false`를 제공합니다. 게이트가 실패해도 이 값을 읽을 수 있습니다. `newly-failed`는 새로 실패한 체크포인트 수입니다.
+발화 검사를 켜면 `steps.compare.outputs.timeline-passed`에 발화 조건 전체의 통과 여부를 문자열 `true` 또는 `false`로 제공합니다. 게이트가 실패해도 이 값을 읽을 수 있습니다. `newly-failed`는 새로 실패한 체크포인트 수입니다.
 
 #### 발화 지연 정책
 
@@ -287,13 +304,13 @@ Markdown은 체크포인트 결과와 발화 타임라인을 함께 보여줍니
 {
   "schema_version": 1,
   "checks": [
-    {"source": "tests/fixtures/payment-timeout.test.yml", "alertname": "PaymentErrorsHigh", "end": "10m", "max_delay": "0s"},
-    {"source": "tests/fixtures/payment-peak.test.yml", "alertname": "PaymentErrorsHigh", "end": "10m", "max_delay": "1m"}
+    {"source": "tests/fixtures/payment-timeout.test.yml", "alertname": "PaymentErrorsHigh", "end": "10m", "max_delay": "0s", "fire_by": "7m"},
+    {"source": "tests/fixtures/payment-peak.test.yml", "alertname": "PaymentErrorsHigh", "end": "10m", "fire_by": "7m"}
   ]
 }
 ```
 
-입력이 하나면 `source`를 생략할 수 있습니다. 여러 개면 각 검사에 명령이나 액션에 지정한 테스트 또는 ZIP 경로를 그대로 적습니다. 같은 `source`와 `alertname` 조합은 한 번만 지정합니다. 각 `end`는 해당 테스트의 평가 시점에 맞추고 `max_delay`에는 `0s`도 사용할 수 있습니다. 전체 정책은 룰 버전마다 최대 10,000개의 평가 시점을 사용할 수 있습니다.
+입력이 하나면 `source`를 생략할 수 있습니다. 여러 개면 각 검사에 명령이나 액션에 지정한 테스트 또는 ZIP 경로를 그대로 적습니다. 같은 `source`와 `alertname` 조합은 한 번만 지정합니다. 각 검사에는 `max_delay`와 `fire_by` 중 하나 이상을 지정합니다. `end`는 해당 테스트의 평가 시점에 맞추고 `fire_by`는 `end` 이하로 지정합니다. `max_delay`에는 `0s`도 사용할 수 있습니다. 전체 정책은 룰 버전마다 최대 10,000개의 평가 시점을 사용할 수 있습니다.
 
 `compare`에서 `--fixture-ref`를 사용하면 그 커밋에서 정책을 읽습니다. Git의 `compare-bundle`은 `--bundle-ref`에서, Action의 번들 비교는 `before-ref`에서 정책을 읽습니다. 이때 정책과 `source` 경로는 저장소 루트 기준입니다. 나머지 경우에는 로컬 파일 경로를 사용합니다.
 
@@ -553,12 +570,13 @@ python3 incident_to_promtool.py compare-bundle tests/fixtures/payment-baseline.z
 
 ##### 번들의 최초 발화 지연 검사
 
-`compare-bundle`에 `--timeline-alertname`, `--timeline-end`, `--timeline-max-delay`를 모두 지정하면, 체크포인트 검사를 위해 읽고 검증한 테스트와 룰로 최초 발화 지연도 검사합니다. ZIP에 보관한 기준 룰과 외부 기준 룰 모두 사용할 수 있습니다.
+`compare-bundle`에서 `--timeline-alertname`, `--timeline-end`와 함께 `--timeline-max-delay` 또는 `--timeline-fire-by`를 지정하면, 체크포인트 검사를 위해 읽고 검증한 테스트와 룰로 최초 발화도 검사합니다. ZIP에 보관한 기준 룰과 외부 기준 룰 모두 사용할 수 있습니다.
 
 ```sh
 python3 incident_to_promtool.py compare-bundle demo/generated/payment-baseline.zip \
   --after demo/after.rules.yml --timeline-alertname PaymentErrorsHigh \
-  --timeline-end 10m --timeline-max-delay 0s --json-report demo/generated/payment-timing.json
+  --timeline-end 10m --timeline-max-delay 0s --timeline-fire-by 7m \
+  --json-report demo/generated/payment-timing.json
 ```
 
 여러 ZIP을 비교할 때는 `--timeline-bundle`에 입력 목록의 ZIP 경로 하나를 그대로 적습니다. ZIP 하나를 비교할 때는 그 파일을 기본으로 선택합니다.
