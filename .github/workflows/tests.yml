@@ -194,6 +194,7 @@ jobs:
           recording_rule="rules/payment recording.yml"
           bundle="incidents/payment baseline.zip"
           second_bundle="incidents/alternative baseline.zip"
+          timing_policy="incidents/payment timing policy.json"
           bundle_baseline="rules/bundle baseline fixed.yml"
           bundle_regression="rules/bundle candidate regressed.yml"
           git init --quiet "$repo"
@@ -204,6 +205,17 @@ jobs:
             --rule-file demo/before.rules.yml --output "$repo/$bundle"
           python3 incident_to_promtool.py bundle demo/demo.json --matrix demo/incident.matrix.json \
             --rule-file demo/after.rules.yml --output "$repo/$second_bundle"
+          cat > "$repo/$timing_policy" <<'JSON'
+          {
+            "schema_version": 1,
+            "checks": [
+              {"source": "incidents/payment baseline.zip", "alertname": "PaymentErrorsHigh",
+               "end": "10m", "max_delay": "0s"},
+              {"source": "incidents/alternative baseline.zip", "alertname": "PaymentErrorsHigh",
+               "end": "10m", "max_delay": "0s"}
+            ]
+          }
+          JSON
           (
             cd "$repo"
             python3 "$GITHUB_WORKSPACE/incident_to_promtool.py" "$GITHUB_WORKSPACE/demo/demo.json" \
@@ -240,7 +252,7 @@ jobs:
           cp demo/kubernetes/before.yml "$repo/$rule"
           cp demo/kubernetes/before.yml "$repo/$scoped_baseline"
           cp demo/kubernetes/after.yml "$repo/$bundle_baseline"
-          git -C "$repo" add -- "$rule" "$scoped_baseline" "$bundle" "$second_bundle" "$bundle_baseline" \
+          git -C "$repo" add -- "$rule" "$scoped_baseline" "$bundle" "$second_bundle" "$bundle_baseline" "$timing_policy" \
             payment.test.yml payment.capture.json quiet.test.yml quiet.capture.json timing.test.yml timing.capture.json
           git -C "$repo" commit --quiet -m 'Add original payment alert'
           cp demo/kubernetes/after.yml "$repo/$rule"
@@ -264,8 +276,9 @@ jobs:
           printf 'invalid replacement bundle\n' > "$repo/$bundle"
           git -C "$repo" add -- "$rule" "$candidate" "$renamed_rule" "$recording_rule" \
             "$bundle" "$bundle_regression"
-          git -C "$repo" rm --quiet -- "$second_bundle" "$scoped_baseline" "$bundle_baseline"
+          git -C "$repo" rm --quiet -- "$second_bundle" "$scoped_baseline" "$bundle_baseline" "$timing_policy"
           git -C "$repo" commit --quiet -m 'Fix late payment alert'
+          printf 'invalid timing policy\n' > "$repo/$timing_policy"
           printf 'invalid fixture\n' > "$repo/payment.test.yml"
           printf 'invalid fixture\n' > "$repo/timing.test.yml"
           rm -- "$repo/payment.capture.json" "$repo/quiet.test.yml" "$repo/quiet.capture.json" "$repo/timing.capture.json" \
@@ -605,10 +618,7 @@ jobs:
           rule-files: |
             rules/payment candidate.yml
           rule-format: kubernetes
-          timeline-alertname: PaymentErrorsHigh
-          timeline-end: 10m
-          timeline-max-delay: 0s
-          timeline-bundle: incidents/alternative baseline.zip
+          timeline-policy: incidents/payment timing policy.json
       - name: Check the committed bundle batch comparison
         env:
           REPORT_PATH: ${{ steps.bundled-batch.outputs.report-path }}
@@ -621,11 +631,14 @@ jobs:
           [[ "$report" == *'| Before | Failed | 3/4 |'* ]]
           [[ "$report" == *'| After | Passed | 4/4 |'* ]]
           [[ "$NEWLY_FAILED" == '0' ]]
+          [[ "$report" == *'**Passed** (2/2 checks)'* ]]
           [[ "$report" == *'Timing gate `max-delay 0s` **Passed**'* && "$TIMELINE_PASSED" == true ]]
           python3 - <<'PY'
+          import hashlib
           import json
           import os
           from pathlib import Path
+          import subprocess
           from xml.etree import ElementTree
 
           report = json.loads(Path(os.environ["JSON_REPORT_PATH"]).read_text(encoding="utf-8"))
@@ -637,20 +650,29 @@ jobs:
           assert all(fixture["after"] == {"matched": 2, "total": 2} for fixture in fixtures)
           assert report["summary"]["newly_failed"] == 0
 
-          timeline = report["timeline"]
-          assert timeline["bundle"] == report["bundles"][1]
-          assert timeline["fixture_path"] == fixtures[1]["path"]
-          assert timeline["baseline_source"] == "bundle"
-          assert timeline["fixture_commit"] == report["commits"]["before"]
-          assert timeline["rule_files"] == {"before": ["rules/rules-1.yml"], "after": ["rules/payment candidate.yml"]}
-          gate = timeline["gate"]
-          assert gate["max_delay_ms"] == 0 and gate["passed"] is True
-          group, = gate["groups"]
-          assert group["status"] == "passed" and group["first_firing_delta_ms"] == 0
-          assert group["before_first_firing_offset_ms"] == group["after_first_firing_offset_ms"] == 330_000
+          policy = report["timeline_policy"]
+          repo = Path(os.environ["RUNNER_TEMP"], "composite-repo")
+          baseline = subprocess.check_output(["git", "rev-parse", "HEAD^1"], cwd=repo, text=True).strip()
+          policy_path = "incidents/payment timing policy.json"
+          policy_bytes = subprocess.check_output(["git", "show", f"{baseline}:{policy_path}"], cwd=repo)
+          assert policy["path"] == policy_path and policy["passed"] is True
+          assert policy["commit"] == report["commits"]["before"] == baseline
+          assert policy["sha256"] == hashlib.sha256(policy_bytes).hexdigest()
+          for timeline, bundle, fixture, before in zip(
+              policy["checks"], report["bundles"], fixtures, (570_000, 330_000), strict=True,
+          ):
+              assert timeline["bundle"] == bundle and timeline["fixture_path"] == fixture["path"]
+              assert timeline["baseline_source"] == "bundle" and timeline["fixture_commit"] == baseline
+              assert timeline["rule_files"] == {"before": ["rules/rules-1.yml"], "after": ["rules/payment candidate.yml"]}
+              gate = timeline["gate"]
+              assert gate["max_delay_ms"] == 0 and gate["passed"] is True
+              group, = gate["groups"]
+              assert group["status"] == "passed" and group["first_firing_delta_ms"] == 330_000 - before
+              assert group["before_first_firing_offset_ms"] == before
+              assert group["after_first_firing_offset_ms"] == 330_000
 
           junit = ElementTree.parse(os.environ["JUNIT_REPORT_PATH"]).getroot()
-          assert junit.attrib["tests"] == "5" and junit.attrib["failures"] == "0"
+          assert junit.attrib["tests"] == "6" and junit.attrib["failures"] == "0"
           timing_cases = junit.findall("testsuite[@name='Alert firing delay']/testcase")
-          assert len(timing_cases) == 1 and timing_cases[0].find("failure") is None
+          assert len(timing_cases) == 2 and all(case.find("failure") is None for case in timing_cases)
           PY

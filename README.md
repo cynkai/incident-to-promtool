@@ -14,7 +14,7 @@ bash scripts/demo.sh
 
 The demo replays synthetic payment metrics without a Prometheus server. It checks that the alert stays quiet before the outage and is firing five minutes after it starts. The original rule matches **1/2** checkpoints. The revised rule matches **2/2** and passes the check.
 
-Use `timeline` to compare an alert's first firing across Git revisions. The GitHub Action also offers an optional delay limit alongside checkpoint checks. [GitHub Action timing gate](#pr에서-최초-발화-지연-검사)
+Use `timeline` to compare an alert's first firing across Git revisions. The GitHub Action can enforce delay limits from a committed timing policy alongside checkpoint checks. [GitHub Action timing policy](#발화-지연-정책)
 
 Use Python 3.10+ and `promtool` 3.9+. With no local `promtool`, the demo downloads and verifies a pinned binary on Linux x64. Set `PROMTOOL=/path/to/promtool` to use a specific executable.
 
@@ -113,7 +113,7 @@ python3 incident_to_promtool.py timeline demo/generated/after.test.yml \
 
 종료 코드는 게이트 없이 보고를 완료했거나 게이트를 통과했을 때 `0`, 게이트 실패 `1`, 입력 또는 실행 오류 `2`입니다.
 
-`compare`와 `compare-bundle`에서 체크포인트와 발화 지연을 함께 검사하려면 `--timeline-alertname`, `--timeline-end`, `--timeline-max-delay`를 추가합니다. 입력이 여러 개면 `compare`는 `--timeline-fixture`, `compare-bundle`은 `--timeline-bundle`로 대상 경로를 지정합니다. [PR에서 최초 발화 지연 검사](#pr에서-최초-발화-지연-검사)
+`compare`와 `compare-bundle`에서 체크포인트와 발화 지연을 함께 검사하려면 `--timeline-alertname`, `--timeline-end`, `--timeline-max-delay`를 추가합니다. 입력이 여러 개면 `compare`는 `--timeline-fixture`, `compare-bundle`은 `--timeline-bundle`로 대상 경로를 지정합니다. 여러 발화 지연 검사는 `--timeline-policy`로 구성할 수 있습니다. [발화 지연 정책](#발화-지연-정책)
 
 #### Git 커밋의 룰로 타임라인 재생
 
@@ -276,6 +276,54 @@ with:
 Markdown은 체크포인트 결과와 발화 타임라인을 함께 보여줍니다. JSON의 `timeline`에는 발화 타임라인과 지연 판정을 담고, 최상위 `gate`는 체크포인트 판정을 담습니다. JUnit XML에는 검사 하나를 담은 `Alert firing delay` 스위트가 추가되고 전체 검사 수에도 반영됩니다.
 
 지연 검사를 켜면 `steps.compare.outputs.timeline-passed`에 문자열 `true` 또는 `false`를 제공합니다. 게이트가 실패해도 이 값을 읽을 수 있습니다. `newly-failed`는 새로 실패한 체크포인트 수입니다.
+
+#### 발화 지연 정책
+
+여러 알람이나 장애를 함께 검사할 때는 CLI의 `compare` 또는 `compare-bundle`에 `--timeline-policy PATH`를 지정합니다. GitHub Action 입력은 `timeline-policy`입니다. 정책 방식과 위의 단일 지연 검사 옵션 중 하나를 선택합니다.
+
+아래 `tests/fixtures/payment-timing.json`은 두 결제 장애의 테스트 파일에서 같은 `PaymentErrorsHigh` 알람을 검사합니다.
+
+```json
+{
+  "schema_version": 1,
+  "checks": [
+    {"source": "tests/fixtures/payment-timeout.test.yml", "alertname": "PaymentErrorsHigh", "end": "10m", "max_delay": "0s"},
+    {"source": "tests/fixtures/payment-peak.test.yml", "alertname": "PaymentErrorsHigh", "end": "10m", "max_delay": "1m"}
+  ]
+}
+```
+
+입력이 하나면 `source`를 생략할 수 있습니다. 여러 개면 각 검사에 명령이나 액션에 지정한 테스트 또는 ZIP 경로를 그대로 적습니다. 같은 `source`와 `alertname` 조합은 한 번만 지정합니다. 각 `end`는 해당 테스트의 평가 시점에 맞추고 `max_delay`에는 `0s`도 사용할 수 있습니다. 전체 정책은 룰 버전마다 최대 10,000개의 평가 시점을 사용할 수 있습니다.
+
+`compare`에서 `--fixture-ref`를 사용하면 그 커밋에서 정책을 읽습니다. Git의 `compare-bundle`은 `--bundle-ref`에서, Action의 번들 비교는 `before-ref`에서 정책을 읽습니다. 이때 정책과 `source` 경로는 저장소 루트 기준입니다. 나머지 경우에는 로컬 파일 경로를 사용합니다.
+
+두 테스트 파일과 정책을 기준 커밋에 보관한 뒤 실행합니다.
+
+```sh
+python3 incident_to_promtool.py compare \
+  tests/fixtures/payment-timeout.test.yml tests/fixtures/payment-peak.test.yml \
+  --before-ref 'HEAD^1' --after-ref HEAD --rule-file prometheus/payment.rules.yml \
+  --fixture-ref 'HEAD^1' --timeline-policy tests/fixtures/payment-timing.json \
+  --json-report review-policy.json
+```
+
+위 PR 워크플로의 비교 단계에도 같은 경로를 지정할 수 있습니다.
+
+```yaml
+- name: Compare alert rules and timing policy
+  id: compare
+  uses: cynkai/incident-to-promtool@main
+  with:
+    fixtures: |
+      tests/fixtures/payment-timeout.test.yml
+      tests/fixtures/payment-peak.test.yml
+    fixture-ref: 'HEAD^1'
+    rule-files: |
+      prometheus/payment.rules.yml
+    timeline-policy: tests/fixtures/payment-timing.json
+```
+
+JSON의 `timeline_policy`에는 정책 경로 `path`, 읽은 파일 바이트의 `sha256`, 커밋에서 읽었을 때의 `commit`, 정책 전체 판정 `passed`, 검사별 타임라인 `checks`가 들어갑니다. 각 검사 결과는 단일 `timeline`과 같은 구조를 사용합니다. `timeline-passed`는 모든 정책 검사의 통과 여부입니다. JUnit의 `Alert firing delay` 스위트에는 정책 검사마다 테스트 케이스 하나가 들어갑니다. 단계가 성공하려면 체크포인트 검사와 정책 검사가 모두 통과해야 합니다.
 
 #### 기준 번들로 PR 검사
 

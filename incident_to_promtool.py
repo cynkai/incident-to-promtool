@@ -803,7 +803,7 @@ def read_bundle_member(archive, path, name, manifest=None):
     return contents
 
 
-def unique_manifest_object(pairs):
+def unique_json_object(pairs):
     result = {}
     for key, value in pairs:
         if key in result:
@@ -817,7 +817,7 @@ def read_bundle_manifest(archive, path, names):
         return None
     contents = read_bundle_member(archive, path, BUNDLE_MANIFEST)
     try:
-        document = json.loads(contents.decode("utf-8"), object_pairs_hook=unique_manifest_object)
+        document = json.loads(contents.decode("utf-8"), object_pairs_hook=unique_json_object)
     except (ValueError, RecursionError) as exc:
         raise ValueError(f"{path}!{BUNDLE_MANIFEST}: invalid manifest JSON: {exc}") from exc
     version = document.get("schema_version") if isinstance(document, dict) else None
@@ -1182,8 +1182,10 @@ def print_markdown_report(report):
 
 def build_junit_report(fixtures, report):
     zero_counts = {"errors": "0", "skipped": "0"}
-    timeline = report.get("timeline")
-    test_count = report["summary"]["after"]["total"] + int(timeline is not None)
+    timelines = report.get("timeline_policy", {}).get("checks", ())
+    if "timeline" in report:
+        timelines = (report["timeline"],)
+    test_count = report["summary"]["after"]["total"] + len(timelines)
     root = ElementTree.Element("testsuites", {
         "name": "incident-to-promtool", "tests": str(test_count), **zero_counts,
     })
@@ -1219,21 +1221,22 @@ def build_junit_report(fixtures, report):
                     ElementTree.SubElement(case, "system-out").text = XML_INVALID.sub("\ufffd", f"{message}\n\n{details}")
         suite.set("failures", str(suite_failures))
         failures += suite_failures
-    if timeline is not None:
-        timing_gate = timeline["gate"]
-        timing_failed = int(not timing_gate["passed"])
+    if timelines:
+        timing_failures = sum(not timeline["gate"]["passed"] for timeline in timelines)
         suite = ElementTree.SubElement(root, "testsuite", {
-            "name": "Alert firing delay", "tests": "1", "failures": str(timing_failed), **zero_counts,
+            "name": "Alert firing delay", "tests": str(len(timelines)), "failures": str(timing_failures), **zero_counts,
         })
-        title = f"{timeline['alertname']} (max delay {as_duration(timing_gate['max_delay_ms'])})"
-        case = ElementTree.SubElement(suite, "testcase", {
-            "classname": XML_INVALID.sub("\ufffd", timeline["fixture_path"]),
-            "name": XML_INVALID.sub("\ufffd", title),
-        })
-        if timing_failed:
-            failure = ElementTree.SubElement(case, "failure", {"message": "Alert firing delay gate failed", "type": "max-delay"})
-            failure.text = json.dumps(timing_gate, indent=2)
-        failures += timing_failed
+        for timeline in timelines:
+            timing_gate = timeline["gate"]
+            title = f"{timeline['alertname']} (max delay {as_duration(timing_gate['max_delay_ms'])})"
+            case = ElementTree.SubElement(suite, "testcase", {
+                "classname": XML_INVALID.sub("\ufffd", timeline["fixture_path"]),
+                "name": XML_INVALID.sub("\ufffd", title),
+            })
+            if not timing_gate["passed"]:
+                failure = ElementTree.SubElement(case, "failure", {"message": "Alert firing delay gate failed", "type": "max-delay"})
+                failure.text = json.dumps(timing_gate, indent=2)
+        failures += timing_failures
     root.set("failures", str(failures))
     ElementTree.indent(root)
     return ElementTree.tostring(root, encoding="utf-8", xml_declaration=True) + b"\n"
@@ -1265,7 +1268,7 @@ def write_comparison_reports(reports):
 
 def compare(
     fixtures, baseline_rule_sets, after, executable, revisions, gate, json_report, fixture_commit,
-    *, bundles=(), junit_report=None, rule_paths=None, show_rule_paths=True, timeline=None,
+    *, bundles=(), junit_report=None, rule_paths=None, show_rule_paths=True, timelines=(), timeline_policy=None,
 ):
     if (json_report is not None and junit_report is not None
             and os.path.realpath(json_report) == os.path.realpath(junit_report)):
@@ -1273,33 +1276,40 @@ def compare(
     promtool = require_promtool(executable)
 
     replay_fixtures = fixtures
-    if timeline is not None:
+    if timelines:
         # Stage timing probes beside the checkpoint fixtures using the same rule bytes.
-        timeline_index = fixtures.index(timeline.fixture)
-        baseline = baseline_rule_sets[timeline_index]
-        replay_fixtures = [*fixtures, timeline.probes]
-        baseline_rule_sets = [*baseline_rule_sets, baseline]
+        replay_fixtures = [*fixtures, *(timeline.probes for _, timeline in timelines)]
+        baseline_rule_sets = [*baseline_rule_sets, *(baseline_rule_sets[index] for index, _ in timelines)]
     with TemporaryDirectory() as temporary:
         path = Path(temporary)
         before_failures = test_rule_version(promtool, replay_fixtures, baseline_rule_sets, path / "before")
         after_failures = test_rule_version(promtool, replay_fixtures, [after] * len(replay_fixtures), path / "after")
 
-    timing_report = None
-    if timeline is not None:
-        timing_report = build_timeline_report(timeline, before_failures.pop(), after_failures.pop())
+    fixture_count = len(fixtures)
+    timing_reports = []
+    for (index, timeline), before_probes, after_probes in zip(
+        timelines, before_failures[fixture_count:], after_failures[fixture_count:], strict=True,
+    ):
+        timing_report = build_timeline_report(timeline, before_probes, after_probes)
         add_timeline_provenance(
             timing_report, timeline.fixture, revisions, rule_paths, fixture_commit,
-            bundle=bundles[timeline_index] if bundles else None,
+            bundle=bundles[index] if bundles else None,
         )
-    report = build_comparison_report(fixtures, before_failures, after_failures, revisions, gate, fixture_commit)
+        timing_reports.append(timing_report)
+    timing_passed = all(timing_report["gate"]["passed"] for timing_report in timing_reports)
+    report = build_comparison_report(
+        fixtures, before_failures[:fixture_count], after_failures[:fixture_count], revisions, gate, fixture_commit,
+    )
     if len(bundles) == 1:
         report["bundle"] = bundles[0]
     elif bundles:
         report["bundles"] = list(bundles)
     if show_rule_paths and rule_paths is not None:
         report["rule_files"] = rule_paths
-    if timing_report is not None:
-        report["timeline"] = timing_report
+    if timeline_policy is not None:
+        report["timeline_policy"] = {**timeline_policy, "passed": timing_passed, "checks": timing_reports}
+    elif timing_reports:
+        report["timeline"] = timing_reports[0]
     reports = []
     if json_report is not None:
         reports.append(("JSON", json_report, json_document(report)))
@@ -1308,10 +1318,12 @@ def compare(
     if reports:
         write_comparison_reports(reports)
     print_markdown_report(report)
-    if timing_report is not None:
+    if timeline_policy is not None:
+        print_timeline_policy(report["timeline_policy"])
+    elif timing_reports:
         print()
-        print_timeline_report(timing_report)
-    return int(not report["gate"]["passed"] or (timing_report is not None and not timing_report["gate"]["passed"]))
+        print_timeline_report(timing_reports[0])
+    return int(not (report["gate"]["passed"] and timing_passed))
 
 
 def add_comparison_report_options(parser):
@@ -1391,7 +1403,7 @@ def comparison_rule_bytes(sources, rule_format):
     return [content for _, content in sources]
 
 
-def timeline_probes(fixture, alertname, start, end, *, probe_from_zero=False):
+def timeline_probes(fixture, alertname, start, end, *, probe_from_zero=False, tick_budget=None):
     try:
         evaluation = duration_ms(fixture.data.get("evaluation_interval"))
     except ValueError as exc:
@@ -1409,8 +1421,12 @@ def timeline_probes(fixture, alertname, start, end, *, probe_from_zero=False):
     ]
     if not selected_groups:
         raise ValueError(f"{fixture.path}: no checkpoints for alert {alertname!r}")
-    if len(selected_groups) * (end // evaluation + 1) > MAX_TIMELINE_TICKS:
-        raise ValueError(f"timeline would simulate more than {MAX_TIMELINE_TICKS:,} evaluation ticks per rule version; shorten --end")
+    evaluation_ticks = len(selected_groups) * (end // evaluation + 1)
+    if evaluation_ticks > (MAX_TIMELINE_TICKS if tick_budget is None else tick_budget):
+        limit = f"more than {MAX_TIMELINE_TICKS:,} evaluation ticks per rule version"
+        if tick_budget is not None:
+            raise ValueError(f"timeline policy would simulate {limit}; shorten one or more check end values")
+        raise ValueError(f"timeline would simulate {limit}; shorten --end")
 
     # An empty expected alert set differs from Promtool's result exactly at firing ticks.
     ticks = range(0 if probe_from_zero else start, end + 1, evaluation)
@@ -1421,7 +1437,7 @@ def timeline_probes(fixture, alertname, start, end, *, probe_from_zero=False):
     ]
     keys = {(alertname, offset) for offset in ticks}
     probes = ReplayFixture(fixture.path, {**fixture.data, "tests": groups}, [keys] * len(groups), None, None)
-    return probes, selected_groups, evaluation
+    return probes, selected_groups, evaluation, evaluation_ticks
 
 
 def firing_offsets(mismatches, group_count):
@@ -1479,17 +1495,18 @@ class TimelineReplay:
     probes: ReplayFixture
     group_numbers: list[int]
     evaluation: int
+    evaluation_ticks: int
     alertname: str
     start: int
     end: int
     max_delay: int | None
 
 
-def prepare_timeline(fixture, alertname, start, end, max_delay):
-    probes, group_numbers, evaluation = timeline_probes(
-        fixture, alertname, start, end, probe_from_zero=max_delay is not None,
+def prepare_timeline(fixture, alertname, start, end, max_delay, *, tick_budget=None):
+    probes, group_numbers, evaluation, evaluation_ticks = timeline_probes(
+        fixture, alertname, start, end, probe_from_zero=max_delay is not None, tick_budget=tick_budget,
     )
-    return TimelineReplay(fixture, probes, group_numbers, evaluation, alertname, start, end, max_delay)
+    return TimelineReplay(fixture, probes, group_numbers, evaluation, evaluation_ticks, alertname, start, end, max_delay)
 
 
 def build_timeline_report(timeline, before, after):
@@ -1587,8 +1604,8 @@ def print_timeline_gate(gate, end):
         print("| " + " | ".join(cells) + " |")
 
 
-def print_timeline_report(report):
-    print("## Prometheus alert firing timeline\n")
+def print_timeline_report(report, *, heading="##"):
+    print(f"{heading} Prometheus alert firing timeline\n")
     print(f"{markdown_code(report['alertname'])} in {markdown_code(report['fixture_path'])}.\n")
     commits = report.get("commits")
     if rule_paths := report.get("rule_files"):
@@ -1628,6 +1645,20 @@ def print_timeline_report(report):
         print("| " + " | ".join(cells) + " |")
     if "gate" in report:
         print_timeline_gate(report["gate"], end)
+
+
+def print_timeline_policy(policy):
+    checks = policy["checks"]
+    passed = sum(check["gate"]["passed"] for check in checks)
+    verdict = "Passed" if policy["passed"] else "Failed"
+    print(f"\n## Alert firing delay policy\n\n**{verdict}** ({passed}/{len(checks)} checks) "
+          f"for {markdown_code(policy['path'])}.\n")
+    if commit := policy.get("commit"):
+        print(f"Loaded the policy from Git commit `{commit}`.\n")
+    print(f"Policy SHA-256 `{policy['sha256']}`.")
+    for check in checks:
+        print()
+        print_timeline_report(check, heading="###")
 
 
 def timeline_main(argv):
@@ -1678,6 +1709,7 @@ def timeline_main(argv):
 
 
 def add_comparison_timeline_options(parser, source, *, path_type):
+    parser.add_argument("--timeline-policy", type=Path, help="JSON file with one or more first-firing delay checks")
     parser.add_argument("--timeline-alertname", help="alert to check for first-firing delay")
     parser.add_argument("--timeline-end", metavar="DURATION", help="last offset to observe for the first-firing check")
     parser.add_argument("--timeline-max-delay", metavar="DURATION", help="maximum allowed first-firing delay")
@@ -1689,6 +1721,8 @@ def add_comparison_timeline_options(parser, source, *, path_type):
 
 def comparison_timeline_index(parser, args, paths, selection, source):
     options = (args.timeline_alertname, args.timeline_end, args.timeline_max_delay)
+    if args.timeline_policy is not None and (any(option is not None for option in options) or selection is not None):
+        parser.error("--timeline-policy cannot be combined with individual timeline options")
     if all(option is None for option in options) and selection is None:
         return None
     if not all(option is not None for option in options):
@@ -1704,13 +1738,78 @@ def comparison_timeline_index(parser, args, paths, selection, source):
     return paths.index(selection)
 
 
-def prepare_comparison_timeline(args, fixtures, index):
+def load_timeline_policy(path, repo, commit):
+    contents = read_replay_bytes(path, repo, commit, "timeline policy")
+    try:
+        document = json.loads(contents.decode("utf-8"), object_pairs_hook=unique_json_object)
+    except (ValueError, RecursionError) as exc:
+        raise ValueError(f"{path}: invalid timeline policy JSON: {exc}") from exc
+    version = document.get("schema_version") if isinstance(document, dict) else None
+    if type(version) is not int or version != 1:
+        raise ValueError(f"{path}: timeline policy requires schema_version 1")
+    if document.keys() - {"schema_version", "checks"}:
+        raise ValueError(f"{path}: timeline policy contains unknown fields")
+    checks = document.get("checks")
+    if not isinstance(checks, list) or not checks:
+        raise ValueError(f"{path}: timeline policy requires a nonempty checks array")
+    origin = {"path": str(path), "sha256": hashlib.sha256(contents).hexdigest()}
+    if commit is not None:
+        origin["commit"] = commit
+    return checks, origin
+
+
+def prepare_policy_timelines(path, fixtures, paths, repo, commit):
+    checks, origin = load_timeline_policy(path, repo, commit)
+    positions = {source: index for index, source in enumerate(paths)}
+    required = {"alertname", "end", "max_delay"}
+    allowed = required | {"source"}
+    seen = set()
+    timelines = []
+    remaining_ticks = MAX_TIMELINE_TICKS
+    for number, check in enumerate(checks, start=1):
+        try:
+            if not isinstance(check, dict) or not required <= check.keys():
+                raise ValueError("requires alertname, end, and max_delay")
+            if check.keys() - allowed:
+                raise ValueError("contains unknown fields")
+            alertname = check["alertname"]
+            if not isinstance(alertname, str) or not alertname.strip():
+                raise ValueError("alertname must be a nonempty string")
+            if "source" in check:
+                source = check["source"]
+                if not isinstance(source, str) or not source.strip():
+                    raise ValueError("source must be a nonempty path")
+                key = Path(source) if isinstance(paths[0], Path) else source
+                if key not in positions:
+                    raise ValueError(f"source {source!r} must match one of the supplied incident paths")
+                index = positions[key]
+            elif len(paths) != 1:
+                raise ValueError("source is required when comparing multiple incidents")
+            else:
+                index = 0
+            identity = (index, alertname)
+            if identity in seen:
+                raise ValueError(f"duplicate check for {alertname!r} in {paths[index]}")
+            end, max_delay = duration_ms(check["end"]), duration_ms(check["max_delay"])
+            timeline = prepare_timeline(fixtures[index], alertname, 0, end, max_delay, tick_budget=remaining_ticks)
+        except ValueError as exc:
+            raise ValueError(f"{path}: check {number}: {exc}") from exc
+        seen.add(identity)
+        timelines.append((index, timeline))
+        remaining_ticks -= timeline.evaluation_ticks
+    return timelines, origin
+
+
+def prepare_comparison_timelines(args, fixtures, index, paths, *, repo=None, commit=None):
+    if args.timeline_policy is not None:
+        return prepare_policy_timelines(args.timeline_policy, fixtures, paths, repo, commit)
     if index is None:
-        return None
-    return prepare_timeline(
+        return (), None
+    timeline = prepare_timeline(
         fixtures[index], args.timeline_alertname, 0,
         duration_ms(args.timeline_end), duration_ms(args.timeline_max_delay),
     )
+    return ((index, timeline),), None
 
 
 def compare_main(argv):
@@ -1733,14 +1832,16 @@ def compare_main(argv):
     try:
         sources = load_comparison_rules(parser, args)
         fixtures = load_replay_fixtures(args.fixtures, args.capture_summary, sources.repo, sources.fixture_commit)
-        timeline = prepare_comparison_timeline(args, fixtures, timing_index)
+        timelines, policy = prepare_comparison_timelines(
+            args, fixtures, timing_index, args.fixtures, repo=sources.repo, commit=sources.fixture_commit,
+        )
         before_rules = comparison_rule_bytes(sources.before, args.rule_format)
         after_rules = comparison_rule_bytes(sources.after, args.rule_format)
         return compare(
             fixtures, [before_rules] * len(fixtures), after_rules, args.promtool, revisions=sources.revisions,
             gate=args.gate, json_report=args.json_report, fixture_commit=sources.fixture_commit,
             junit_report=args.junit_report, rule_paths=sources.rule_paths,
-            show_rule_paths=args.before_rule_file is not None, timeline=timeline,
+            show_rule_paths=args.before_rule_file is not None, timelines=timelines, timeline_policy=policy,
         )
     except (OSError, ValueError, TypeError) as exc:
         parser.exit(2, f"error: {exc}\n")
@@ -1788,6 +1889,7 @@ def compare_bundle_main(argv):
             raise ValueError("each incident bundle must be supplied only once")
         revisions = None
         before = None
+        repo = None
         include_archived_rules = not (scoped_paths or args.before)
         if git_mode:
             repo = args.repo or Path.cwd()
@@ -1811,14 +1913,16 @@ def compare_bundle_main(argv):
                 before = read_rule_sources(args.before)
                 rule_paths = {"before": [str(path) for path in args.before], "after": candidate_paths}
         fixtures, baseline_rule_sets, bundles = zip(*replays)
-        timeline = prepare_comparison_timeline(args, fixtures, timing_index)
+        timelines, policy = prepare_comparison_timelines(
+            args, fixtures, timing_index, args.bundles, repo=repo, commit=revisions[0] if revisions else None,
+        )
         if before is not None:
             baseline_rule_sets = [comparison_rule_bytes(before, args.rule_format)] * len(fixtures)
         return compare(
             fixtures, baseline_rule_sets, comparison_rule_bytes(after, args.rule_format), args.promtool, revisions=revisions,
             gate=args.gate, json_report=args.json_report, fixture_commit=None, bundles=bundles,
             junit_report=args.junit_report, rule_paths=rule_paths, show_rule_paths=not include_archived_rules,
-            timeline=timeline,
+            timelines=timelines, timeline_policy=policy,
         )
     except (OSError, ValueError, TypeError) as exc:
         parser.exit(2, f"error: {exc}\n")

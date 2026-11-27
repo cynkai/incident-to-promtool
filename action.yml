@@ -49,6 +49,9 @@ inputs:
   timeline-bundle:
     description: Choose the timing gate bundle by its exact ZIP path. Required for the timing gate when comparing multiple bundles.
     required: false
+  timeline-policy:
+    description: Path to a JSON policy for multiple first-firing timing checks. Provide it as the only timing input.
+    required: false
   repo-path:
     description: Checkout directory, relative to the workflow workspace if not absolute.
     default: '.'
@@ -74,7 +77,7 @@ outputs:
     description: Number of checkpoints that passed before and failed after the rule changes.
     value: ${{ steps.replay.outputs.newly-failed }}
   timeline-passed:
-    description: The string true or false when the optional first-firing timing gate runs.
+    description: The string true or false when an optional timing gate or policy runs.
     value: ${{ steps.replay.outputs.timeline-passed }}
 runs:
   using: composite
@@ -100,6 +103,7 @@ runs:
         INCIDENT_TIMELINE_MAX_DELAY: ${{ inputs.timeline-max-delay }}
         INCIDENT_TIMELINE_FIXTURE: ${{ inputs.timeline-fixture }}
         INCIDENT_TIMELINE_BUNDLE: ${{ inputs.timeline-bundle }}
+        INCIDENT_TIMELINE_POLICY: ${{ inputs.timeline-policy }}
         INCIDENT_REPO_PATH: ${{ inputs.repo-path }}
         INCIDENT_BEFORE_REF: ${{ inputs.before-ref }}
         INCIDENT_AFTER_REF: ${{ inputs.after-ref }}

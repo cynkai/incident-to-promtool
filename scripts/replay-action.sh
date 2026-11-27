@@ -45,28 +45,36 @@ timeline_end=${INCIDENT_TIMELINE_END:-}
 timeline_max_delay=${INCIDENT_TIMELINE_MAX_DELAY:-}
 timeline_fixture=${INCIDENT_TIMELINE_FIXTURE:-}
 timeline_bundle=${INCIDENT_TIMELINE_BUNDLE:-}
+timeline_policy=${INCIDENT_TIMELINE_POLICY:-}
 bundle_mode=0
 if [[ -n "$bundle" || -n "${bundle_paths[0]:-}" ]]; then
     bundle_mode=1
 fi
-if [[ "$bundle_mode" -eq 1 && -n "$timeline_fixture" ]]; then
-    printf 'timeline-fixture requires fixture or fixtures.\n' >&2
-    exit 2
-fi
-if [[ "$bundle_mode" -eq 0 && -n "$timeline_bundle" ]]; then
-    printf 'timeline-bundle requires bundle or bundles.\n' >&2
-    exit 2
-fi
 
-timeline_enabled=0
+timeline_mode=disabled
+if [[ -n "$timeline_policy" ]]; then
+    timeline_mode=policy
+fi
 if [[ -n "$timeline_alertname" || -n "$timeline_end" || -n "$timeline_max_delay" ||
       -n "$timeline_fixture" || -n "$timeline_bundle" ]]; then
+    if [[ "$timeline_mode" == policy ]]; then
+        printf 'Provide timeline-policy or individual timeline inputs.\n' >&2
+        exit 2
+    fi
+    if [[ "$bundle_mode" -eq 1 && -n "$timeline_fixture" ]]; then
+        printf 'timeline-fixture requires fixture or fixtures.\n' >&2
+        exit 2
+    fi
+    if [[ "$bundle_mode" -eq 0 && -n "$timeline_bundle" ]]; then
+        printf 'timeline-bundle requires bundle or bundles.\n' >&2
+        exit 2
+    fi
     if [[ ! "$timeline_alertname" =~ [^[:space:]] || ! "$timeline_end" =~ [^[:space:]] ||
           ! "$timeline_max_delay" =~ [^[:space:]] ]]; then
         printf 'Provide timeline-alertname, timeline-end, and timeline-max-delay together.\n' >&2
         exit 2
     fi
-    timeline_enabled=1
+    timeline_mode=single
 fi
 
 if [[ "$bundle_mode" -eq 1 ]]; then
@@ -115,7 +123,9 @@ else
     fi
 fi
 
-if [[ "$timeline_enabled" -eq 1 ]]; then
+if [[ "$timeline_mode" == policy ]]; then
+    comparison_arguments+=(--timeline-policy="$timeline_policy")
+elif [[ "$timeline_mode" == single ]]; then
     comparison_arguments+=(--timeline-alertname="$timeline_alertname" --timeline-end="$timeline_end"
         --timeline-max-delay="$timeline_max_delay")
     if [[ -n "$timeline_fixture" ]]; then
@@ -203,7 +213,7 @@ printf '::%s::\n' "$command_token"
 
 if [[ "$status" -le 1 ]]; then
     if [[ -s "$report" && -s "$json_report" && -s "$junit_report" ]] &&
-        report_values=$("$python" - "$json_report" "$timeline_enabled" <<'PY'
+        report_values=$("$python" - "$json_report" "$timeline_mode" <<'PY'
 import json
 import sys
 
@@ -211,13 +221,17 @@ try:
     with open(sys.argv[1], encoding="utf-8") as source:
         report = json.load(source)
     count = report["summary"]["newly_failed"]
-    timeline_enabled = sys.argv[2] == "1"
-    timeline_passed = report["timeline"]["gate"]["passed"] if timeline_enabled else None
+    timeline_mode = sys.argv[2]
+    timeline_passed = None
+    if timeline_mode == "policy":
+        timeline_passed = report["timeline_policy"]["passed"]
+    elif timeline_mode == "single":
+        timeline_passed = report["timeline"]["gate"]["passed"]
 except (OSError, ValueError, KeyError, TypeError):
     sys.exit(1)
-if type(count) is not int or count < 0 or (timeline_enabled and type(timeline_passed) is not bool):
+if type(count) is not int or count < 0 or (timeline_mode != "disabled" and type(timeline_passed) is not bool):
     sys.exit(1)
-print(count, str(timeline_passed).lower() if timeline_enabled else "")
+print(count, str(timeline_passed).lower() if timeline_passed is not None else "")
 PY
     ); then
         read -r newly_failed timeline_passed <<< "$report_values"
