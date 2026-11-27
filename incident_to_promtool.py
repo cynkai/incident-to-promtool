@@ -1288,6 +1288,65 @@ def add_comparison_report_options(parser):
     )
 
 
+def add_rule_comparison_options(parser):
+    parser.add_argument("--before", type=Path, action="append", help="baseline rule file (repeatable)")
+    parser.add_argument("--after", type=Path, action="append", help="proposed rule file (repeatable)")
+    parser.add_argument("--before-ref", help="baseline Git ref or commit")
+    parser.add_argument("--after-ref", help="proposed Git ref or commit")
+    parser.add_argument("--rule-file", action="append", help="repository-root-relative path present in both commits (repeatable)")
+    parser.add_argument("--before-rule-file", action="append", help="repository-root-relative rule path at --before-ref (repeatable)")
+    parser.add_argument("--after-rule-file", action="append", help="repository-root-relative rule path at --after-ref (repeatable)")
+    parser.add_argument("--repo", type=Path, help="Git repository for ref comparison (default: current directory)")
+    parser.add_argument("--fixture-ref", help="read test fixtures and capture summaries from this Git ref (Git comparison only)")
+    parser.add_argument(
+        "--rule-format", choices=("prometheus", "kubernetes"), default="prometheus",
+        help="input rule format for both versions (default: prometheus)",
+    )
+
+
+@dataclass(frozen=True)
+class ComparisonRuleSources:
+    before: list[tuple[str, bytes]]
+    after: list[tuple[str, bytes]]
+    repo: Path | None = None
+    revisions: tuple[str, str] | None = None
+    fixture_commit: str | None = None
+    rule_paths: dict[str, list[str]] | None = None
+
+
+def load_comparison_rules(parser, args):
+    scoped_paths = args.before_rule_file is not None or args.after_rule_file is not None
+    git_mode = scoped_paths or any(value is not None for value in (args.before_ref, args.after_ref, args.rule_file, args.repo))
+    if args.fixture_ref is not None and not git_mode:
+        parser.error("--fixture-ref requires Git rule comparison")
+    if not git_mode:
+        if not (args.before and args.after):
+            parser.error("file comparison requires both --before and --after")
+        return ComparisonRuleSources(read_rule_sources(args.before), read_rule_sources(args.after))
+
+    if args.before or args.after:
+        parser.error("choose either --before and --after or Git ref comparison options")
+    if not (args.before_ref and args.after_ref):
+        parser.error("Git comparison requires --before-ref and --after-ref")
+    if scoped_paths and args.rule_file:
+        parser.error("choose either --rule-file or the --before-rule-file and --after-rule-file lists")
+    if scoped_paths and not (args.before_rule_file and args.after_rule_file):
+        parser.error("provide both --before-rule-file and --after-rule-file lists")
+    if not (scoped_paths or args.rule_file):
+        parser.error("provide --rule-file or both --before-rule-file and --after-rule-file lists")
+
+    repo = args.repo or Path.cwd()
+    revisions = (resolve_commit(repo, args.before_ref), resolve_commit(repo, args.after_ref))
+    fixture_commit = resolve_commit(repo, args.fixture_ref) if args.fixture_ref is not None else None
+    before_paths = args.before_rule_file if scoped_paths else args.rule_file
+    after_paths = args.after_rule_file if scoped_paths else args.rule_file
+    return ComparisonRuleSources(
+        read_committed_rules(repo, revisions[0], before_paths), read_committed_rules(repo, revisions[1], after_paths),
+        repo=repo, revisions=revisions, fixture_commit=fixture_commit,
+        rule_paths={"before": before_paths, "after": after_paths},
+    )
+
+
 def comparison_rule_bytes(sources, rule_format):
     if rule_format == "kubernetes":
         from kubernetes_rules import convert_manifests
@@ -1378,15 +1437,15 @@ def timeline_delay_result(group, baseline, candidate, max_delay):
     }
 
 
-def build_timeline_report(args):
-    fixture = load_replay_fixture(args.fixture, args.fixture.read_bytes(), None, None)
+def build_timeline_report(args, sources):
+    fixture, = load_replay_fixtures([args.fixture], args.capture_summary, sources.repo, sources.fixture_commit)
     start, end = duration_ms(args.start), duration_ms(args.end)
     max_delay = duration_ms(args.max_delay) if args.max_delay is not None else None
     probes, group_numbers, evaluation = timeline_probes(
         fixture, args.alertname, start, end, probe_from_zero=max_delay is not None,
     )
-    before_rules = comparison_rule_bytes(read_rule_sources(args.before), args.rule_format)
-    after_rules = comparison_rule_bytes(read_rule_sources(args.after), args.rule_format)
+    before_rules = comparison_rule_bytes(sources.before, args.rule_format)
+    after_rules = comparison_rule_bytes(sources.after, args.rule_format)
     promtool = require_promtool(args.promtool)
     with TemporaryDirectory() as temporary:
         path = Path(temporary)
@@ -1408,7 +1467,7 @@ def build_timeline_report(args):
             gate_groups.append(timeline_delay_result(number, before_offsets, after_offsets, max_delay))
     report = {
         "schema_version": 1,
-        "fixture_path": str(args.fixture),
+        "fixture_path": str(fixture.path),
         "alertname": args.alertname,
         "evaluation_interval_ms": evaluation,
         "start_offset_ms": start,
@@ -1424,6 +1483,16 @@ def build_timeline_report(args):
             "checked_groups": checked,
             "groups": gate_groups,
         }
+    if sources.revisions is not None:
+        before_commit, after_commit = sources.revisions
+        report["commits"] = {"before": before_commit, "after": after_commit}
+        report["rule_files"] = sources.rule_paths
+    if sources.fixture_commit is not None:
+        report["fixture_commit"] = sources.fixture_commit
+    if fixture.sha256 is not None:
+        report["fixture_sha256"] = fixture.sha256
+    if fixture.capture_summary is not None:
+        report["capture_summary"] = str(fixture.capture_summary)
     return report
 
 
@@ -1465,6 +1534,17 @@ def print_timeline_gate(gate, end):
 def print_timeline_report(report):
     print("## Prometheus alert firing timeline\n")
     print(f"{markdown_code(report['alertname'])} in {markdown_code(report['fixture_path'])}.\n")
+    if commits := report.get("commits"):
+        for side in ("before", "after"):
+            paths = ", ".join(markdown_code(path) for path in report["rule_files"][side])
+            print(f"{side.title()} rules from Git commit `{commits[side]}` ({paths}).\n")
+    if fixture_commit := report.get("fixture_commit"):
+        print(f"Loaded the fixture from Git commit `{fixture_commit}`.\n")
+    if checksum := report.get("fixture_sha256"):
+        if summary := report.get("capture_summary"):
+            print(f"Verified fixture SHA-256 `{checksum}` against {markdown_code(summary)}.\n")
+        else:
+            print(f"Fixture SHA-256 `{checksum}`.\n")
     start = as_duration(report["start_offset_ms"])
     end = as_duration(report["end_offset_ms"])
     step = as_duration(report["evaluation_interval_ms"])
@@ -1495,23 +1575,25 @@ def timeline_main(argv):
         description="Compare firing offsets and intervals from the same incident fixture.",
     )
     parser.add_argument("fixture", type=Path, help="test fixture generated by this CLI")
-    parser.add_argument("--before", type=Path, action="append", required=True, help="baseline rule file (repeatable)")
-    parser.add_argument("--after", type=Path, action="append", required=True, help="proposed rule file (repeatable)")
+    add_rule_comparison_options(parser)
+    parser.add_argument(
+        "--capture-summary", type=Path, action="append",
+        help="verify the fixture hash against this capture summary",
+    )
     parser.add_argument("--alertname", required=True, help="alert name from the fixture's checkpoints")
     parser.add_argument("--start", default="0s", metavar="DURATION", help="first offset to observe (default: 0s)")
     parser.add_argument("--end", required=True, metavar="DURATION", help="last offset to observe (inclusive)")
     parser.add_argument("--max-delay", metavar="DURATION", help="gate the first proposed firing against the baseline from 0s")
-    parser.add_argument(
-        "--rule-format", choices=("prometheus", "kubernetes"), default="prometheus",
-        help="input rule format for both versions (default: prometheus)",
-    )
     parser.add_argument("--promtool", default="promtool", help="promtool executable or path")
     parser.add_argument("--format", choices=("markdown", "json"), default="markdown", help="report format (default: markdown)")
     args = parser.parse_args(argv)
     if not args.alertname.strip():
         parser.error("--alertname must not be empty")
+    if args.capture_summary is not None and len(args.capture_summary) != 1:
+        parser.error("provide only one --capture-summary for the timeline fixture")
     try:
-        report = build_timeline_report(args)
+        sources = load_comparison_rules(parser, args)
+        report = build_timeline_report(args, sources)
     except (OSError, ValueError, TypeError) as exc:
         parser.exit(2, f"error: {exc}\n")
     if args.format == "json":
@@ -1528,69 +1610,24 @@ def compare_main(argv):
         description="Compare two rulesets against identical captured samples and alert expectations.",
     )
     parser.add_argument("fixtures", metavar="fixture", type=Path, nargs="+", help="test fixtures generated by this CLI")
-    parser.add_argument("--before", type=Path, action="append", help="baseline rule file (repeatable)")
-    parser.add_argument("--after", type=Path, action="append", help="proposed rule file (repeatable)")
-    parser.add_argument("--before-ref", help="baseline Git ref or commit")
-    parser.add_argument("--after-ref", help="proposed Git ref or commit")
-    parser.add_argument("--rule-file", action="append", help="repository-root-relative path present in both commits (repeatable)")
-    parser.add_argument("--before-rule-file", action="append", help="repository-root-relative rule path at --before-ref (repeatable)")
-    parser.add_argument("--after-rule-file", action="append", help="repository-root-relative rule path at --after-ref (repeatable)")
-    parser.add_argument("--repo", type=Path, help="Git repository for ref comparison (default: current directory)")
-    parser.add_argument("--fixture-ref", help="read fixtures and capture summaries from this Git ref (Git comparison only)")
+    add_rule_comparison_options(parser)
     parser.add_argument(
         "--capture-summary", type=Path, action="append",
         help="verify the fixture hash against this capture summary (one per fixture, in the same order)",
     )
-    parser.add_argument(
-        "--rule-format", choices=("prometheus", "kubernetes"), default="prometheus",
-        help="input rule format for both versions (default: prometheus)",
-    )
     add_comparison_report_options(parser)
     args = parser.parse_args(argv)
-    scoped_paths = args.before_rule_file is not None or args.after_rule_file is not None
-    git_mode = scoped_paths or any(value is not None for value in (args.before_ref, args.after_ref, args.rule_file, args.repo))
-    if args.fixture_ref is not None and not git_mode:
-        parser.error("--fixture-ref requires Git rule comparison")
     if args.capture_summary is not None and len(args.capture_summary) != len(args.fixtures):
         parser.error("provide one --capture-summary per incident fixture, in the same order")
-    if git_mode and (args.before or args.after):
-        parser.error("choose either --before and --after or Git ref comparison options")
-    if git_mode and not (args.before_ref and args.after_ref):
-        parser.error("Git comparison requires --before-ref and --after-ref")
-    if scoped_paths and args.rule_file:
-        parser.error("choose either --rule-file or the --before-rule-file and --after-rule-file lists")
-    if scoped_paths and not (args.before_rule_file and args.after_rule_file):
-        parser.error("provide both --before-rule-file and --after-rule-file lists")
-    if git_mode and not (scoped_paths or args.rule_file):
-        parser.error("provide --rule-file or both --before-rule-file and --after-rule-file lists")
-    if not git_mode and not (args.before and args.after):
-        parser.error("file comparison requires both --before and --after")
     try:
-        repo = None
-        revisions = None
-        fixture_commit = None
-        rule_paths = None
-        if git_mode:
-            repo = args.repo or Path.cwd()
-            revisions = (resolve_commit(repo, args.before_ref), resolve_commit(repo, args.after_ref))
-            if args.fixture_ref is not None:
-                fixture_commit = resolve_commit(repo, args.fixture_ref)
-            baseline_paths = args.before_rule_file if scoped_paths else args.rule_file
-            candidate_paths = args.after_rule_file if scoped_paths else args.rule_file
-            before = read_committed_rules(repo, revisions[0], baseline_paths)
-            after = read_committed_rules(repo, revisions[1], candidate_paths)
-            if scoped_paths:
-                rule_paths = {"before": baseline_paths, "after": candidate_paths}
-        else:
-            before = read_rule_sources(args.before)
-            after = read_rule_sources(args.after)
-        fixtures = load_replay_fixtures(args.fixtures, args.capture_summary, repo, fixture_commit)
-        before_rules = comparison_rule_bytes(before, args.rule_format)
-        after_rules = comparison_rule_bytes(after, args.rule_format)
+        sources = load_comparison_rules(parser, args)
+        fixtures = load_replay_fixtures(args.fixtures, args.capture_summary, sources.repo, sources.fixture_commit)
+        before_rules = comparison_rule_bytes(sources.before, args.rule_format)
+        after_rules = comparison_rule_bytes(sources.after, args.rule_format)
         return compare(
-            fixtures, [before_rules] * len(fixtures), after_rules, args.promtool, revisions=revisions,
-            gate=args.gate, json_report=args.json_report, fixture_commit=fixture_commit, junit_report=args.junit_report,
-            rule_paths=rule_paths,
+            fixtures, [before_rules] * len(fixtures), after_rules, args.promtool, revisions=sources.revisions,
+            gate=args.gate, json_report=args.json_report, fixture_commit=sources.fixture_commit,
+            junit_report=args.junit_report, rule_paths=sources.rule_paths if args.before_rule_file else None,
         )
     except (OSError, ValueError, TypeError) as exc:
         parser.exit(2, f"error: {exc}\n")

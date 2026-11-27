@@ -14,6 +14,8 @@ bash scripts/demo.sh
 
 The demo replays synthetic payment metrics without a Prometheus server. It checks that the alert stays quiet before the outage and is firing five minutes after it starts. The original rule matches **1/2** checkpoints. The revised rule matches **2/2** and passes the check.
 
+Use `timeline` to compare when the alert first fires at two Git commits and fail CI if the proposed rule exceeds a delay limit. [Git-backed timing check](#git-커밋의-룰로-타임라인-재생)
+
 Use Python 3.10+ and `promtool` 3.9+. With no local `promtool`, the demo downloads and verifies a pinned binary on Linux x64. Set `PROMTOOL=/path/to/promtool` to use a specific executable.
 
 Commit a fixture for your own incident, compare rule changes between Git refs, and add the same check to CI. Detailed examples are available in Korean. [Capture an incident](#내-prometheus로-실행) · [Plan capture selectors](#캡처할-시계열-계획) · [Raw metric snapshot](#원본-시계열-스냅샷) · [Bundle an incident](#장애-재현-번들) · [Inspect sample gaps](#시계열-표본-간격-확인) · [Alertmanager webhook](#alertmanager-웹훅으로-기대-동작-만들기) · [Native Prometheus rules](#룰-변경-전후-비교) · [Git ref comparison](#git-커밋으로-비교) · [Kubernetes PrometheusRule](#kubernetes-prometheusrule로-테스트) · [GitHub Action](#github-actions에서-pr-검사)
@@ -110,6 +112,23 @@ python3 incident_to_promtool.py timeline demo/generated/after.test.yml \
 `--max-delay`와 `--format json`을 같이 사용하면 JSON의 `gate`에 `mode`(`max-delay`), `max_delay_ms`, `passed`, `checked_groups`, `groups`가 들어갑니다. `groups`의 각 항목은 `group`, `status`, `before_first_firing_offset_ms`, `after_first_firing_offset_ms`, `first_firing_delta_ms`를 기록합니다. 이 시점과 차이는 `0s`부터 관측한 결과입니다. `status`는 `passed`, `delayed`, `missing_after`, `no_baseline` 중 하나입니다.
 
 종료 코드는 게이트 없이 보고를 완료했거나 게이트를 통과했을 때 `0`, 게이트 실패 `1`, 입력 또는 실행 오류 `2`입니다.
+
+#### Git 커밋의 룰로 타임라인 재생
+
+`timeline`에서도 `--before-ref`와 `--after-ref`를 지정해 각 커밋의 룰을 읽을 수 있습니다. 두 커밋의 공통 경로를 `--rule-file`로 제공하거나, `--before-rule-file`과 `--after-rule-file`로 양쪽 목록을 각각 제공합니다. 룰 경로는 저장소 루트 기준이며 각 옵션을 반복할 수 있습니다. `--repo DIR`을 생략하면 현재 디렉터리의 Git 저장소를 사용합니다.
+
+`--fixture-ref`를 지정하면 그 커밋에서 테스트 파일과 선택한 `--capture-summary` 파일 한 개를 읽습니다. 두 경로는 저장소 루트 기준입니다. `--fixture-ref`를 생략하면 현재 디렉터리 기준의 로컬 경로나 절대 경로를 사용합니다. 캡처 요약을 제공하면 테스트 파일의 SHA-256을 검증합니다.
+
+```sh
+python3 incident_to_promtool.py timeline tests/fixtures/payment.test.yml \
+  --before-ref 'HEAD^1' --after-ref HEAD --rule-file prometheus/payment.rules.yml \
+  --fixture-ref 'HEAD^1' --capture-summary tests/fixtures/payment.capture.json \
+  --alertname PaymentErrorsHigh --end 10m --max-delay 1m --format json
+```
+
+룰을 읽는 두 Git ref와 선택한 테스트 ref를 로컬에 가져와야 합니다. GitHub Actions에서는 `fetch-depth: 0`으로 필요한 이력을 가져올 수 있습니다. PR의 두 커밋을 직접 비교하려면 `github.event.pull_request.base.sha`와 `github.event.pull_request.head.sha`를 기준 및 수정 ref로 사용합니다.
+
+Git 리포트는 확정된 커밋 ID와 사용한 룰 경로를 기록합니다. JSON에서는 `commits`와 `rule_files`로 확인할 수 있습니다. `--fixture-ref`는 `fixture_commit`을, `--capture-summary`는 검증한 요약의 경로 `capture_summary`를 추가합니다. 둘 중 하나를 지정하면 테스트의 해시 `fixture_sha256`도 포함합니다.
 
 ### JSON 리포트
 

@@ -60,15 +60,38 @@ jobs:
           "$cli" timeline payment.test.yml --before "$demo/before.rules.yml" --after "$demo/after.rules.yml" \
             --alertname PaymentErrorsHigh --end 10m --max-delay 0s \
             --format json --promtool "$RUNNER_TEMP/promtool" > timeline.json
+
+          timeline_repo="$smoke/timeline-repo"
+          git init --quiet "$timeline_repo"
+          git -C "$timeline_repo" config user.name 'Integration Test'
+          git -C "$timeline_repo" config user.email 'test@example.invalid'
+          cp payment.test.yml summary.json "$timeline_repo/"
+          cp "$demo/kubernetes/after.yml" "$timeline_repo/fast rules.yml"
+          git -C "$timeline_repo" add --all
+          git -C "$timeline_repo" commit --quiet -m 'Capture an incident with the fast rule'
+          rm -- "$timeline_repo/fast rules.yml" "$timeline_repo/summary.json"
+          printf 'invalid fixture\n' > "$timeline_repo/payment.test.yml"
+          cp "$demo/kubernetes/before.yml" "$timeline_repo/slow rules.yml"
+          git -C "$timeline_repo" add --all
+          git -C "$timeline_repo" commit --quiet -m 'Propose a slower rule'
+          rm -- "$timeline_repo/slow rules.yml"
+
           timeline_status=0
-          "$cli" timeline payment.test.yml --before "$demo/after.rules.yml" --after "$demo/before.rules.yml" \
-            --alertname PaymentErrorsHigh --start 9m --end 10m --max-delay 1m \
-            --format json --promtool "$RUNNER_TEMP/promtool" > timeline-regression.json || timeline_status=$?
+          (
+            cd "$timeline_repo"
+            "$cli" timeline payment.test.yml --before-ref HEAD^1 --after-ref HEAD \
+              --before-rule-file 'fast rules.yml' --after-rule-file 'slow rules.yml' --rule-format kubernetes \
+              --fixture-ref HEAD^1 --capture-summary summary.json \
+              --alertname PaymentErrorsHigh --start 9m --end 10m --max-delay 1m \
+              --format json --promtool "$RUNNER_TEMP/promtool"
+          ) > timeline-regression.json || timeline_status=$?
           [[ "$timeline_status" -eq 1 ]]
-          "$smoke/venv/bin/python" - <<'PY'
+          "$smoke/venv/bin/python" - "$timeline_repo" <<'PY'
           import hashlib
           import json
           from pathlib import Path
+          import subprocess
+          import sys
 
           coverage = json.loads(Path("coverage.json").read_text(encoding="utf-8"))
           assert coverage["gate"] == {"max_gap_ms": 30_000, "passed": True}
@@ -93,6 +116,13 @@ jobs:
 
           regression = json.loads(Path("timeline-regression.json").read_text(encoding="utf-8"))
           assert regression["schema_version"] == 1
+          repo = Path(sys.argv[1])
+          before, after = subprocess.check_output(["git", "rev-parse", "HEAD^1", "HEAD"], cwd=repo, text=True).splitlines()
+          assert regression["commits"] == {"before": before, "after": after}
+          assert regression["rule_files"] == {"before": ["fast rules.yml"], "after": ["slow rules.yml"]}
+          assert regression["fixture_commit"] == before
+          assert regression["fixture_sha256"] == summary["fixture_sha256"]
+          assert regression["capture_summary"] == "summary.json"
           visible, = regression["groups"]
           assert visible["first_firing_delta_ms"] == 30_000
           assert regression["gate"] == {
