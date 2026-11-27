@@ -352,9 +352,10 @@ class PrometheusTLSIntegrationTests(unittest.TestCase):
 
     def test_all_capture_commands_authenticate_with_a_client_certificate(self):
         with self.server(certificate=self.leaf, require_client=True) as (url, requests, connections):
+            # Closing the rejected TLS socket can surface as a TCP reset.
             self.assert_failed(
                 self.invoke("snapshot", "no client cert.json", url=url, ca=self.ca), 1,
-                r"(?i)certificate|handshake|eof",
+                r"(?i)certificate|handshake|eof|connection reset by peer",
             )
             self.assertEqual(requests, [])
             self.assertEqual(len(connections), 1)
