@@ -281,38 +281,82 @@ def prometheus_json(base_url, endpoint, params, *, post=False, bearer_token=None
 def prometheus_base_url(value):
     base_url = value.rstrip("/")
     url = urlsplit(base_url)
-    if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password or url.query or url.fragment:
+    if (url.scheme not in ("http", "https") or not url.hostname
+            or url.username is not None or url.password is not None or url.query or url.fragment):
         raise ValueError("use an HTTP(S) Prometheus base URL without credentials, query, or fragment")
     return base_url
 
 
-class HTTPSOnlyRedirectHandler(HTTPRedirectHandler):
+def https_origin(url):
+    port = url.port
+    return url.hostname, port if port is not None else 443
+
+
+class PrometheusTLSRedirectHandler(HTTPRedirectHandler):
+    def __init__(self, client_origin=None):
+        super().__init__()
+        self.client_origin = client_origin
+
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if urlsplit(newurl).scheme != "https":
+        try:
+            target = urlsplit(newurl)
+            if target.scheme != "https":
+                option = "--client-cert-file" if self.client_origin is not None else "--ca-file"
+                raise ValueError(f"Prometheus redirects must stay on HTTPS with {option}")
+            if self.client_origin is not None and (
+                target.username is not None or target.password is not None or https_origin(target) != self.client_origin
+            ):
+                raise ValueError("Prometheus redirects must stay on the same HTTPS origin with a client certificate")
+        except ValueError:
             fp.close()
-            raise ValueError("Prometheus redirects must stay on HTTPS with --ca-file")
+            raise
         return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def reject_encrypted_client_key():
+    raise ValueError("Prometheus client key must be unencrypted PEM")
+
+
+def prometheus_tls_opener(args, base_url):
+    url = urlsplit(base_url)
+    use_client_certificate = args.client_cert_file is not None
+    option = "--client-cert-file" if use_client_certificate else "--ca-file"
+    if url.scheme != "https":
+        raise ValueError(f"{option} requires an HTTPS Prometheus URL")
+    client_origin = https_origin(url) if use_client_certificate else None
+    try:
+        import ssl
+        from urllib.request import HTTPSHandler
+    except ImportError:
+        raise ValueError(f"{option} requires Python SSL support") from None
+    context = ssl.create_default_context()
+    if args.ca_file is not None:
+        try:
+            context.load_verify_locations(cafile=str(args.ca_file))
+        except OSError as exc:
+            raise ValueError(f"could not load Prometheus CA file {args.ca_file}: {exc.strerror}") from None
+    if use_client_certificate:
+        try:
+            context.load_cert_chain(
+                certfile=str(args.client_cert_file),
+                keyfile=str(args.client_key_file),
+                password=reject_encrypted_client_key,
+            )
+        except OSError as exc:
+            raise ValueError(
+                f"could not load Prometheus client certificate {args.client_cert_file} and key "
+                f"{args.client_key_file}: {exc.strerror}"
+            ) from None
+    if ssl.HAS_ALPN:
+        context.set_alpn_protocols(["http/1.1"])
+    return build_opener(HTTPSHandler(context=context), PrometheusTLSRedirectHandler(client_origin)).open
 
 
 def prometheus_client(args):
     base_url = prometheus_base_url(args.prometheus_url)
     open_request = urlopen
-    if args.ca_file is not None:
-        if urlsplit(base_url).scheme != "https":
-            raise ValueError("--ca-file requires an HTTPS Prometheus URL")
-        try:
-            import ssl
-            from urllib.request import HTTPSHandler
-        except ImportError:
-            raise ValueError("--ca-file requires Python SSL support") from None
-        context = ssl.create_default_context()
-        try:
-            context.load_verify_locations(cafile=str(args.ca_file))
-        except OSError as exc:
-            raise ValueError(f"could not load Prometheus CA file {args.ca_file}: {exc.strerror}") from None
-        if ssl.HAS_ALPN:
-            context.set_alpn_protocols(["http/1.1"])
-        open_request = build_opener(HTTPSHandler(context=context), HTTPSOnlyRedirectHandler()).open
+    if args.ca_file is not None or args.client_cert_file is not None:
+        open_request = prometheus_tls_opener(args, base_url)
     bearer_token = load_prometheus_bearer_token(args.bearer_token_file)
 
     def request_json(endpoint, params, *, post=False):
@@ -2130,15 +2174,21 @@ def add_prometheus_connection_options(parser):
         "--bearer-token-file", type=Path, help="read a Prometheus Bearer token from a file instead of PROMETHEUS_BEARER_TOKEN",
     )
     parser.add_argument("--ca-file", type=Path, help="trust this additional PEM CA bundle for a live HTTPS Prometheus URL")
+    parser.add_argument("--client-cert-file", type=Path, help="PEM client certificate chain for live HTTPS Prometheus requests")
+    parser.add_argument("--client-key-file", type=Path, help="unencrypted PEM private key for --client-cert-file")
 
 
 def parse_capture_args(parser, argv=None):
     args = parser.parse_args(argv)
+    if (args.client_cert_file is None) != (args.client_key_file is None):
+        parser.error("--client-cert-file and --client-key-file must be provided together")
     if args.prometheus_url is None:
         if args.bearer_token_file is not None:
             parser.error("--bearer-token-file requires --prometheus-url")
         if args.ca_file is not None:
             parser.error("--ca-file requires --prometheus-url")
+        if args.client_cert_file is not None:
+            parser.error("--client-cert-file and --client-key-file require --prometheus-url")
     return args
 
 
@@ -2197,7 +2247,7 @@ def plan_capture_main(argv):
     parser.add_argument("--alertname", required=True, action="append", help="alert rule name (repeatable)")
     parser.add_argument("--prometheus-url", required=True, help="Prometheus server providing /api/v1/parse_query")
     add_prometheus_connection_options(parser)
-    args = parser.parse_args(argv)
+    args = parse_capture_args(parser, argv)
     if any(not name.strip() for name in args.alertname):
         parser.error("--alertname must not be empty")
     from capture_planner import plan_capture

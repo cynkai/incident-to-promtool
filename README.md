@@ -476,6 +476,23 @@ python3 incident_to_promtool.py snapshot incident.json \
 
 `--ca-file`을 쓰면 HTTPS 리디렉션 대상의 인증서도 검증하며, HTTP로 향하는 리디렉션은 오류로 처리합니다. `urllib`은 원래 요청에만 인증 헤더를 붙이므로 `--prometheus-url`에는 최종 Prometheus HTTPS 기본 URL을 지정하세요.
 
+#### 클라이언트 인증서로 연결 (mTLS)
+
+클라이언트 인증을 요구하는 Prometheus에는 HTTPS `--prometheus-url`과 함께 `--client-cert-file PATH` 및 `--client-key-file PATH`를 지정합니다. 두 옵션은 함께 사용해야 합니다. 앞의 다섯 라이브 명령에서 지원하며, 파일에는 각각 PEM 인증서 체인과 암호화되지 않은 PEM 개인 키를 넣습니다. 서버 인증서와 호스트 이름도 검증합니다. 필요에 따라 `--ca-file`이나 `--bearer-token-file`을 추가할 수 있습니다.
+
+아래는 클라이언트 인증서와 키를 읽기 전용 Kubernetes Secret으로 마운트한 예입니다.
+
+```sh
+python3 incident_to_promtool.py snapshot incident.json \
+  --prometheus-url https://prometheus.example.com \
+  --ca-file /etc/prometheus/tls/ca.crt \
+  --client-cert-file /var/run/secrets/prometheus-client/tls.crt \
+  --client-key-file /var/run/secrets/prometheus-client/tls.key \
+  --output incident.matrix.json
+```
+
+mTLS를 쓰면 리디렉션은 원래 URL과 HTTPS 스킴, 호스트, 포트가 같을 때만 따릅니다. Bearer 토큰도 사용하는 경우 `--prometheus-url`에 최종 HTTPS 기본 URL을 지정하세요.
+
 ### 캡처할 시계열 계획
 
 `plan-capture`는 알람 룰에 필요한 원본 시계열 선택자를 찾아줍니다. 저장소 루트의 Python 가상 환경에서 실행합니다.
