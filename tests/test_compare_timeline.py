@@ -203,14 +203,6 @@ exec {real_promtool} "$@"
                 for path in (marker, machine, junit):
                     self.assertFalse(path.exists(), f"failed preflight should not create {path.name}")
 
-    def test_compare_bundle_does_not_accept_compare_timing_options(self):
-        result = self.cli("compare-bundle", "archived.zip", "--after", FAST, *self.timing())
-
-        self.assertEqual(result.returncode, 2, f"{result.stdout}\n{result.stderr}")
-        self.assertEqual(result.stdout, "")
-        self.assertIn("unrecognized arguments", result.stderr)
-        self.assertIn("--timeline-alertname", result.stderr)
-
 
 if __name__ == "__main__":
     unittest.main()

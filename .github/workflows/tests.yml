@@ -542,6 +542,9 @@ jobs:
             rules/bundle candidate regressed.yml
           rule-format: kubernetes
           gate: regressions
+          timeline-alertname: PaymentErrorsHigh
+          timeline-end: 10m
+          timeline-max-delay: 1m
       - name: Check the bundle regression against the committed baseline
         env:
           OUTCOME: ${{ steps.bundled-refs.outcome }}
@@ -549,12 +552,14 @@ jobs:
           JSON_REPORT_PATH: ${{ steps.bundled-refs.outputs.json-report-path }}
           JUNIT_REPORT_PATH: ${{ steps.bundled-refs.outputs.junit-report-path }}
           NEWLY_FAILED: ${{ steps.bundled-refs.outputs.newly-failed }}
+          TIMELINE_PASSED: ${{ steps.bundled-refs.outputs.timeline-passed }}
         run: |
           [[ "$OUTCOME" == failure ]]
           report=$(cat "$REPORT_PATH")
           [[ "$report" == *'| Before | Passed | 2/2 |'* ]]
           [[ "$report" == *'| After | Failed | 1/2 |'* ]]
           [[ "$NEWLY_FAILED" == '1' ]]
+          [[ "$report" == *'Timing gate `max-delay 60s` **Failed**'* && "$TIMELINE_PASSED" == false ]]
           python3 - <<'PY'
           import json
           import os
@@ -571,8 +576,23 @@ jobs:
           assert report["summary"]["before"] == {"matched": 2, "total": 2}
           assert report["summary"]["after"] == {"matched": 1, "total": 2}
           assert report["summary"]["newly_failed"] == 1
+
+          timeline = report["timeline"]
+          assert timeline["bundle"] == report["bundle"]
+          assert timeline["baseline_source"] == "rules" and timeline["rule_files"] == report["rule_files"]
+          assert timeline["fixture_commit"] == report["commits"]["before"]
+          gate = timeline["gate"]
+          assert gate["max_delay_ms"] == 60_000 and gate["passed"] is False
+          group, = gate["groups"]
+          assert group["status"] == "delayed" and group["first_firing_delta_ms"] == 240_000
+          assert group["before_first_firing_offset_ms"] == 330_000
+          assert group["after_first_firing_offset_ms"] == 570_000
+
           junit = ElementTree.parse(os.environ["JUNIT_REPORT_PATH"]).getroot()
-          assert len(junit.findall("testsuite/testcase/failure")) == 1
+          assert junit.attrib["tests"] == "3" and junit.attrib["failures"] == "2"
+          assert len(junit.findall("testsuite/testcase/failure")) == 2
+          failure = junit.find("testsuite[@name='Alert firing delay']/testcase/failure")
+          assert failure is not None and failure.attrib["type"] == "max-delay"
           PY
       - name: Compare two committed bundles to a proposed Kubernetes rule
         id: bundled-batch
@@ -585,20 +605,28 @@ jobs:
           rule-files: |
             rules/payment candidate.yml
           rule-format: kubernetes
+          timeline-alertname: PaymentErrorsHigh
+          timeline-end: 10m
+          timeline-max-delay: 0s
+          timeline-bundle: incidents/alternative baseline.zip
       - name: Check the committed bundle batch comparison
         env:
           REPORT_PATH: ${{ steps.bundled-batch.outputs.report-path }}
           JSON_REPORT_PATH: ${{ steps.bundled-batch.outputs.json-report-path }}
+          JUNIT_REPORT_PATH: ${{ steps.bundled-batch.outputs.junit-report-path }}
           NEWLY_FAILED: ${{ steps.bundled-batch.outputs.newly-failed }}
+          TIMELINE_PASSED: ${{ steps.bundled-batch.outputs.timeline-passed }}
         run: |
           report=$(cat "$REPORT_PATH")
           [[ "$report" == *'| Before | Failed | 3/4 |'* ]]
           [[ "$report" == *'| After | Passed | 4/4 |'* ]]
           [[ "$NEWLY_FAILED" == '0' ]]
+          [[ "$report" == *'Timing gate `max-delay 0s` **Passed**'* && "$TIMELINE_PASSED" == true ]]
           python3 - <<'PY'
           import json
           import os
           from pathlib import Path
+          from xml.etree import ElementTree
 
           report = json.loads(Path(os.environ["JSON_REPORT_PATH"]).read_text(encoding="utf-8"))
           paths = ["incidents/payment baseline.zip", "incidents/alternative baseline.zip"]
@@ -608,4 +636,21 @@ jobs:
           assert [fixture["before"] for fixture in fixtures] == [{"matched": 1, "total": 2}, {"matched": 2, "total": 2}]
           assert all(fixture["after"] == {"matched": 2, "total": 2} for fixture in fixtures)
           assert report["summary"]["newly_failed"] == 0
+
+          timeline = report["timeline"]
+          assert timeline["bundle"] == report["bundles"][1]
+          assert timeline["fixture_path"] == fixtures[1]["path"]
+          assert timeline["baseline_source"] == "bundle"
+          assert timeline["fixture_commit"] == report["commits"]["before"]
+          assert timeline["rule_files"] == {"before": ["rules/rules-1.yml"], "after": ["rules/payment candidate.yml"]}
+          gate = timeline["gate"]
+          assert gate["max_delay_ms"] == 0 and gate["passed"] is True
+          group, = gate["groups"]
+          assert group["status"] == "passed" and group["first_firing_delta_ms"] == 0
+          assert group["before_first_firing_offset_ms"] == group["after_first_firing_offset_ms"] == 330_000
+
+          junit = ElementTree.parse(os.environ["JUNIT_REPORT_PATH"]).getroot()
+          assert junit.attrib["tests"] == "5" and junit.attrib["failures"] == "0"
+          timing_cases = junit.findall("testsuite[@name='Alert firing delay']/testcase")
+          assert len(timing_cases) == 1 and timing_cases[0].find("failure") is None
           PY

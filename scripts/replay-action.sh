@@ -44,12 +44,23 @@ timeline_alertname=${INCIDENT_TIMELINE_ALERTNAME:-}
 timeline_end=${INCIDENT_TIMELINE_END:-}
 timeline_max_delay=${INCIDENT_TIMELINE_MAX_DELAY:-}
 timeline_fixture=${INCIDENT_TIMELINE_FIXTURE:-}
+timeline_bundle=${INCIDENT_TIMELINE_BUNDLE:-}
+bundle_mode=0
+if [[ -n "$bundle" || -n "${bundle_paths[0]:-}" ]]; then
+    bundle_mode=1
+fi
+if [[ "$bundle_mode" -eq 1 && -n "$timeline_fixture" ]]; then
+    printf 'timeline-fixture requires fixture or fixtures.\n' >&2
+    exit 2
+fi
+if [[ "$bundle_mode" -eq 0 && -n "$timeline_bundle" ]]; then
+    printf 'timeline-bundle requires bundle or bundles.\n' >&2
+    exit 2
+fi
+
 timeline_enabled=0
-if [[ -n "$timeline_alertname" || -n "$timeline_end" || -n "$timeline_max_delay" || -n "$timeline_fixture" ]]; then
-    if [[ -n "$bundle" || -n "${bundle_paths[0]:-}" ]]; then
-        printf 'Timeline inputs require fixture or fixtures.\n' >&2
-        exit 2
-    fi
+if [[ -n "$timeline_alertname" || -n "$timeline_end" || -n "$timeline_max_delay" ||
+      -n "$timeline_fixture" || -n "$timeline_bundle" ]]; then
     if [[ ! "$timeline_alertname" =~ [^[:space:]] || ! "$timeline_end" =~ [^[:space:]] ||
           ! "$timeline_max_delay" =~ [^[:space:]] ]]; then
         printf 'Provide timeline-alertname, timeline-end, and timeline-max-delay together.\n' >&2
@@ -58,7 +69,7 @@ if [[ -n "$timeline_alertname" || -n "$timeline_end" || -n "$timeline_max_delay"
     timeline_enabled=1
 fi
 
-if [[ -n "$bundle" || -n "${bundle_paths[0]:-}" ]]; then
+if [[ "$bundle_mode" -eq 1 ]]; then
     if [[ -n "$fixture_ref" || -n "$capture_summaries" ]]; then
         printf 'fixture-ref and capture-summaries require fixture or fixtures.\n' >&2
         exit 2
@@ -109,6 +120,8 @@ if [[ "$timeline_enabled" -eq 1 ]]; then
         --timeline-max-delay="$timeline_max_delay")
     if [[ -n "$timeline_fixture" ]]; then
         comparison_arguments+=(--timeline-fixture="$timeline_fixture")
+    elif [[ -n "$timeline_bundle" ]]; then
+        comparison_arguments+=(--timeline-bundle="$timeline_bundle")
     fi
 fi
 

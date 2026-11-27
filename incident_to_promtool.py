@@ -1275,7 +1275,8 @@ def compare(
     replay_fixtures = fixtures
     if timeline is not None:
         # Stage timing probes beside the checkpoint fixtures using the same rule bytes.
-        baseline = baseline_rule_sets[fixtures.index(timeline.fixture)]
+        timeline_index = fixtures.index(timeline.fixture)
+        baseline = baseline_rule_sets[timeline_index]
         replay_fixtures = [*fixtures, timeline.probes]
         baseline_rule_sets = [*baseline_rule_sets, baseline]
     with TemporaryDirectory() as temporary:
@@ -1286,7 +1287,10 @@ def compare(
     timing_report = None
     if timeline is not None:
         timing_report = build_timeline_report(timeline, before_failures.pop(), after_failures.pop())
-        add_timeline_provenance(timing_report, timeline.fixture, revisions, rule_paths, fixture_commit)
+        add_timeline_provenance(
+            timing_report, timeline.fixture, revisions, rule_paths, fixture_commit,
+            bundle=bundles[timeline_index] if bundles else None,
+        )
     report = build_comparison_report(fixtures, before_failures, after_failures, revisions, gate, fixture_commit)
     if len(bundles) == 1:
         report["bundle"] = bundles[0]
@@ -1525,10 +1529,20 @@ def build_timeline_report(timeline, before, after):
     return report
 
 
-def add_timeline_provenance(report, fixture, revisions, rule_paths, fixture_commit):
+def add_timeline_provenance(report, fixture, revisions, rule_paths, fixture_commit, *, bundle=None):
+    if bundle is not None:
+        report["bundle"] = bundle
+        if "before" in rule_paths:
+            report["baseline_source"] = "rules"
+        else:
+            report["baseline_source"] = "bundle"
+            rule_paths = {"before": bundle["rule_files"], "after": rule_paths["after"]}
+        if revisions is not None:
+            fixture_commit = revisions[0]
     if revisions is not None:
         before_commit, after_commit = revisions
         report["commits"] = {"before": before_commit, "after": after_commit}
+    if rule_paths is not None:
         report["rule_files"] = rule_paths
     if fixture_commit is not None:
         report["fixture_commit"] = fixture_commit
@@ -1576,10 +1590,15 @@ def print_timeline_gate(gate, end):
 def print_timeline_report(report):
     print("## Prometheus alert firing timeline\n")
     print(f"{markdown_code(report['alertname'])} in {markdown_code(report['fixture_path'])}.\n")
-    if commits := report.get("commits"):
+    commits = report.get("commits")
+    if rule_paths := report.get("rule_files"):
         for side in ("before", "after"):
-            paths = ", ".join(markdown_code(path) for path in report["rule_files"][side])
-            print(f"{side.title()} rules from Git commit `{commits[side]}` ({paths}).\n")
+            paths = ", ".join(markdown_code(path) for path in rule_paths[side])
+            if side == "before" and report.get("baseline_source") == "bundle":
+                location = f" in bundle {markdown_code(report['bundle']['path'])}"
+            else:
+                location = f" from Git commit `{commits[side]}`" if commits else ""
+            print(f"{side.title()} rules{location} ({paths}).\n")
     if fixture_commit := report.get("fixture_commit"):
         print(f"Loaded the fixture from Git commit `{fixture_commit}`.\n")
     if checksum := report.get("fixture_sha256"):
@@ -1658,6 +1677,42 @@ def timeline_main(argv):
     return int(gate is not None and not gate["passed"])
 
 
+def add_comparison_timeline_options(parser, source, *, path_type):
+    parser.add_argument("--timeline-alertname", help="alert to check for first-firing delay")
+    parser.add_argument("--timeline-end", metavar="DURATION", help="last offset to observe for the first-firing check")
+    parser.add_argument("--timeline-max-delay", metavar="DURATION", help="maximum allowed first-firing delay")
+    parser.add_argument(
+        f"--timeline-{source}", type=path_type,
+        help=f"one of the listed {source}s (required for timing with multiple {source}s)",
+    )
+
+
+def comparison_timeline_index(parser, args, paths, selection, source):
+    options = (args.timeline_alertname, args.timeline_end, args.timeline_max_delay)
+    if all(option is None for option in options) and selection is None:
+        return None
+    if not all(option is not None for option in options):
+        parser.error("--timeline-alertname, --timeline-end, and --timeline-max-delay are required together")
+    if not args.timeline_alertname.strip():
+        parser.error("--timeline-alertname must not be empty")
+    if selection is None:
+        if len(paths) != 1:
+            parser.error(f"--timeline-{source} is required when comparing multiple {source}s")
+        return 0
+    if selection not in paths:
+        parser.error(f"--timeline-{source} must match one of the supplied incident {source}s")
+    return paths.index(selection)
+
+
+def prepare_comparison_timeline(args, fixtures, index):
+    if index is None:
+        return None
+    return prepare_timeline(
+        fixtures[index], args.timeline_alertname, 0,
+        duration_ms(args.timeline_end), duration_ms(args.timeline_max_delay),
+    )
+
+
 def compare_main(argv):
     parser = argparse.ArgumentParser(
         prog=f"{Path(sys.argv[0]).name} compare",
@@ -1669,24 +1724,16 @@ def compare_main(argv):
         "--capture-summary", type=Path, action="append",
         help="verify the fixture hash against this capture summary (one per fixture, in the same order)",
     )
-    parser.add_argument("--timeline-alertname", help="alert to check for first-firing delay")
-    parser.add_argument("--timeline-end", metavar="DURATION", help="last offset to observe for the first-firing check")
-    parser.add_argument("--timeline-max-delay", metavar="DURATION", help="maximum allowed first-firing delay")
-    parser.add_argument("--timeline-fixture", type=Path, help="one of the listed fixtures (required for timing with multiple fixtures)")
+    add_comparison_timeline_options(parser, "fixture", path_type=Path)
     add_comparison_report_options(parser)
     args = parser.parse_args(argv)
     if args.capture_summary is not None and len(args.capture_summary) != len(args.fixtures):
         parser.error("provide one --capture-summary per incident fixture, in the same order")
-    timing_index = comparison_timeline_index(parser, args)
+    timing_index = comparison_timeline_index(parser, args, args.fixtures, args.timeline_fixture, "fixture")
     try:
         sources = load_comparison_rules(parser, args)
         fixtures = load_replay_fixtures(args.fixtures, args.capture_summary, sources.repo, sources.fixture_commit)
-        timeline = None
-        if timing_index is not None:
-            timeline = prepare_timeline(
-                fixtures[timing_index], args.timeline_alertname, 0,
-                duration_ms(args.timeline_end), duration_ms(args.timeline_max_delay),
-            )
+        timeline = prepare_comparison_timeline(args, fixtures, timing_index)
         before_rules = comparison_rule_bytes(sources.before, args.rule_format)
         after_rules = comparison_rule_bytes(sources.after, args.rule_format)
         return compare(
@@ -1697,23 +1744,6 @@ def compare_main(argv):
         )
     except (OSError, ValueError, TypeError) as exc:
         parser.exit(2, f"error: {exc}\n")
-
-
-def comparison_timeline_index(parser, args):
-    options = (args.timeline_alertname, args.timeline_end, args.timeline_max_delay)
-    if all(option is None for option in options) and args.timeline_fixture is None:
-        return None
-    if not all(option is not None for option in options):
-        parser.error("--timeline-alertname, --timeline-end, and --timeline-max-delay are required together")
-    if not args.timeline_alertname.strip():
-        parser.error("--timeline-alertname must not be empty")
-    if args.timeline_fixture is None:
-        if len(args.fixtures) != 1:
-            parser.error("--timeline-fixture is required when comparing multiple fixtures")
-        return 0
-    if args.timeline_fixture not in args.fixtures:
-        parser.error("--timeline-fixture must match one of the supplied incident fixtures")
-    return args.fixtures.index(args.timeline_fixture)
 
 
 def compare_bundle_main(argv):
@@ -1734,6 +1764,7 @@ def compare_bundle_main(argv):
         "--rule-format", choices=("prometheus", "kubernetes"), default="prometheus",
         help="input format of explicitly supplied rule files (default: prometheus)",
     )
+    add_comparison_timeline_options(parser, "bundle", path_type=str)
     add_comparison_report_options(parser)
     args = parser.parse_args(argv)
     scoped_paths = args.before_rule_file is not None or args.after_rule_file is not None
@@ -1750,13 +1781,13 @@ def compare_bundle_main(argv):
         parser.error("Git bundle comparison requires --rule-file or both --before-rule-file and --after-rule-file lists")
     if not git_mode and not args.after:
         parser.error("file bundle comparison requires at least one --after rule file")
+    timing_index = comparison_timeline_index(parser, args, args.bundles, args.timeline_bundle, "bundle")
     try:
         identities = args.bundles if git_mode else [os.path.realpath(path, strict=True) for path in args.bundles]
         if len(identities) != len(set(identities)):
             raise ValueError("each incident bundle must be supplied only once")
         revisions = None
         before = None
-        rule_paths = None
         include_archived_rules = not (scoped_paths or args.before)
         if git_mode:
             repo = args.repo or Path.cwd()
@@ -1767,22 +1798,27 @@ def compare_bundle_main(argv):
             ]
             candidate_paths = args.after_rule_file if scoped_paths else args.rule_file
             after = read_committed_rules(repo, revisions[1], candidate_paths)
+            rule_paths = {"after": candidate_paths}
             if scoped_paths:
                 before = read_committed_rules(repo, revisions[0], args.before_rule_file)
                 rule_paths = {"before": args.before_rule_file, "after": candidate_paths}
         else:
             replays = [load_bundle_replay(Path(path), include_archived_rules=include_archived_rules) for path in args.bundles]
             after = read_rule_sources(args.after)
+            candidate_paths = [str(path) for path in args.after]
+            rule_paths = {"after": candidate_paths}
             if args.before:
                 before = read_rule_sources(args.before)
-                rule_paths = {"before": [str(path) for path in args.before], "after": [str(path) for path in args.after]}
+                rule_paths = {"before": [str(path) for path in args.before], "after": candidate_paths}
         fixtures, baseline_rule_sets, bundles = zip(*replays)
+        timeline = prepare_comparison_timeline(args, fixtures, timing_index)
         if before is not None:
             baseline_rule_sets = [comparison_rule_bytes(before, args.rule_format)] * len(fixtures)
         return compare(
             fixtures, baseline_rule_sets, comparison_rule_bytes(after, args.rule_format), args.promtool, revisions=revisions,
             gate=args.gate, json_report=args.json_report, fixture_commit=None, bundles=bundles,
-            junit_report=args.junit_report, rule_paths=rule_paths,
+            junit_report=args.junit_report, rule_paths=rule_paths, show_rule_paths=not include_archived_rules,
+            timeline=timeline,
         )
     except (OSError, ValueError, TypeError) as exc:
         parser.exit(2, f"error: {exc}\n")

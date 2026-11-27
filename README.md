@@ -113,7 +113,7 @@ python3 incident_to_promtool.py timeline demo/generated/after.test.yml \
 
 종료 코드는 게이트 없이 보고를 완료했거나 게이트를 통과했을 때 `0`, 게이트 실패 `1`, 입력 또는 실행 오류 `2`입니다.
 
-`compare`에서 체크포인트와 발화 지연을 함께 검사하려면 `--timeline-alertname`, `--timeline-end`, `--timeline-max-delay`를 추가합니다. 테스트가 여러 개면 `--timeline-fixture`로 대상 경로도 지정합니다. [PR에서 최초 발화 지연 검사](#pr에서-최초-발화-지연-검사)
+`compare`와 `compare-bundle`에서 체크포인트와 발화 지연을 함께 검사하려면 `--timeline-alertname`, `--timeline-end`, `--timeline-max-delay`를 추가합니다. 입력이 여러 개면 `compare`는 `--timeline-fixture`, `compare-bundle`은 `--timeline-bundle`로 대상 경로를 지정합니다. [PR에서 최초 발화 지연 검사](#pr에서-최초-발화-지연-검사)
 
 #### Git 커밋의 룰로 타임라인 재생
 
@@ -256,7 +256,7 @@ with:
 
 #### PR에서 최초 발화 지연 검사
 
-생성된 테스트를 `fixture`나 `fixtures`로 지정한 경우 `timeline-alertname`, `timeline-end`, `timeline-max-delay`를 모두 설정해 최초 발화 지연도 검사할 수 있습니다. 테스트가 하나면 기본으로 선택합니다. 여러 개면 `timeline-fixture`가 필요합니다. 지정한 `timeline-fixture`는 설정한 테스트 경로 중 하나와 같아야 합니다.
+`timeline-alertname`, `timeline-end`, `timeline-max-delay`를 모두 설정하면 최초 발화 지연도 검사합니다. `fixture` 또는 `fixtures`에서는 `timeline-fixture`, `bundle` 또는 `bundles`에서는 `timeline-bundle`로 대상을 선택합니다. 입력이 하나면 그 파일을 기본으로 선택합니다. 여러 개면 해당 선택 옵션이 필요합니다. 선택할 때는 입력에 적은 경로를 그대로 사용합니다.
 
 체크포인트 검사에서 읽은 테스트와 룰을 사용해 `0s`부터 `timeline-end`까지의 최초 발화를 비교합니다. `timeline-end`는 선택한 테스트의 평가 간격에 맞춥니다. 선택한 체크포인트 게이트(`strict` 또는 `regressions`)와 지연 게이트가 모두 통과하면 단계가 성공합니다.
 
@@ -273,13 +273,13 @@ with:
   timeline-max-delay: '0s'
 ```
 
-Markdown은 체크포인트 결과와 발화 타임라인을 함께 보여줍니다. JSON의 `timeline`은 `timeline` 명령과 같은 구조이며 최상위 `gate`는 체크포인트 판정입니다. JUnit XML에는 검사 하나를 담은 `Alert firing delay` 스위트가 추가되고 전체 검사 수에도 반영됩니다.
+Markdown은 체크포인트 결과와 발화 타임라인을 함께 보여줍니다. JSON의 `timeline`에는 발화 타임라인과 지연 판정을 담고, 최상위 `gate`는 체크포인트 판정을 담습니다. JUnit XML에는 검사 하나를 담은 `Alert firing delay` 스위트가 추가되고 전체 검사 수에도 반영됩니다.
 
 지연 검사를 켜면 `steps.compare.outputs.timeline-passed`에 문자열 `true` 또는 `false`를 제공합니다. 게이트가 실패해도 이 값을 읽을 수 있습니다. `newly-failed`는 새로 실패한 체크포인트 수입니다.
 
 #### 기준 번들로 PR 검사
 
-기준 커밋에 장애 번들 ZIP이 있으면 각 ZIP의 테스트와 기준 룰을 적용할 수 있습니다. 위 워크플로의 `fetch-depth: 0` 체크아웃을 유지하고 비교 단계를 다음과 같이 설정합니다.
+기준 커밋에 장애 번들 ZIP이 있으면 각 ZIP의 테스트와 기준 룰을 적용할 수 있습니다. 위 워크플로의 `fetch-depth: 0` 체크아웃을 유지하고 비교 단계를 다음과 같이 설정합니다. 아래 예제는 결제 번들에 최초 발화 지연 검사도 적용합니다.
 
 ```yaml
 - name: Compare alert rules from bundles
@@ -292,6 +292,10 @@ Markdown은 체크포인트 결과와 발화 타임라인을 함께 보여줍니
     rule-files: |
       prometheus/payment.rules.yml
       prometheus/checkout.rules.yml
+    timeline-alertname: PaymentErrorsHigh
+    timeline-end: '10m'
+    timeline-max-delay: '0s'
+    timeline-bundle: tests/fixtures/payment-baseline.zip
 ```
 
 ZIP 하나를 비교할 때는 `bundle`, 여러 개면 `bundles`에 한 줄에 하나씩 경로를 적습니다. 비교에는 `bundle`, `bundles`, `fixture`, `fixtures` 중 하나를 선택합니다. 번들 비교에서는 ZIP을 `before-ref`(기본 `HEAD^1`)에서 읽고, `rule-files`에 지정한 공통 수정 룰을 `after-ref`(기본 `HEAD`)에서 읽습니다. 두 경로는 저장소 루트 기준이며, 룰 파일은 수정 커밋에 있으면 됩니다. [장애 재현 번들](#장애-재현-번들)
@@ -498,6 +502,20 @@ python3 incident_to_promtool.py compare-bundle tests/fixtures/payment-baseline.z
 ```
 
 외부 룰 목록은 모든 ZIP에 공통으로 적용합니다. `--rule-format kubernetes`는 외부 기준 룰과 수정 룰 모두에 적용합니다. JSON 최상위 `rule_files.before`와 `rule_files.after`에는 실제 비교에 사용한 외부 룰 경로가 기록됩니다. `bundle.rule_files`와 `bundles`의 각 `rule_files`는 ZIP에 담긴 룰 멤버 경로입니다.
+
+##### 번들의 최초 발화 지연 검사
+
+`compare-bundle`에 `--timeline-alertname`, `--timeline-end`, `--timeline-max-delay`를 모두 지정하면, 체크포인트 검사를 위해 읽고 검증한 테스트와 룰로 최초 발화 지연도 검사합니다. ZIP에 보관한 기준 룰과 외부 기준 룰 모두 사용할 수 있습니다.
+
+```sh
+python3 incident_to_promtool.py compare-bundle demo/generated/payment-baseline.zip \
+  --after demo/after.rules.yml --timeline-alertname PaymentErrorsHigh \
+  --timeline-end 10m --timeline-max-delay 0s --json-report demo/generated/payment-timing.json
+```
+
+여러 ZIP을 비교할 때는 `--timeline-bundle`에 입력 목록의 ZIP 경로 하나를 그대로 적습니다. ZIP 하나를 비교할 때는 그 파일을 기본으로 선택합니다.
+
+JSON의 `timeline`에는 선택한 `bundle`, 기준 룰의 출처 `baseline_source`(`bundle` 또는 `rules`), 실제 비교한 `rule_files.before`와 `rule_files.after`를 기록합니다. ZIP의 기준 룰을 사용하면 `before` 목록은 번들 내부의 룰 멤버 경로입니다. Git 비교에서는 `timeline.fixture_commit`에 ZIP에서 테스트를 읽은 커밋을 기록합니다. [PR에서 최초 발화 지연 검사](#pr에서-최초-발화-지연-검사)
 
 ### 시계열 표본 간격 확인
 
