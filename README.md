@@ -462,11 +462,13 @@ python3 incident_to_promtool.py incident.json --prometheus-url http://localhost:
 
 ### 긴 캡처 구간 나눠 조회하기
 
-라이브 테스트 생성 명령과 `snapshot`, `inspect`, `bundle`에 `--chunk-window DURATION`을 지정하면 각 Prometheus 요청의 조회 범위가 지정한 길이 이내가 되도록 캡처를 나눕니다. 양수 기간과 `--prometheus-url`이 필요하며, 인증과 TLS 옵션도 함께 쓸 수 있습니다. 기본값은 선택자당 한 번의 조회입니다. [Prometheus 인증](#prometheus-인증)
+라이브 테스트 생성 명령과 `snapshot`, `inspect`, `bundle`은 기본적으로 선택자마다 전체 캡처 구간을 한 번에 조회합니다. `--chunk-window DURATION`을 지정하면 각 Prometheus 요청의 조회 범위가 지정한 길이 이내가 되도록 캡처를 나눕니다. 양수 기간과 `--prometheus-url`이 필요하며, 인증과 TLS 옵션도 함께 쓸 수 있습니다. [Prometheus 인증](#prometheus-인증)
+
+같은 라이브 명령에 `--split-on-limit`을 지정하면 Prometheus 표본 수 한도 초과 오류(HTTP 422, `errorType: execution`)가 발생한 범위만 밀리초 단위로 이등분해 시간순으로 다시 조회합니다. `--chunk-window`를 함께 지정하면 처음부터 그 길이가 요청당 상한이며, `--split-on-limit`만 지정하면 전체 구간부터 요청합니다. 1ms 구간에서도 표본 수 한도를 넘거나 다른 HTTP 오류나 데이터 오류가 발생하면 캡처를 중단합니다.
 
 ```sh
 python3 incident_to_promtool.py snapshot incident.json \
-  --prometheus-url http://localhost:9090 --chunk-window 15m \
+  --prometheus-url http://localhost:9090 --chunk-window 15m --split-on-limit \
   --output incident.matrix.json
 ```
 

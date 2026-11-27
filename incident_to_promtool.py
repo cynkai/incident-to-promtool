@@ -252,6 +252,13 @@ def redact_bearer_token(detail, token):
     return "***" if token in unquote(redacted) else redacted
 
 
+class PrometheusSampleLimitError(ValueError):
+    """The Prometheus query engine reached its sample limit."""
+
+
+PROMETHEUS_SAMPLE_LIMIT_MESSAGE = "query processing would load too many samples into memory in query execution"
+
+
 def prometheus_json(base_url, endpoint, params, *, post=False, bearer_token=None, open_request=urlopen):
     form = urlencode(params)
     url = f"{base_url}/api/v1/{endpoint}"
@@ -267,11 +274,17 @@ def prometheus_json(base_url, endpoint, params, *, post=False, bearer_token=None
             return json.load(response, parse_float=Decimal)
     except HTTPError as exc:
         message = f"Prometheus returned HTTP {exc.code} for /api/v1/{endpoint}"
+        error_class = ValueError
         with exc, suppress(ValueError, OSError, HTTPException):
             error = json.loads(exc.read(4096))
             if isinstance(error, dict) and isinstance(error.get("error"), str):
-                message += f": {redact_bearer_token(error['error'], bearer_token)}"
-        raise ValueError(message) from None
+                detail = error["error"]
+                if (endpoint == "query" and exc.code == 422 and error.get("status") == "error"
+                        and error.get("errorType") == "execution"
+                        and detail.partition(": ")[0] == PROMETHEUS_SAMPLE_LIMIT_MESSAGE):
+                    error_class = PrometheusSampleLimitError
+                message += f": {redact_bearer_token(detail, bearer_token)}"
+        raise error_class(message) from None
     except (URLError, HTTPException) as exc:
         reason = exc.reason if isinstance(exc, URLError) else exc
         detail = redact_bearer_token(str(reason), bearer_token)
@@ -379,16 +392,35 @@ def fetch_promql_ast(request_json, expression):
     return response.get("data")
 
 
-def capture_matrix_chunks(request_json, selectors, end, range_width, chunk_window):
+def capture_matrix_range(request_json, selector, end, width, *, split_on_limit):
+    try:
+        matrix = fetch_matrix(request_json, selector, end, width)
+    except (ValueError, OSError) as exc:
+        prefix = f"Prometheus chunk ending {end.isoformat()}"
+        if not split_on_limit or not isinstance(exc, PrometheusSampleLimitError):
+            raise ValueError(f"{prefix}: {exc}") from None
+        if width == 1:
+            raise ValueError(f"{prefix} exceeds the sample limit even at 1ms: {exc}") from None
+    else:
+        yield matrix
+        return
+
+    # Divide (end - width, end] into two adjacent left-open ranges.
+    left_width = width // 2
+    right_width = width - left_width
+    left_end = end - timedelta(milliseconds=right_width)
+    yield from capture_matrix_range(request_json, selector, left_end, left_width, split_on_limit=True)
+    yield from capture_matrix_range(request_json, selector, end, right_width, split_on_limit=True)
+
+
+def capture_matrix_chunks(request_json, selectors, end, range_width, chunk_window, *, split_on_limit):
     for selector in selectors:
         for offset in range(0, range_width, chunk_window):
             stop = min(offset + chunk_window, range_width)
             chunk_end = end - timedelta(milliseconds=range_width - stop)
-            try:
-                matrix = fetch_matrix(request_json, selector, chunk_end, stop - offset)
-            except (ValueError, OSError) as exc:
-                raise ValueError(f"Prometheus chunk ending {chunk_end.isoformat()}: {exc}") from None
-            yield matrix
+            yield from capture_matrix_range(
+                request_json, selector, chunk_end, stop - offset, split_on_limit=split_on_limit,
+            )
 
 
 def capture_matrices(args, config, end, window):
@@ -411,8 +443,10 @@ def capture_matrices(args, config, end, window):
     request_json = prometheus_client(args)
     # PromQL ranges are left-open. Start 1ms before the requested capture start.
     range_width = window + 1
-    if chunk_window is not None and chunk_window < range_width:
-        return capture_matrix_chunks(request_json, selectors, end, range_width, chunk_window)
+    if args.split_on_limit or (chunk_window is not None and chunk_window < range_width):
+        return capture_matrix_chunks(
+            request_json, selectors, end, range_width, chunk_window or range_width, split_on_limit=args.split_on_limit,
+        )
     return (fetch_matrix(request_json, selector, end, range_width) for selector in selectors)
 
 
@@ -2191,6 +2225,7 @@ def add_capture_source_options(parser):
     source.add_argument("--prometheus-url", help="query a Prometheus server for raw historical samples")
     source.add_argument("--matrix", type=Path, action="append", help="read a saved raw query response (repeatable)")
     parser.add_argument("--chunk-window", metavar="DURATION", help="maximum PromQL range per live Prometheus query")
+    parser.add_argument("--split-on-limit", action="store_true", help="bisect queries that exceed the Prometheus sample limit")
     add_prometheus_connection_options(parser)
 
 
@@ -2216,6 +2251,8 @@ def parse_capture_args(parser, argv=None):
             parser.error("--client-cert-file and --client-key-file require --prometheus-url")
         if getattr(args, "chunk_window", None) is not None:
             parser.error("--chunk-window requires --prometheus-url")
+        if getattr(args, "split_on_limit", False):
+            parser.error("--split-on-limit requires --prometheus-url")
     return args
 
 

@@ -24,6 +24,7 @@ EXACT = 'payment_requests_total{code="500"}'
 WIDE = 'payment_requests_total{code=~"200|500"}'
 SELECTORS = (EXACT, WIDE)
 QUERY = re.compile(r"(.+)\[(\d+)(ms|s)\]")
+SAMPLE_LIMIT = "query processing would load too many samples into memory in query execution"
 POINTS = ((-1, "-1"), (0, "0.00"), (1, "1"), (2, "2"), (3, "3"), (5, "5"), (9, "9e0"), (10, "10"), (11, "11"))
 OTHER_POINTS = ((0, "2"), (10, "2.0"))
 CAPTURE_MODES = (
@@ -36,6 +37,10 @@ CAPTURE_MODES = (
 
 def matrix(series):
     return {"status": "success", "data": {"resultType": "matrix", "result": series}}
+
+
+def sample_limit_error():
+    return 422, {"status": "error", "errorType": "execution", "error": f"{SAMPLE_LIMIT}: details for {TOKEN}"}
 
 
 class ChunkedCaptureIntegrationTests(unittest.TestCase):
@@ -63,7 +68,7 @@ class ChunkedCaptureIntegrationTests(unittest.TestCase):
         self.offline.write_text(json.dumps(matrix([])), encoding="utf-8")
 
     @contextmanager
-    def server(self, *, fail_at=None, warning=False):
+    def server(self, *, fail_at=None, warning=False, error_for=None):
         requests = []
         shared_in_wide = tuple((offset, "3.000" if offset == 3 else value) for offset, value in POINTS)
         data = {EXACT: (("500", POINTS),), WIDE: (("500", shared_in_wide), ("200", OTHER_POINTS))}
@@ -94,6 +99,10 @@ class ChunkedCaptureIntegrationTests(unittest.TestCase):
                         response["warnings"] = ["one replica did not provide every sample"]
                     else:
                         status, response = 503, {"status": "error", "error": "cannot retrieve this capture chunk"}
+                if error_for is not None:
+                    error = error_for(selector, right, width)
+                    if error is not None:
+                        status, response = error
                 body = json.dumps(response).encode("utf-8")
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
@@ -122,7 +131,7 @@ class ChunkedCaptureIntegrationTests(unittest.TestCase):
             capture_output=True, text=True, timeout=30,
         )
 
-    def capture(self, mode, name, *, url=None, chunk=None):
+    def capture(self, mode, name, *, url=None, chunk=None, split_on_limit=False):
         command = [] if mode == "generate" else [mode]
         command.append(self.config)
         if url is None:
@@ -131,6 +140,8 @@ class ChunkedCaptureIntegrationTests(unittest.TestCase):
             command.extend(("--prometheus-url", url, "--bearer-token-file", self.token))
         if chunk is not None:
             command.append(f"--chunk-window={chunk}")
+        if split_on_limit:
+            command.append("--split-on-limit")
         if mode == "inspect":
             command.extend(("--format", "json", "--max-gap", "10ms"))
         output = self.workspace / name if name is not None else None
@@ -155,6 +166,7 @@ class ChunkedCaptureIntegrationTests(unittest.TestCase):
         self.assertEqual(result.returncode, exit_code, f"{result.stdout}\n{result.stderr}")
         self.assertEqual(result.stdout, "")
         self.assertRegex(result.stderr, diagnostic)
+        self.assertNotIn(TOKEN, result.stderr)
         if output is not None:
             self.assertFalse(output.exists())
 
@@ -172,21 +184,26 @@ class ChunkedCaptureIntegrationTests(unittest.TestCase):
                 self.assert_ranges(requests, [(2, 3), (5, 3), (8, 3), (10, 2)])
                 self.assertEqual([count for _, offset, _, _, count in requests if offset == 8], [0, 0])
 
-                if mode == "inspect":
-                    report = json.loads(split.stdout)
-                    self.assertEqual(report, json.loads(normal.stdout))
-                    self.assertEqual((report["series_count"], report["sample_count"]), (2, 9))
-                    self.assertEqual(report["gate"], {"max_gap_ms": 10, "passed": True})
-                elif mode == "bundle":
-                    self.assert_bundle_matches_and_replays(normal_file, split_file)
-                else:
-                    self.assertEqual(split_file.read_bytes(), normal_file.read_bytes())
-                    if mode == "snapshot":
-                        self.assert_snapshot_samples(split_file)
-                    if mode == "generate":
-                        group, = json.loads(split_file.read_bytes())["tests"]
-                        self.assertEqual(group["interval"], "1ms")
-                        self.assertEqual(len(group["input_series"]), 2)
+                self.assert_matches_unchunked(mode, (normal, normal_file), (split, split_file))
+
+    def assert_matches_unchunked(self, mode, baseline, recovered):
+        normal, normal_file = baseline
+        split, split_file = recovered
+        if mode == "inspect":
+            report = json.loads(split.stdout)
+            self.assertEqual(report, json.loads(normal.stdout))
+            self.assertEqual((report["series_count"], report["sample_count"]), (2, 9))
+            self.assertEqual(report["gate"], {"max_gap_ms": 10, "passed": True})
+        elif mode == "bundle":
+            self.assert_bundle_matches_and_replays(normal_file, split_file)
+        else:
+            self.assertEqual(split_file.read_bytes(), normal_file.read_bytes())
+            if mode == "snapshot":
+                self.assert_snapshot_samples(split_file)
+            if mode == "generate":
+                group, = json.loads(split_file.read_bytes())["tests"]
+                self.assertEqual(group["interval"], "1ms")
+                self.assertEqual(len(group["input_series"]), 2)
 
     def assert_snapshot_samples(self, path):
         series = json.loads(path.read_bytes(), parse_float=Decimal)["data"]["result"]
@@ -250,7 +267,87 @@ class ChunkedCaptureIntegrationTests(unittest.TestCase):
                     self.assert_failure(
                         self.capture(mode, output, chunk="3ms"), 2, r"(?i)chunk.window.*prometheus.url",
                     )
+                    self.assert_failure(
+                        self.capture(mode, output, split_on_limit=True), 2, r"(?i)split.on.limit.*prometheus.url",
+                    )
         self.assertEqual(requests, [])
+
+    def test_sample_limit_splitting_recovers_the_same_capture_on_all_live_routes(self):
+        def limit(_selector, _right, width):
+            return sample_limit_error() if width > 3 else None
+
+        expected = [(10, 11), (4, 5), (1, 2), (4, 3), (10, 6), (7, 3), (10, 3)]
+        for mode, filename, _ in CAPTURE_MODES:
+            with self.subTest(mode=mode):
+                with self.server() as (url, _):
+                    baseline = self.capture(mode, f"full-{filename}" if filename else None, url=url)
+                self.assert_success(baseline[0])
+
+                with self.server(error_for=limit) as (url, requests):
+                    recovered = self.capture(
+                        mode, f"recovered-{filename}" if filename else None, url=url, split_on_limit=True,
+                    )
+
+                self.assert_success(recovered[0])
+                self.assert_ranges(requests, expected)
+                self.assert_matches_unchunked(mode, baseline, recovered)
+
+    def test_splitting_composes_with_the_initial_range_cap(self):
+        def limit(_selector, _right, width):
+            return sample_limit_error() if width > 3 else None
+
+        with self.server(error_for=limit) as (url, requests):
+            result, output = self.capture("snapshot", "capped and adaptive.json", url=url, chunk="5ms", split_on_limit=True)
+
+        self.assert_success(result)
+        self.assert_ranges(requests, [(4, 5), (1, 2), (4, 3), (9, 5), (6, 2), (9, 3), (10, 1)])
+        self.assert_snapshot_samples(output)
+
+    def test_default_capture_fails_without_splitting_a_sample_limit_response(self):
+        with self.server(error_for=lambda *_query: sample_limit_error()) as (url, requests):
+            outcome = self.capture("snapshot", "no adaptive splitting.json", url=url)
+
+        self.assert_failure(outcome, 1, r"HTTP 422.*too many samples")
+        self.assertEqual([request[:4] for request in requests], [(EXACT, 10, 11, f"Bearer {TOKEN}")])
+
+    def test_nonlimit_responses_never_trigger_splitting(self):
+        _, canonical = sample_limit_error()
+        unrelated = (
+            ("unauthorized", 401, canonical, r"HTTP 401"),
+            ("timed out", 503, {**canonical, "errorType": "timeout", "error": "query timed out"}, r"HTTP 503"),
+            ("wrong error type", 422, {**canonical, "errorType": "timeout"}, r"HTTP 422"),
+            ("wrong status field", 422, {**canonical, "status": "success"}, r"HTTP 422"),
+            ("wrong response shape", 422, [canonical], r"HTTP 422"),
+            ("other execution failure", 422, {**canonical, "error": "query execution failed"}, r"HTTP 422"),
+            ("nonprefix error", 422, {**canonical, "error": f"simulated error text: {SAMPLE_LIMIT}"}, r"HTTP 422"),
+            ("near match", 422, {**canonical, "error": f"{SAMPLE_LIMIT}extra"}, r"HTTP 422"),
+            ("success status code", 200, canonical, r"(?i)capture failed"),
+        )
+        for name, status, response, diagnostic in unrelated:
+            with self.subTest(case=name):
+                with self.server(error_for=lambda *_query: (status, response)) as (url, requests):
+                    outcome = self.capture("snapshot", f"{name}.json", url=url, split_on_limit=True)
+
+                self.assert_failure(outcome, 1, diagnostic)
+                self.assertEqual([request[:4] for request in requests], [(EXACT, 10, 11, f"Bearer {TOKEN}")])
+
+    def test_sample_limit_at_one_millisecond_stops_without_partial_capture(self):
+        def limit(_selector, right, width):
+            return sample_limit_error() if right - width < 9 <= right else None
+
+        expected = [(10, 11), (4, 5), (10, 6), (7, 3), (10, 3), (8, 1), (10, 2), (9, 1)]
+        for mode, filename, exit_code in CAPTURE_MODES:
+            with self.subTest(mode=mode):
+                with self.server(error_for=limit) as (url, requests):
+                    outcome = self.capture(
+                        mode, f"terminal-{filename}" if filename else None, url=url, split_on_limit=True,
+                    )
+
+                self.assert_failure(outcome, exit_code, r"(?i)exceeds the sample limit even at 1ms")
+                self.assertEqual(
+                    [request[:4] for request in requests],
+                    [(EXACT, right, width, f"Bearer {TOKEN}") for right, width in expected],
+                )
 
 
 if __name__ == "__main__":
