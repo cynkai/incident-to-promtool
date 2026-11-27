@@ -135,6 +135,8 @@ jobs:
           recording_rule="rules/payment recording.yml"
           bundle="incidents/payment baseline.zip"
           second_bundle="incidents/alternative baseline.zip"
+          bundle_baseline="rules/bundle baseline fixed.yml"
+          bundle_regression="rules/bundle candidate regressed.yml"
           git init --quiet "$repo"
           git -C "$repo" config user.name 'Integration Test'
           git -C "$repo" config user.email 'test@example.invalid'
@@ -164,7 +166,8 @@ jobs:
           PY
           cp demo/kubernetes/before.yml "$repo/$rule"
           cp demo/kubernetes/before.yml "$repo/$scoped_baseline"
-          git -C "$repo" add -- "$rule" "$scoped_baseline" "$bundle" "$second_bundle" \
+          cp demo/kubernetes/after.yml "$repo/$bundle_baseline"
+          git -C "$repo" add -- "$rule" "$scoped_baseline" "$bundle" "$second_bundle" "$bundle_baseline" \
             payment.test.yml payment.capture.json quiet.test.yml
           git -C "$repo" commit --quiet -m 'Add original payment alert'
           cp demo/kubernetes/after.yml "$repo/$rule"
@@ -184,13 +187,16 @@ jobs:
                   - record: payment:http_errors:rate2m
                     expr: sum(rate(payment_http_requests_total{code="500"}[2m]))
           YAML
+          cp demo/kubernetes/before.yml "$repo/$bundle_regression"
           printf 'invalid replacement bundle\n' > "$repo/$bundle"
-          git -C "$repo" add -- "$rule" "$candidate" "$renamed_rule" "$recording_rule" "$bundle"
-          git -C "$repo" rm --quiet -- "$second_bundle" "$scoped_baseline"
+          git -C "$repo" add -- "$rule" "$candidate" "$renamed_rule" "$recording_rule" \
+            "$bundle" "$bundle_regression"
+          git -C "$repo" rm --quiet -- "$second_bundle" "$scoped_baseline" "$bundle_baseline"
           git -C "$repo" commit --quiet -m 'Fix late payment alert'
           printf 'invalid fixture\n' > "$repo/payment.test.yml"
           rm -- "$repo/payment.capture.json" "$repo/quiet.test.yml" \
-            "$repo/$candidate" "$repo/$renamed_rule" "$repo/$recording_rule" "$repo/$bundle"
+            "$repo/$candidate" "$repo/$renamed_rule" "$repo/$recording_rule" \
+            "$repo/$bundle" "$repo/$bundle_regression"
       - name: Compare the fixed rule
         id: fixed
         uses: ./
@@ -367,6 +373,51 @@ jobs:
           assert report["gate"] == {"mode": "strict", "passed": True}
           fixture, = report["fixtures"]
           assert fixture["sha256"] == fixture_sha256
+          PY
+      - name: Compare a committed bundle using rules from both refs
+        id: bundled-refs
+        continue-on-error: true
+        uses: ./
+        with:
+          repo-path: ${{ runner.temp }}/composite-repo
+          bundle: incidents/payment baseline.zip
+          before-rule-files: |
+            rules/bundle baseline fixed.yml
+          after-rule-files: |
+            rules/bundle candidate regressed.yml
+          rule-format: kubernetes
+          gate: regressions
+      - name: Check the bundle regression against the committed baseline
+        env:
+          OUTCOME: ${{ steps.bundled-refs.outcome }}
+          REPORT_PATH: ${{ steps.bundled-refs.outputs.report-path }}
+          JSON_REPORT_PATH: ${{ steps.bundled-refs.outputs.json-report-path }}
+          JUNIT_REPORT_PATH: ${{ steps.bundled-refs.outputs.junit-report-path }}
+          NEWLY_FAILED: ${{ steps.bundled-refs.outputs.newly-failed }}
+        run: |
+          [[ "$OUTCOME" == failure ]]
+          report=$(cat "$REPORT_PATH")
+          [[ "$report" == *'| Before | Passed | 2/2 |'* ]]
+          [[ "$report" == *'| After | Failed | 1/2 |'* ]]
+          [[ "$NEWLY_FAILED" == '1' ]]
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from xml.etree import ElementTree
+
+          report = json.loads(Path(os.environ["JSON_REPORT_PATH"]).read_text(encoding="utf-8"))
+          assert report["bundle"]["path"] == "incidents/payment baseline.zip"
+          assert report["rule_files"] == {
+              "before": ["rules/bundle baseline fixed.yml"],
+              "after": ["rules/bundle candidate regressed.yml"],
+          }
+          assert report["gate"] == {"mode": "regressions", "passed": False}
+          assert report["summary"]["before"] == {"matched": 2, "total": 2}
+          assert report["summary"]["after"] == {"matched": 1, "total": 2}
+          assert report["summary"]["newly_failed"] == 1
+          junit = ElementTree.parse(os.environ["JUNIT_REPORT_PATH"]).getroot()
+          assert len(junit.findall("testsuite/testcase/failure")) == 1
           PY
       - name: Compare two committed bundles to a proposed Kubernetes rule
         id: bundled-batch

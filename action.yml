@@ -20,16 +20,16 @@ inputs:
     description: Newline-separated capture summary paths in the same order as the fixtures. Use with fixture or fixtures.
     required: false
   rule-files:
-    description: Newline-separated rule paths from the repository root. Fixture mode reads these from both refs. Bundle mode requires this input and reads it from after-ref.
+    description: Newline-separated rule paths from the repository root. Fixture mode reads these from both refs. Bundle mode reads these from after-ref and uses the archived baseline.
     required: false
   before-rule-files:
-    description: Newline-separated repository-root-relative rule paths at before-ref. Use with after-rule-files in fixture mode.
+    description: Newline-separated repository-root-relative rule paths at before-ref. Pair with after-rule-files. These files define the comparison baseline.
     required: false
   after-rule-files:
-    description: Newline-separated repository-root-relative rule paths at after-ref. Use with before-rule-files in fixture mode.
+    description: Newline-separated repository-root-relative rule paths at after-ref. Pair with before-rule-files.
     required: false
   rule-format:
-    description: Either prometheus or kubernetes. Applies to both versions in fixture mode and proposed rules in bundle mode.
+    description: Either prometheus or kubernetes. Applies to rule files read from Git.
     default: prometheus
   gate:
     description: Use strict to fail on any failing proposed checkpoint or regressions to fail only on newly failing checkpoints.
@@ -38,7 +38,7 @@ inputs:
     description: Checkout directory, relative to the workflow workspace if not absolute.
     default: '.'
   before-ref:
-    description: Git revision containing the baseline rules or bundles. The default is the first parent of the PR merge candidate.
+    description: Git revision containing the baseline rule files, bundle ZIPs, or both. The default is the first parent of the PR merge candidate.
     default: 'HEAD^1'
   after-ref:
     description: Proposed Git revision. The default is the checked-out PR merge candidate.

@@ -851,7 +851,7 @@ def verify_bundle_capture_summary(path, checksum, contents, manifest):
             raise ValueError(f"{path}: capture summary requires {BUNDLE_MANIFEST}")
 
 
-def load_bundle_replay(path, *, source=None):
+def load_bundle_replay(path, *, source=None, include_archived_rules=True):
     fixture_path = f"{path}!{BUNDLE_FIXTURE}"
     summary_path = f"{path}!{BUNDLE_CAPTURE_SUMMARY}"
     with open_bundle_archive(path, source) as (archive, names):
@@ -866,7 +866,9 @@ def load_bundle_replay(path, *, source=None):
             not isinstance(name, str) or not BUNDLE_RULE_PATH.fullmatch(name) for name in rule_paths
         ) or len(rule_paths) != len(set(rule_paths)):
             raise ValueError(f"{fixture_path}: rule_files must list distinct bundled paths such as 'rules/rules-1.yml'")
-        rules = [read_bundle_member(archive, path, name, manifest) for name in rule_paths]
+        rules = []
+        if include_archived_rules:
+            rules = [read_bundle_member(archive, path, name, manifest) for name in rule_paths]
     return fixture, rules, {"path": str(path), "rule_files": rule_paths}
 
 
@@ -884,12 +886,12 @@ def verify_bundle(path):
     return {"schema_version": 1, "bundle_path": str(path), "verified_files": sorted(manifest)}
 
 
-def load_committed_bundle_replay(repo, revision, path):
+def load_committed_bundle_replay(repo, revision, path, *, include_archived_rules=True):
     object_id = committed_file_id(repo, revision, path, "bundle")
     with TemporaryFile() as source:
         git_output(repo, "cat-file", "blob", object_id, stdout=source)
         source.seek(0)
-        return load_bundle_replay(path, source=source)
+        return load_bundle_replay(path, source=source, include_archived_rules=include_archived_rules)
 
 
 def identify_alert_mismatches(fixture, cases):
@@ -1108,17 +1110,22 @@ def print_markdown_report(report):
     commits = report["commits"]
     bundle = report.get("bundle")
     bundles = report.get("bundles")
+    rule_paths = report.get("rule_files")
     if bundle or bundles:
         anchor = f" at Git commit `{commits['before']}`" if commits else ""
         if bundle:
-            print(f"Loaded the baseline rules and fixture from bundle {markdown_code(bundle['path'])}{anchor}.\n")
+            files = "the fixture" if rule_paths else "the baseline rules and fixture"
+            print(f"Loaded {files} from bundle {markdown_code(bundle['path'])}{anchor}.\n")
         else:
-            print(f"Loaded baseline rules and fixtures from {len(bundles)} bundles{anchor}.\n")
+            files = "fixtures" if rule_paths else "baseline rules and fixtures"
+            print(f"Loaded {files} from {len(bundles)} bundles{anchor}.\n")
         if commits:
+            if rule_paths:
+                print(f"Read baseline rules from Git commit `{commits['before']}`.\n")
             print(f"Read proposed rules from Git commit `{commits['after']}`.\n")
     elif commits:
         print(f"Compared Git commits `{commits['before']}` and `{commits['after']}` (before and after).\n")
-    if rule_paths := report.get("rule_files"):
+    if rule_paths:
         for version in versions:
             paths = ", ".join(markdown_code(path) for path in rule_paths[version])
             print(f"{version.title()} rule files {paths}.\n")
@@ -1360,25 +1367,35 @@ def compare_main(argv):
 def compare_bundle_main(argv):
     parser = argparse.ArgumentParser(
         prog=f"{Path(sys.argv[0]).name} compare-bundle",
-        description="Compare proposed rules with the archived baseline and fixture in each incident bundle.",
+        description="Use incident bundles to compare proposed rules with archived or explicitly supplied baseline rules.",
     )
     parser.add_argument("bundles", metavar="bundle", nargs="+", help="ZIP archives created with bundle (repository-root-relative in Git mode)")
+    parser.add_argument("--before", type=Path, action="append", help="override the archived baseline with a local rule file (repeatable)")
     parser.add_argument("--after", type=Path, action="append", help="proposed rule file in the working tree (repeatable)")
-    parser.add_argument("--bundle-ref", help="Git ref or commit containing the bundles")
+    parser.add_argument("--bundle-ref", help="Git ref or commit containing the bundles and any explicit baseline rules")
     parser.add_argument("--after-ref", help="Git ref or commit containing the proposed rules")
-    parser.add_argument("--rule-file", action="append", help="repository-root-relative rule path at --after-ref (repeatable)")
+    parser.add_argument("--rule-file", action="append", help="repository-root-relative proposed rule path when using archived baselines (repeatable)")
+    parser.add_argument("--before-rule-file", action="append", help="repository-root-relative baseline rule path at --bundle-ref (repeatable)")
+    parser.add_argument("--after-rule-file", action="append", help="repository-root-relative proposed rule path at --after-ref with an explicit baseline (repeatable)")
     parser.add_argument("--repo", type=Path, help="Git repository for ref comparison (default: current directory)")
     parser.add_argument(
         "--rule-format", choices=("prometheus", "kubernetes"), default="prometheus",
-        help="input format of the proposed rule files (default: prometheus)",
+        help="input format of explicitly supplied rule files (default: prometheus)",
     )
     add_comparison_report_options(parser)
     args = parser.parse_args(argv)
-    git_mode = any(value is not None for value in (args.bundle_ref, args.after_ref, args.rule_file, args.repo))
-    if git_mode and args.after:
-        parser.error("choose either --after files or Git ref comparison options")
-    if git_mode and not (args.bundle_ref and args.after_ref and args.rule_file):
-        parser.error("Git bundle comparison requires --bundle-ref, --after-ref and at least one --rule-file")
+    scoped_paths = args.before_rule_file is not None or args.after_rule_file is not None
+    git_mode = scoped_paths or any(value is not None for value in (args.bundle_ref, args.after_ref, args.rule_file, args.repo))
+    if git_mode and (args.before or args.after):
+        parser.error("choose either local rule files or Git ref comparison options")
+    if git_mode and not (args.bundle_ref and args.after_ref):
+        parser.error("Git bundle comparison requires --bundle-ref and --after-ref")
+    if scoped_paths and args.rule_file:
+        parser.error("choose either --rule-file or the --before-rule-file and --after-rule-file lists")
+    if scoped_paths and not (args.before_rule_file and args.after_rule_file):
+        parser.error("provide both --before-rule-file and --after-rule-file lists")
+    if git_mode and not (scoped_paths or args.rule_file):
+        parser.error("Git bundle comparison requires --rule-file or both --before-rule-file and --after-rule-file lists")
     if not git_mode and not args.after:
         parser.error("file bundle comparison requires at least one --after rule file")
     try:
@@ -1386,19 +1403,34 @@ def compare_bundle_main(argv):
         if len(identities) != len(set(identities)):
             raise ValueError("each incident bundle must be supplied only once")
         revisions = None
+        before = None
+        rule_paths = None
+        include_archived_rules = not (scoped_paths or args.before)
         if git_mode:
             repo = args.repo or Path.cwd()
             revisions = (resolve_commit(repo, args.bundle_ref), resolve_commit(repo, args.after_ref))
-            replays = [load_committed_bundle_replay(repo, revisions[0], path) for path in args.bundles]
-            after = read_committed_rules(repo, revisions[1], args.rule_file)
+            replays = [
+                load_committed_bundle_replay(repo, revisions[0], path, include_archived_rules=include_archived_rules)
+                for path in args.bundles
+            ]
+            candidate_paths = args.after_rule_file if scoped_paths else args.rule_file
+            after = read_committed_rules(repo, revisions[1], candidate_paths)
+            if scoped_paths:
+                before = read_committed_rules(repo, revisions[0], args.before_rule_file)
+                rule_paths = {"before": args.before_rule_file, "after": candidate_paths}
         else:
-            replays = [load_bundle_replay(Path(path)) for path in args.bundles]
+            replays = [load_bundle_replay(Path(path), include_archived_rules=include_archived_rules) for path in args.bundles]
             after = read_rule_sources(args.after)
+            if args.before:
+                before = read_rule_sources(args.before)
+                rule_paths = {"before": [str(path) for path in args.before], "after": [str(path) for path in args.after]}
         fixtures, baseline_rule_sets, bundles = zip(*replays)
+        if before is not None:
+            baseline_rule_sets = [comparison_rule_bytes(before, args.rule_format)] * len(fixtures)
         return compare(
             fixtures, baseline_rule_sets, comparison_rule_bytes(after, args.rule_format), args.promtool, revisions=revisions,
             gate=args.gate, json_report=args.json_report, fixture_commit=None, bundles=bundles,
-            junit_report=args.junit_report,
+            junit_report=args.junit_report, rule_paths=rule_paths,
         )
     except (OSError, ValueError, TypeError) as exc:
         parser.exit(2, f"error: {exc}\n")

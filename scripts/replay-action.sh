@@ -100,10 +100,6 @@ while IFS= read -r rule; do
 done < <(nonempty_path_lines "${INCIDENT_AFTER_RULE_FILES:-}")
 
 if [[ -n "${before_rule_arguments[0]:-}" || -n "${after_rule_arguments[0]:-}" ]]; then
-    if [[ -n "${bundle_paths[0]:-}" ]]; then
-        printf 'before-rule-files and after-rule-files require fixture or fixtures.\n' >&2
-        exit 2
-    fi
     if [[ -n "${rule_arguments[0]:-}" ]]; then
         printf 'Provide either rule-files or both before-rule-files and after-rule-files.\n' >&2
         exit 2
@@ -114,11 +110,7 @@ if [[ -n "${before_rule_arguments[0]:-}" || -n "${after_rule_arguments[0]:-}" ]]
     fi
     rule_arguments=("${before_rule_arguments[@]}" "${after_rule_arguments[@]}")
 elif [[ -z "${rule_arguments[0]:-}" ]]; then
-    if [[ -n "${bundle_paths[0]:-}" ]]; then
-        printf 'Provide at least one repository-relative path in rule-files.\n' >&2
-    else
-        printf 'Provide either rule-files or both before-rule-files and after-rule-files.\n' >&2
-    fi
+    printf 'Provide either rule-files or both before-rule-files and after-rule-files.\n' >&2
     exit 2
 fi
 
