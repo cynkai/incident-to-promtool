@@ -57,6 +57,8 @@ jobs:
             --format json --max-gap 30s > coverage.json
           "$cli" "$demo/alertmanager.incident.json" --matrix payment.matrix.json \
             --output payment.test.yml --summary-format json > summary.json
+          "$cli" timeline payment.test.yml --before "$demo/before.rules.yml" --after "$demo/after.rules.yml" \
+            --alertname PaymentErrorsHigh --end 10m --format json --promtool "$RUNNER_TEMP/promtool" > timeline.json
           "$smoke/venv/bin/python" - <<'PY'
           import hashlib
           import json
@@ -73,6 +75,14 @@ jobs:
           assert summary["schema_version"] == 1
           assert summary["series_count"] == 1 and summary["checkpoint_count"] == 2
           assert summary["fixture_sha256"] == hashlib.sha256(Path("payment.test.yml").read_bytes()).hexdigest()
+
+          timeline = json.loads(Path("timeline.json").read_text(encoding="utf-8"))
+          assert timeline["schema_version"] == 1
+          assert timeline["evaluation_interval_ms"] == 30_000
+          group, = timeline["groups"]
+          assert group["before"]["first_firing_offset_ms"] == 570_000
+          assert group["after"]["first_firing_offset_ms"] == 330_000
+          assert group["first_firing_delta_ms"] == -240_000
           PY
 
           report=$("$cli" compare payment.test.yml --before "$demo/before.rules.yml" \

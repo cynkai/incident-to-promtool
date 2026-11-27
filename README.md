@@ -77,6 +77,22 @@ python3 incident_to_promtool.py compare demo/generated/after.test.yml \
 
 캡처 요약을 보관했다면 `--capture-summary PATH`로 비교에 사용할 테스트 파일이 생성 당시와 같은지 검증할 수 있습니다. 이 옵션을 쓸 때는 위치 인자로 지정한 테스트 파일마다 하나씩, 같은 순서로 요약을 지정합니다. v1 요약의 `fixture_sha256`을 테스트 파일 바이트의 SHA-256과 대조합니다. 요약이 유효하지 않거나 해시가 다르면 `promtool` 실행 전에 종료 코드 `2`를 반환합니다. [캡처 요약 JSON](#캡처-요약-json)
 
+### 알람 발화 타임라인
+
+`timeline`은 생성한 `.test.yml`에 `--alertname`의 기대 동작이 들어 있는 테스트 그룹을 찾아, 같은 시계열에서 기존 룰과 수정 룰의 발화 시점을 비교합니다.
+
+```sh
+python3 incident_to_promtool.py timeline demo/generated/after.test.yml \
+  --before demo/before.rules.yml --after demo/after.rules.yml \
+  --alertname PaymentErrorsHigh --end 10m
+```
+
+`--start`(기본 `0s`)와 `--end`는 각 테스트 그룹 시작 기준의 오프셋이며, 양끝 모두 평가 간격에 맞춰 지정합니다. 보고 범위에는 시작과 끝이 모두 들어갑니다. 평가는 항상 `0s`에서 시작해 보고 범위 앞의 상태도 재현합니다. 룰 버전별로 워밍업과 선택한 모든 테스트 그룹을 합해 최대 10,000개의 평가 시점을 사용할 수 있습니다.
+
+지정한 이름의 알람이 라벨 조합 하나에서라도 발화하면 해당 평가 시점을 발화로 기록합니다. 리포트에는 범위 안에서 처음 관측한 발화, 연속된 평가 시점에서 발화한 구간, 양쪽에서 모두 발화가 관측됐을 때의 첫 발화 차이(수정 − 기준)가 들어갑니다. 구간 끝은 마지막으로 발화가 관측된 시점입니다. `--end`까지 이어지는 구간의 해제 시각은 이후 관측이 있어야 판단할 수 있습니다.
+
+결제 예제에서는 테스트 시작부터 기준 룰 `570s`, 수정 룰 `330s`에 처음 발화가 관측돼 수정 룰이 `240s` 앞섭니다. 기본 출력은 Markdown이며 `--format json`으로 JSON을 받습니다. 의존 룰은 `--before`와 `--after`를 반복해 지정하고, Kubernetes `PrometheusRule`은 `--rule-format kubernetes`를 사용합니다. `--promtool`로 실행 파일을 지정할 수 있습니다. 게이트에 따른 회귀 판정은 `compare`에서 확인합니다.
+
 ### JSON 리포트
 
 자동화에서 비교 결과를 읽으려면 `--json-report`를 추가합니다. JSON 출력은 새 경로를 지정합니다. 종료 코드 `0`과 `1`에서 JSON이 기록되고, 입력이나 실행 오류(`2`)가 발생하면 JSON 파일은 생성되지 않습니다.
