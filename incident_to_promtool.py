@@ -367,8 +367,8 @@ def prometheus_client(args):
     return request_json
 
 
-def fetch_matrix(request_json, selector, end, window):
-    params = {"query": f"{selector}[{as_duration(window + 1)}]", "time": end.isoformat()}
+def fetch_matrix(request_json, selector, end, range_width):
+    params = {"query": f"{selector}[{as_duration(range_width)}]", "time": end.isoformat()}
     return request_json("query", params)
 
 
@@ -377,6 +377,18 @@ def fetch_promql_ast(request_json, expression):
     if not isinstance(response, dict) or response.get("status") != "success" or response.get("warnings"):
         raise ValueError("Prometheus could not parse the expression through /api/v1/parse_query")
     return response.get("data")
+
+
+def capture_matrix_chunks(request_json, selectors, end, range_width, chunk_window):
+    for selector in selectors:
+        for offset in range(0, range_width, chunk_window):
+            stop = min(offset + chunk_window, range_width)
+            chunk_end = end - timedelta(milliseconds=range_width - stop)
+            try:
+                matrix = fetch_matrix(request_json, selector, chunk_end, stop - offset)
+            except (ValueError, OSError) as exc:
+                raise ValueError(f"Prometheus chunk ending {chunk_end.isoformat()}: {exc}") from None
+            yield matrix
 
 
 def capture_matrices(args, config, end, window):
@@ -388,8 +400,20 @@ def capture_matrices(args, config, end, window):
         for selector in selectors
     ):
         raise ValueError("selectors must contain raw metric selectors, such as requests_total{job=\"api\"}")
+    chunk_window = None
+    if args.chunk_window is not None:
+        try:
+            chunk_window = duration_ms(args.chunk_window)
+        except ValueError as exc:
+            raise ValueError(f"--chunk-window: {exc}") from None
+        if chunk_window <= 0:
+            raise ValueError("--chunk-window requires a positive duration")
     request_json = prometheus_client(args)
-    return (fetch_matrix(request_json, selector, end, window) for selector in selectors)
+    # PromQL ranges are left-open. Start 1ms before the requested capture start.
+    range_width = window + 1
+    if chunk_window is not None and chunk_window < range_width:
+        return capture_matrix_chunks(request_json, selectors, end, range_width, chunk_window)
+    return (fetch_matrix(request_json, selector, end, range_width) for selector in selectors)
 
 
 def series_name(labels):
@@ -2166,6 +2190,7 @@ def add_capture_source_options(parser):
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--prometheus-url", help="query a Prometheus server for raw historical samples")
     source.add_argument("--matrix", type=Path, action="append", help="read a saved raw query response (repeatable)")
+    parser.add_argument("--chunk-window", metavar="DURATION", help="maximum PromQL range per live Prometheus query")
     add_prometheus_connection_options(parser)
 
 
@@ -2189,6 +2214,8 @@ def parse_capture_args(parser, argv=None):
             parser.error("--ca-file requires --prometheus-url")
         if args.client_cert_file is not None:
             parser.error("--client-cert-file and --client-key-file require --prometheus-url")
+        if getattr(args, "chunk_window", None) is not None:
+            parser.error("--chunk-window requires --prometheus-url")
     return args
 
 

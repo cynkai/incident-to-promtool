@@ -433,6 +433,8 @@ promtool test rules incident.test.yml
 
 저장된 API 응답이 있을 때는 `--matrix`로 로컬에서 변환할 수 있습니다. Prometheus의 `/api/v1/query`에 범위 선택자를 보냈을 때 반환되는 원본 `matrix` 응답을 사용합니다. 인증이 필요한 서버에 연결할 때는 토큰 파일이나 환경 변수를 지정할 수 있습니다. [Prometheus 인증](#prometheus-인증)
 
+Prometheus의 요청당 조회 한도에 걸리는 긴 캡처는 여러 요청으로 나눌 수 있습니다. [긴 캡처 구간 나눠 조회하기](#긴-캡처-구간-나눠-조회하기)
+
 - `start`와 `end`는 시간대가 포함된 캡처 구간입니다. `start`를 테스트의 시각 기준으로 고정합니다. `start`는 장애보다 앞에 두고, 룰의 `rate(...[5m])` 같은 조회 범위와 `for` 상태를 평가할 수 있게 충분한 사전 구간을 포함하세요.
 - `selectors`에는 룰 평가에 필요한 원본 시계열 선택자를 넣습니다. `sample_interval`은 시계열 격자 간격, `evaluation_interval`은 테스트의 단일 평가 간격입니다. 발화 시점을 대조하려면 평가 간격을 운영과 맞추고 `start`도 운영 룰 그룹의 평가 시점에 맞추세요. 평가 시점이 다른 그룹은 테스트를 따로 생성하세요.
 - `expectations[].at`는 `start`부터 센 시간이며 평가 간격에 맞춰야 합니다. `alerts: []`이면 해당 시점에 발화가 없어야 합니다. 발화를 기대할 때는 해당 알람의 모든 최종 라벨과 펼쳐진 주석을 지정합니다. `alertname`은 별도 필드에 둡니다.
@@ -457,6 +459,18 @@ python3 incident_to_promtool.py incident.json --prometheus-url http://localhost:
 `"30s"`처럼 간격을 직접 지정하면 평가 간격은 그 배수여야 하며, 기본 변환은 표본 시각이 격자에 맞아야 합니다. 명시적으로 `--round-up`을 쓰면 표본을 다음 격자로 미루고 최대 이동 시간을 표시합니다. 이때 `end`도 격자에 맞춰야 하고, 같은 시계열의 두 타임스탬프가 한 칸에 들어가면 더 촘촘한 간격이 필요합니다.
 
 입력은 유한한 스칼라 표본입니다. Prometheus 원본 조회 API는 stale 표식을 제외하므로, `absent()`처럼 시계열이 stale 상태가 된 시각에 의존하는 룰은 이 방식으로 정확히 재현하기 어렵습니다.
+
+### 긴 캡처 구간 나눠 조회하기
+
+라이브 테스트 생성 명령과 `snapshot`, `inspect`, `bundle`에 `--chunk-window DURATION`을 지정하면 각 Prometheus 요청의 조회 범위가 지정한 길이 이내가 되도록 캡처를 나눕니다. 양수 기간과 `--prometheus-url`이 필요하며, 인증과 TLS 옵션도 함께 쓸 수 있습니다. 기본값은 선택자당 한 번의 조회입니다. [Prometheus 인증](#prometheus-인증)
+
+```sh
+python3 incident_to_promtool.py snapshot incident.json \
+  --prometheus-url http://localhost:9090 --chunk-window 15m \
+  --output incident.matrix.json
+```
+
+첫 요청의 조회 범위는 `start`보다 1ms 앞에서 시작해 `start` 시각의 표본을 포함합니다. 이후 각 요청은 바로 이전 구간의 끝 다음부터 현재 구간의 끝까지 조회합니다. 모든 요청이 성공해야 결과를 만들며, 실패하면 출력 파일을 생성하지 않습니다. 합친 표본의 원본 시각은 스냅샷과 ZIP 안의 `matrix` 응답에 보존됩니다. 표준 형식으로 저장한 스냅샷, 테스트, 번들은 오프라인에서도 쓸 수 있습니다.
 
 ### Prometheus 인증
 
