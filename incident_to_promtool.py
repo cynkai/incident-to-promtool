@@ -1296,7 +1296,7 @@ def comparison_rule_bytes(sources, rule_format):
     return [content for _, content in sources]
 
 
-def timeline_probes(fixture, alertname, start, end):
+def timeline_probes(fixture, alertname, start, end, *, probe_from_zero=False):
     try:
         evaluation = duration_ms(fixture.data.get("evaluation_interval"))
     except ValueError as exc:
@@ -1318,7 +1318,7 @@ def timeline_probes(fixture, alertname, start, end):
         raise ValueError(f"timeline would simulate more than {MAX_TIMELINE_TICKS:,} evaluation ticks per rule version; shorten --end")
 
     # An empty expected alert set differs from Promtool's result exactly at firing ticks.
-    ticks = range(start, end + 1, evaluation)
+    ticks = range(0 if probe_from_zero else start, end + 1, evaluation)
     checks = [{"alertname": alertname, "eval_time": as_duration(offset), "exp_alerts": []} for offset in ticks]
     groups = [
         {**fixture.data["tests"][number - 1], "alert_rule_test": checks}
@@ -1329,32 +1329,62 @@ def timeline_probes(fixture, alertname, start, end):
     return probes, selected_groups, evaluation
 
 
-def firing_timeline(mismatches, group_count, evaluation):
+def firing_offsets(mismatches, group_count):
     offsets = [[] for _ in range(group_count)]
     for group, _, offset in mismatches:
         offsets[group - 1].append(offset)
 
-    timelines = []
     for firing in offsets:
         firing.sort()
-        intervals = []
-        for offset in firing:
-            if intervals and offset == intervals[-1]["end_offset_ms"] + evaluation:
-                intervals[-1]["end_offset_ms"] = offset
-            else:
-                intervals.append({"start_offset_ms": offset, "end_offset_ms": offset})
-        timelines.append({
-            "first_firing_offset_ms": firing[0] if firing else None,
-            "firing_ticks": len(firing),
-            "firing_intervals": intervals,
-        })
-    return timelines
+    return offsets
+
+
+def firing_timeline(firing, evaluation):
+    intervals = []
+    for offset in firing:
+        if intervals and offset == intervals[-1]["end_offset_ms"] + evaluation:
+            intervals[-1]["end_offset_ms"] = offset
+        else:
+            intervals.append({"start_offset_ms": offset, "end_offset_ms": offset})
+    return {
+        "first_firing_offset_ms": firing[0] if firing else None,
+        "firing_ticks": len(firing),
+        "firing_intervals": intervals,
+    }
+
+
+def firing_delta(before, after):
+    return after - before if before is not None and after is not None else None
+
+
+def timeline_delay_result(group, baseline, candidate, max_delay):
+    first_before = baseline[0] if baseline else None
+    first_after = candidate[0] if candidate else None
+    delta = firing_delta(first_before, first_after)
+    if first_before is None:
+        status = "no_baseline"
+    elif first_after is None:
+        status = "missing_after"
+    elif delta > max_delay:
+        status = "delayed"
+    else:
+        status = "passed"
+    return {
+        "group": group,
+        "status": status,
+        "before_first_firing_offset_ms": first_before,
+        "after_first_firing_offset_ms": first_after,
+        "first_firing_delta_ms": delta,
+    }
 
 
 def build_timeline_report(args):
     fixture = load_replay_fixture(args.fixture, args.fixture.read_bytes(), None, None)
     start, end = duration_ms(args.start), duration_ms(args.end)
-    probes, group_numbers, evaluation = timeline_probes(fixture, args.alertname, start, end)
+    max_delay = duration_ms(args.max_delay) if args.max_delay is not None else None
+    probes, group_numbers, evaluation = timeline_probes(
+        fixture, args.alertname, start, end, probe_from_zero=max_delay is not None,
+    )
     before_rules = comparison_rule_bytes(read_rule_sources(args.before), args.rule_format)
     after_rules = comparison_rule_bytes(read_rule_sources(args.after), args.rule_format)
     promtool = require_promtool(args.promtool)
@@ -1364,17 +1394,19 @@ def build_timeline_report(args):
         after, = test_rule_version(promtool, [probes], [after_rules], path / "after")
 
     groups = []
-    for number, baseline, candidate in zip(
-        group_numbers, firing_timeline(before, len(group_numbers), evaluation),
-        firing_timeline(after, len(group_numbers), evaluation), strict=True,
+    gate_groups = []
+    for number, before_offsets, after_offsets in zip(
+        group_numbers, firing_offsets(before, len(group_numbers)), firing_offsets(after, len(group_numbers)), strict=True,
     ):
-        first_before = baseline["first_firing_offset_ms"]
-        first_after = candidate["first_firing_offset_ms"]
+        baseline = firing_timeline([offset for offset in before_offsets if offset >= start], evaluation)
+        candidate = firing_timeline([offset for offset in after_offsets if offset >= start], evaluation)
         groups.append({
             "group": number, "before": baseline, "after": candidate,
-            "first_firing_delta_ms": first_after - first_before if first_before is not None and first_after is not None else None,
+            "first_firing_delta_ms": firing_delta(baseline["first_firing_offset_ms"], candidate["first_firing_offset_ms"]),
         })
-    return {
+        if max_delay is not None:
+            gate_groups.append(timeline_delay_result(number, before_offsets, after_offsets, max_delay))
+    report = {
         "schema_version": 1,
         "fixture_path": str(args.fixture),
         "alertname": args.alertname,
@@ -1383,6 +1415,51 @@ def build_timeline_report(args):
         "end_offset_ms": end,
         "groups": groups,
     }
+    if max_delay is not None:
+        checked = sum(group["status"] != "no_baseline" for group in gate_groups)
+        report["gate"] = {
+            "mode": "max-delay",
+            "max_delay_ms": max_delay,
+            "passed": checked > 0 and all(group["status"] in ("passed", "no_baseline") for group in gate_groups),
+            "checked_groups": checked,
+            "groups": gate_groups,
+        }
+    return report
+
+
+def format_observed_offset(offset):
+    return as_duration(offset) if offset is not None else "—"
+
+
+def format_timeline_shift(delta):
+    if delta is None:
+        return "—"
+    if delta == 0:
+        return "0s"
+    return f"{as_duration(abs(delta))} {'earlier' if delta < 0 else 'later'}"
+
+
+def print_timeline_gate(gate, end):
+    limit = as_duration(gate["max_delay_ms"])
+    verdict = "Passed" if gate["passed"] else "Failed"
+    print(f"\nTiming gate `max-delay {limit}` **{verdict}**. Measured from 0s through {end}.\n")
+    if not gate["checked_groups"]:
+        print("No baseline firing was observed in any selected group.\n")
+    statuses = {
+        "passed": "Within limit",
+        "delayed": "Delay exceeds limit",
+        "missing_after": "No candidate firing through end",
+        "no_baseline": "No baseline firing observed",
+    }
+    print("| Group | Baseline first firing | Candidate first firing | Shift | Gate result |")
+    print("| ---: | --- | --- | --- | --- |")
+    for group in gate["groups"]:
+        cells = [
+            str(group["group"]), format_observed_offset(group["before_first_firing_offset_ms"]),
+            format_observed_offset(group["after_first_firing_offset_ms"]),
+            format_timeline_shift(group["first_firing_delta_ms"]), statuses[group["status"]],
+        ]
+        print("| " + " | ".join(cells) + " |")
 
 
 def print_timeline_report(report):
@@ -1398,23 +1475,18 @@ def print_timeline_report(report):
         first_firings, periods = [], []
         for side in ("before", "after"):
             timeline = group[side]
-            first = timeline["first_firing_offset_ms"]
-            first_firings.append(as_duration(first) if first is not None else "—")
+            first_firings.append(format_observed_offset(timeline["first_firing_offset_ms"]))
             intervals = []
             for interval in timeline["firing_intervals"]:
                 first_tick, last_tick = interval["start_offset_ms"], interval["end_offset_ms"]
                 first_label = as_duration(first_tick)
                 intervals.append(first_label if first_tick == last_tick else f"{first_label}–{as_duration(last_tick)}")
             periods.append(", ".join(intervals) or "—")
-        delta = group["first_firing_delta_ms"]
-        if delta is None:
-            shift = "—"
-        elif delta:
-            shift = f"{as_duration(abs(delta))} {'earlier' if delta < 0 else 'later'}"
-        else:
-            shift = "0s"
+        shift = format_timeline_shift(group["first_firing_delta_ms"])
         cells = [str(group["group"]), *first_firings, shift, *periods]
         print("| " + " | ".join(cells) + " |")
+    if "gate" in report:
+        print_timeline_gate(report["gate"], end)
 
 
 def timeline_main(argv):
@@ -1428,6 +1500,7 @@ def timeline_main(argv):
     parser.add_argument("--alertname", required=True, help="alert name from the fixture's checkpoints")
     parser.add_argument("--start", default="0s", metavar="DURATION", help="first offset to observe (default: 0s)")
     parser.add_argument("--end", required=True, metavar="DURATION", help="last offset to observe (inclusive)")
+    parser.add_argument("--max-delay", metavar="DURATION", help="gate the first proposed firing against the baseline from 0s")
     parser.add_argument(
         "--rule-format", choices=("prometheus", "kubernetes"), default="prometheus",
         help="input rule format for both versions (default: prometheus)",
@@ -1445,6 +1518,8 @@ def timeline_main(argv):
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
         print_timeline_report(report)
+    gate = report.get("gate")
+    return int(gate is not None and not gate["passed"])
 
 
 def compare_main(argv):

@@ -58,7 +58,13 @@ jobs:
           "$cli" "$demo/alertmanager.incident.json" --matrix payment.matrix.json \
             --output payment.test.yml --summary-format json > summary.json
           "$cli" timeline payment.test.yml --before "$demo/before.rules.yml" --after "$demo/after.rules.yml" \
-            --alertname PaymentErrorsHigh --end 10m --format json --promtool "$RUNNER_TEMP/promtool" > timeline.json
+            --alertname PaymentErrorsHigh --end 10m --max-delay 0s \
+            --format json --promtool "$RUNNER_TEMP/promtool" > timeline.json
+          timeline_status=0
+          "$cli" timeline payment.test.yml --before "$demo/after.rules.yml" --after "$demo/before.rules.yml" \
+            --alertname PaymentErrorsHigh --start 9m --end 10m --max-delay 1m \
+            --format json --promtool "$RUNNER_TEMP/promtool" > timeline-regression.json || timeline_status=$?
+          [[ "$timeline_status" -eq 1 ]]
           "$smoke/venv/bin/python" - <<'PY'
           import hashlib
           import json
@@ -83,6 +89,19 @@ jobs:
           assert group["before"]["first_firing_offset_ms"] == 570_000
           assert group["after"]["first_firing_offset_ms"] == 330_000
           assert group["first_firing_delta_ms"] == -240_000
+          assert timeline["gate"]["max_delay_ms"] == 0 and timeline["gate"]["passed"] is True
+
+          regression = json.loads(Path("timeline-regression.json").read_text(encoding="utf-8"))
+          assert regression["schema_version"] == 1
+          visible, = regression["groups"]
+          assert visible["first_firing_delta_ms"] == 30_000
+          assert regression["gate"] == {
+              "mode": "max-delay", "max_delay_ms": 60_000, "passed": False, "checked_groups": 1,
+              "groups": [{
+                  "group": 1, "status": "delayed", "before_first_firing_offset_ms": 330_000,
+                  "after_first_firing_offset_ms": 570_000, "first_firing_delta_ms": 240_000,
+              }],
+          }
           PY
 
           report=$("$cli" compare payment.test.yml --before "$demo/before.rules.yml" \

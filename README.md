@@ -91,7 +91,25 @@ python3 incident_to_promtool.py timeline demo/generated/after.test.yml \
 
 지정한 이름의 알람이 라벨 조합 하나에서라도 발화하면 해당 평가 시점을 발화로 기록합니다. 리포트에는 범위 안에서 처음 관측한 발화, 연속된 평가 시점에서 발화한 구간, 양쪽에서 모두 발화가 관측됐을 때의 첫 발화 차이(수정 − 기준)가 들어갑니다. 구간 끝은 마지막으로 발화가 관측된 시점입니다. `--end`까지 이어지는 구간의 해제 시각은 이후 관측이 있어야 판단할 수 있습니다.
 
-결제 예제에서는 테스트 시작부터 기준 룰 `570s`, 수정 룰 `330s`에 처음 발화가 관측돼 수정 룰이 `240s` 앞섭니다. 기본 출력은 Markdown이며 `--format json`으로 JSON을 받습니다. 의존 룰은 `--before`와 `--after`를 반복해 지정하고, Kubernetes `PrometheusRule`은 `--rule-format kubernetes`를 사용합니다. `--promtool`로 실행 파일을 지정할 수 있습니다. 게이트에 따른 회귀 판정은 `compare`에서 확인합니다.
+결제 예제에서는 테스트 시작부터 기준 룰 `570s`, 수정 룰 `330s`에 처음 발화가 관측돼 수정 룰이 `240s` 앞섭니다. 기본 출력은 Markdown이며 `--format json`으로 JSON을 받습니다. 의존 룰은 `--before`와 `--after`를 반복해 지정하고, Kubernetes `PrometheusRule`은 `--rule-format kubernetes`를 사용합니다. `--promtool`로 실행 파일을 지정할 수 있습니다. 체크포인트에 정의한 기대 동작은 `compare`에서 검증합니다.
+
+#### CI에서 발화 지연 제한
+
+`--max-delay`를 지정하면 `0s`부터 `--end`까지 관측한 최초 발화에 지연 게이트를 적용합니다. `--start`는 타임라인의 표시 범위를 정합니다. 기준 룰이 발화한 그룹마다 수정 룰도 `--end`까지 발화해야 하고, 최초 발화 차이(수정 − 기준)는 허용치 이하여야 합니다. 허용치와 같아도 통과합니다. `--max-delay 0s`는 기준과 같거나 더 이른 발화를 허용합니다.
+
+기준 발화가 관측된 그룹만 지연을 검사합니다. 그런 그룹이 하나도 없으면 판정 근거가 부족해 게이트가 실패합니다.
+
+```sh
+python3 incident_to_promtool.py timeline demo/generated/after.test.yml \
+  --before demo/after.rules.yml --after demo/before.rules.yml \
+  --alertname PaymentErrorsHigh --start 9m --end 10m --max-delay 1m
+```
+
+`9m`부터 표시한 타임라인에서는 `30s` 차이가 보입니다. 게이트는 `0s`부터의 발화 지연 `240s`를 사용해 `1m` 한도를 초과한 것으로 판정합니다. Markdown에는 게이트 판정과 그 근거를 별도 표로 표시합니다.
+
+`--max-delay`와 `--format json`을 같이 사용하면 JSON의 `gate`에 `mode`(`max-delay`), `max_delay_ms`, `passed`, `checked_groups`, `groups`가 들어갑니다. `groups`의 각 항목은 `group`, `status`, `before_first_firing_offset_ms`, `after_first_firing_offset_ms`, `first_firing_delta_ms`를 기록합니다. 이 시점과 차이는 `0s`부터 관측한 결과입니다. `status`는 `passed`, `delayed`, `missing_after`, `no_baseline` 중 하나입니다.
+
+종료 코드는 게이트 없이 보고를 완료했거나 게이트를 통과했을 때 `0`, 게이트 실패 `1`, 입력 또는 실행 오류 `2`입니다.
 
 ### JSON 리포트
 
