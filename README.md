@@ -14,6 +14,8 @@ bash scripts/demo.sh
 
 The demo replays synthetic payment metrics without a Prometheus server. It checks that the alert stays quiet before the outage and is firing five minutes after it starts. The original rule matches **1/2** checkpoints. The revised rule matches **2/2** and passes the check.
 
+Run `bash scripts/demo.sh --timing` for the same offline payment replay with a seven-minute firing deadline. [Payment timing demo](#발화-기한-예제)
+
 Use `timeline` to compare an alert's first firing across Git revisions. The GitHub Action can enforce delay limits and firing deadlines from a committed timing policy alongside checkpoint checks. [GitHub Action timing policy](#발화-지연-정책)
 
 Use Python 3.10+ and `promtool` 3.9+. With no local `promtool`, the demo downloads and verifies a pinned binary on Linux x64. Set `PROMTOOL=/path/to/promtool` to use a specific executable.
@@ -61,6 +63,25 @@ promtool test rules demo/generated/after.test.yml
 ```
 
 `for`를 6분에서 2분으로 바꾸면 이 데이터에서 최초 발화가 장애 시작 후 7분 30초에서 3분 30초로 앞당겨집니다. 다시 생성할 때는 새 출력 경로를 사용하세요.
+
+### 발화 기한 예제
+
+```sh
+bash scripts/demo.sh --timing
+```
+
+저장소에 있는 `demo/timing.incident.json`과 `demo/timing.policy.json`을 사용해, 같은 합성 결제 시계열에서 두 후보를 원래 룰과 각각 비교합니다. 두 후보 모두 체크포인트 `2/2`를 충족하고 기준 대비 지연 허용치 `0s`를 통과합니다. 원래 룰은 테스트 시작 `9m30s`에 발화해 `7m` 기한을 넘깁니다. 수정 룰은 `5m30s`에 발화해 기한을 충족합니다.
+
+스크립트는 두 결과를 재현하면 `0`으로 종료하며 표준 출력에 두 비교를 담은 Markdown 요약을 남깁니다. 같은 파일로 수정 룰의 전체 Markdown과 JSON을 보려면 아래 명령을 실행합니다. [발화 지연 정책](#발화-지연-정책)
+
+```sh
+mkdir -p demo/generated
+python3 incident_to_promtool.py demo/timing.incident.json \
+  --matrix demo/incident.matrix.json --output demo/generated/payment-timing.test.yml
+python3 incident_to_promtool.py compare demo/generated/payment-timing.test.yml \
+  --before demo/before.rules.yml --after demo/after.rules.yml \
+  --timeline-policy demo/timing.policy.json --json-report demo/generated/timing-review.json
+```
 
 ## 룰 변경 전후 비교
 

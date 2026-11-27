@@ -1,0 +1,25 @@
+{
+  "start": "2025-01-01T00:00:00Z",
+  "end": "2025-01-01T00:10:00Z",
+  "sample_interval": "30s",
+  "evaluation_interval": "30s",
+  "selectors": ["payment_http_requests_total{code=\"500\"}"],
+  "rule_files": ["after.rules.yml"],
+  "expectations": [
+    {
+      "at": "90s",
+      "alertname": "PaymentErrorsHigh",
+      "alerts": []
+    },
+    {
+      "at": "10m",
+      "alertname": "PaymentErrorsHigh",
+      "alerts": [
+        {
+          "labels": {"severity": "page"},
+          "annotations": {"summary": "Payment service is returning HTTP 500 responses"}
+        }
+      ]
+    }
+  ]
+}

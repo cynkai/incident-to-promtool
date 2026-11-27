@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "checks": [
+    {
+      "alertname": "PaymentErrorsHigh",
+      "end": "10m",
+      "max_delay": "0s",
+      "fire_by": "7m"
+    }
+  ]
+}

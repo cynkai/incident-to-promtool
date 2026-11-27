@@ -38,6 +38,23 @@ jobs:
           [[ "$report" == '## Prometheus alert comparison'* ]]
           [[ "$report" == *'| Before | Failed | 1/2 |'* ]]
           [[ "$report" == *'| After | Passed | 2/2 |'* ]]
+      - name: Run the timing quickstart from outside the checkout
+        run: |
+          demo="$GITHUB_WORKSPACE/scripts/demo.sh"
+          quickstart=$(mktemp -d "$RUNNER_TEMP/timing-quickstart.XXXXXXXX")
+          cd "$quickstart"
+          export TMPDIR='temporary files' PROMTOOL="$RUNNER_TEMP/promtool"
+          mkdir -- "$TMPDIR"
+          report=$(bash "$demo" --timing)
+          [[ "$report" == '## Payment alert timing demo'* ]]
+          [[ "$report" == *'| Original rule | 2/2 | 570s | 0s (pass) | Failed | Failed |'* ]]
+          [[ "$report" == *'| Revised rule | 2/2 | 330s | 240s earlier (pass) | Passed | Passed |'* ]]
+          usage=$(bash "$demo" --help)
+          [[ "$usage" == *'--timing'* ]]
+          status=0
+          bash "$demo" --unknown > /dev/null 2>&1 || status=$?
+          [[ "$status" -eq 2 ]]
+          [[ $(ls -A) == "$TMPDIR" && -z $(ls -A -- "$TMPDIR") ]]
       - name: Smoke test the installed wheel
         if: matrix.version == '3.11.0'
         run: |
