@@ -431,7 +431,7 @@ python3 incident_to_promtool.py incident.json \
 promtool test rules incident.test.yml
 ```
 
-Bearer 인증이 필요한 서버에는 환경 변수 `PROMETHEUS_BEARER_TOKEN`을 사용할 수 있습니다. 저장된 API 응답이 있을 때는 `--matrix`로 로컬에서 변환할 수 있습니다. Prometheus의 `/api/v1/query`에 범위 선택자를 보냈을 때 반환되는 원본 `matrix` 응답을 사용합니다.
+저장된 API 응답이 있을 때는 `--matrix`로 로컬에서 변환할 수 있습니다. Prometheus의 `/api/v1/query`에 범위 선택자를 보냈을 때 반환되는 원본 `matrix` 응답을 사용합니다. 인증이 필요한 서버에 연결할 때는 토큰 파일이나 환경 변수를 지정할 수 있습니다. [Prometheus 인증](#prometheus-인증)
 
 - `start`와 `end`는 시간대가 포함된 캡처 구간입니다. `start`를 테스트의 시각 기준으로 고정합니다. `start`는 장애보다 앞에 두고, 룰의 `rate(...[5m])` 같은 조회 범위와 `for` 상태를 평가할 수 있게 충분한 사전 구간을 포함하세요.
 - `selectors`에는 룰 평가에 필요한 원본 시계열 선택자를 넣습니다. `sample_interval`은 시계열 격자 간격, `evaluation_interval`은 테스트의 단일 평가 간격입니다. 발화 시점을 대조하려면 평가 간격을 운영과 맞추고 `start`도 운영 룰 그룹의 평가 시점에 맞추세요. 평가 시점이 다른 그룹은 테스트를 따로 생성하세요.
@@ -458,6 +458,21 @@ python3 incident_to_promtool.py incident.json --prometheus-url http://localhost:
 
 입력은 유한한 스칼라 표본입니다. Prometheus 원본 조회 API는 stale 표식을 제외하므로, `absent()`처럼 시계열이 stale 상태가 된 시각에 의존하는 룰은 이 방식으로 정확히 재현하기 어렵습니다.
 
+### Prometheus 인증
+
+`--bearer-token-file PATH`는 Prometheus에 연결하는 테스트 생성 명령과 `bundle`, `snapshot`, `inspect`, `plan-capture`에서 사용할 수 있습니다. `--prometheus-url`을 함께 지정합니다. `--matrix`는 저장된 응답을 읽는 오프라인 모드라 인증 정보를 생략합니다.
+
+파일에는 RFC 6750 형식의 Bearer 토큰 하나를 넣습니다. 끝에 줄바꿈(LF 또는 CRLF) 하나를 둘 수 있습니다. 명령 실행당 한 번 읽으며, 마운트된 Kubernetes Secret의 심볼릭 링크 경로도 사용할 수 있습니다. 파일 옵션을 지정하면 파일이 우선합니다. 파일 옵션을 생략하면 `PROMETHEUS_BEARER_TOKEN` 환경 변수의 토큰을 사용합니다.
+
+```sh
+python3 incident_to_promtool.py snapshot incident.json \
+  --prometheus-url https://prometheus.example.com \
+  --bearer-token-file /var/run/secrets/prometheus/token \
+  --output incident.matrix.json
+```
+
+리디렉션이 발생하면 `urllib`은 원래 요청에만 인증 헤더를 붙입니다. 리디렉션이 끝난 최종 Prometheus HTTPS 기본 URL을 `--prometheus-url`에 지정하세요.
+
 ### 캡처할 시계열 계획
 
 `plan-capture`는 알람 룰에 필요한 원본 시계열 선택자를 찾아줍니다. 저장소 루트의 Python 가상 환경에서 실행합니다.
@@ -470,7 +485,7 @@ python3 incident_to_promtool.py plan-capture demo/after.rules.yml \
 
 Prometheus 룰 YAML은 위치 인자로 여러 개 지정할 수 있습니다. Prometheus와 같이 각 파일의 첫 문서를 읽습니다. 알람이 여러 개면 `--alertname`을 반복합니다. Kubernetes `PrometheusRule`은 [`export-rules`](#kubernetes-prometheusrule로-테스트)로 변환한 YAML을 입력으로 사용합니다.
 
-이 명령은 PromQL 식을 Prometheus 3.x의 실험적 `/api/v1/parse_query`에 보내 구문을 분석합니다. Prometheus 3.9와 3.11에서 확인했으며, Bearer 인증에는 `PROMETHEUS_BEARER_TOKEN`을 사용합니다. 시계열 표본 조회는 이후 캡처 단계에서 실행합니다. [Prometheus 구문 분석 API](https://prometheus.io/docs/prometheus/latest/querying/api/#parsing-a-promql-expressions-into-a-abstract-syntax-tree-ast)
+이 명령은 PromQL 식을 Prometheus 3.x의 실험적 `/api/v1/parse_query`에 보내 구문을 분석합니다. Prometheus 3.9와 3.11에서 확인했습니다. 시계열 표본 조회는 이후 캡처 단계에서 실행합니다. [Prometheus 구문 분석 API](https://prometheus.io/docs/prometheus/latest/querying/api/#parsing-a-promql-expressions-into-a-abstract-syntax-tree-ast) · [Prometheus 인증](#prometheus-인증)
 
 출력은 `schema_version`이 `1`인 JSON으로, 요청한 `alertnames`, 따라간 `recording_rules`, 캡처할 `selectors`를 담습니다. `selectors` 배열을 장애 설정에 복사하세요. 상수식처럼 원본 시계열이 필요 없는 룰의 `selectors`는 빈 배열입니다. 룰 변경 전후에 참조하는 시계열이 달라지면 두 버전에서 얻은 선택자를 합쳐서 캡처하세요.
 

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
+from http.client import HTTPException
 from itertools import pairwise
 import json
 import math
@@ -19,7 +20,7 @@ import subprocess
 import sys
 from tempfile import NamedTemporaryFile, TemporaryDirectory, TemporaryFile
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import quote, unquote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 from zipfile import ZIP_DEFLATED, BadZipFile, ZipFile
@@ -34,6 +35,7 @@ METRIC_NAME = re.compile(r"[a-zA-Z_:][a-zA-Z0-9_:]*")
 LABEL_NAME = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]*")
 SELECTOR = re.compile(r'(?:[a-zA-Z_:][a-zA-Z0-9_:]*)?(?:\{(?:[^{}"\\]|"(?:[^"\\]|\\.)*")*\})?')
 FLOAT = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", re.ASCII)
+BEARER_TOKEN = re.compile(r"[A-Za-z0-9._~+/-]+=*")
 ALERT_MISMATCH = re.compile(r"\A[ \t]*alertname: (.+), time: ([^,\n]+),[ \t]*\n[ \t]*exp:")
 MAX_VALUES = 2_000_000
 MAX_PROMTOOL_DURATION_MS = (2**63 - 1) // 1_000_000
@@ -221,29 +223,59 @@ def rule_test_cases(expectations, window, evaluation, config_dir):
     return tests
 
 
-def prometheus_json(base_url, endpoint, params, *, post=False):
+def load_prometheus_bearer_token(path):
+    if path is None:
+        source = "PROMETHEUS_BEARER_TOKEN"
+        token = os.environ.get(source)
+        if not token:
+            return None
+    else:
+        source = f"Bearer token file {path}"
+        try:
+            contents = path.read_bytes()
+            line_ending = b"\r\n" if contents.endswith(b"\r\n") else b"\n"
+            token = contents.removesuffix(line_ending).decode("ascii")
+        except OSError as exc:
+            raise ValueError(f"could not read {source}: {exc.strerror}") from None
+        except UnicodeError:
+            raise ValueError(f"{source} must contain a single nonempty ASCII Bearer token") from None
+    if not BEARER_TOKEN.fullmatch(token):
+        raise ValueError(f"{source} must contain a single nonempty ASCII Bearer token")
+    return token
+
+
+def redact_bearer_token(detail, token):
+    if token is None:
+        return detail
+    redacted = detail.replace(quote(token, safe=""), "***").replace(token, "***")
+    # Omit the detail if another percent-encoded spelling still reveals the token.
+    return "***" if token in unquote(redacted) else redacted
+
+
+def prometheus_json(base_url, endpoint, params, *, post=False, bearer_token=None):
     form = urlencode(params)
     url = f"{base_url}/api/v1/{endpoint}"
     request = Request(
         url if post else f"{url}?{form}", data=form.encode("ascii") if post else None,
         headers={"Accept": "application/json"},
     )
-    token = os.environ.get("PROMETHEUS_BEARER_TOKEN")
-    if token:
+    if bearer_token is not None:
         # urllib does not copy unredirected headers to a subsequent request.
-        request.add_unredirected_header("Authorization", f"Bearer {token}")
+        request.add_unredirected_header("Authorization", f"Bearer {bearer_token}")
     try:
         with urlopen(request, timeout=30) as response:
             return json.load(response, parse_float=Decimal)
     except HTTPError as exc:
         message = f"Prometheus returned HTTP {exc.code} for /api/v1/{endpoint}"
-        with exc, suppress(ValueError, OSError):
+        with exc, suppress(ValueError, OSError, HTTPException):
             error = json.loads(exc.read(4096))
             if isinstance(error, dict) and isinstance(error.get("error"), str):
-                message += f": {error['error']}"
-        raise ValueError(message) from exc
-    except URLError as exc:
-        raise ValueError(f"Prometheus request failed: {exc.reason}") from exc
+                message += f": {redact_bearer_token(error['error'], bearer_token)}"
+        raise ValueError(message) from None
+    except (URLError, HTTPException) as exc:
+        reason = exc.reason if isinstance(exc, URLError) else exc
+        detail = redact_bearer_token(str(reason), bearer_token)
+        raise ValueError(f"Prometheus request failed: {detail}") from None
 
 
 def prometheus_base_url(value):
@@ -254,13 +286,13 @@ def prometheus_base_url(value):
     return base_url
 
 
-def fetch_matrix(base_url, selector, end, window):
+def fetch_matrix(base_url, selector, end, window, *, bearer_token=None):
     params = {"query": f"{selector}[{as_duration(window + 1)}]", "time": end.isoformat()}
-    return prometheus_json(base_url, "query", params)
+    return prometheus_json(base_url, "query", params, bearer_token=bearer_token)
 
 
-def fetch_promql_ast(base_url, expression):
-    response = prometheus_json(base_url, "parse_query", {"query": expression}, post=True)
+def fetch_promql_ast(base_url, expression, *, bearer_token=None):
+    response = prometheus_json(base_url, "parse_query", {"query": expression}, post=True, bearer_token=bearer_token)
     if not isinstance(response, dict) or response.get("status") != "success" or response.get("warnings"):
         raise ValueError("Prometheus could not parse the expression through /api/v1/parse_query")
     return response.get("data")
@@ -276,7 +308,8 @@ def capture_matrices(args, config, end, window):
         for selector in selectors
     ):
         raise ValueError("selectors must contain raw metric selectors, such as requests_total{job=\"api\"}")
-    return (fetch_matrix(base_url, selector, end, window) for selector in selectors)
+    bearer_token = load_prometheus_bearer_token(args.bearer_token_file)
+    return (fetch_matrix(base_url, selector, end, window, bearer_token=bearer_token) for selector in selectors)
 
 
 def series_name(labels):
@@ -2053,6 +2086,20 @@ def add_capture_source_options(parser):
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--prometheus-url", help="query a Prometheus server for raw historical samples")
     source.add_argument("--matrix", type=Path, action="append", help="read a saved raw query response (repeatable)")
+    add_prometheus_auth_options(parser)
+
+
+def add_prometheus_auth_options(parser):
+    parser.add_argument(
+        "--bearer-token-file", type=Path, help="read a Prometheus Bearer token from a file instead of PROMETHEUS_BEARER_TOKEN",
+    )
+
+
+def parse_capture_args(parser, argv=None):
+    args = parser.parse_args(argv)
+    if args.bearer_token_file is not None and args.prometheus_url is None:
+        parser.error("--bearer-token-file requires --prometheus-url")
+    return args
 
 
 def add_fixture_generation_options(parser):
@@ -2070,7 +2117,7 @@ def bundle_main(argv):
     add_capture_source_options(parser)
     add_fixture_generation_options(parser)
     parser.add_argument("--output", required=True, type=Path, help="new ZIP archive")
-    args = parser.parse_args(argv)
+    args = parse_capture_args(parser, argv)
     try:
         summary = write_bundle(args)
     except FileExistsError:
@@ -2109,6 +2156,7 @@ def plan_capture_main(argv):
     parser.add_argument("rules", metavar="rule-file", nargs="+", type=Path, help="native Prometheus rule files")
     parser.add_argument("--alertname", required=True, action="append", help="alert rule name (repeatable)")
     parser.add_argument("--prometheus-url", required=True, help="Prometheus server providing /api/v1/parse_query")
+    add_prometheus_auth_options(parser)
     args = parser.parse_args(argv)
     if any(not name.strip() for name in args.alertname):
         parser.error("--alertname must not be empty")
@@ -2116,8 +2164,11 @@ def plan_capture_main(argv):
 
     try:
         base_url = prometheus_base_url(args.prometheus_url)
+        bearer_token = load_prometheus_bearer_token(args.bearer_token_file)
         sources = read_rule_sources(args.rules)
-        report = plan_capture(sources, args.alertname, lambda expression: fetch_promql_ast(base_url, expression))
+        report = plan_capture(
+            sources, args.alertname, lambda expression: fetch_promql_ast(base_url, expression, bearer_token=bearer_token),
+        )
     except (ValueError, TypeError, KeyError, OSError, RecursionError) as exc:
         parser.exit(2, f"error: {exc}\n")
     print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -2131,7 +2182,7 @@ def snapshot_main(argv):
     parser.add_argument("config", type=Path, help="capture window and selectors (JSON)")
     add_capture_source_options(parser)
     parser.add_argument("--output", required=True, type=Path, help="new matrix JSON file")
-    args = parser.parse_args(argv)
+    args = parse_capture_args(parser, argv)
     try:
         config = read_json(args.config)
         (_, begin_ms), (end, end_ms) = capture_window(config)
@@ -2155,7 +2206,7 @@ def inspect_main(argv):
     add_capture_source_options(parser)
     parser.add_argument("--format", choices=("markdown", "json"), default="markdown", help="report format (default: markdown)")
     parser.add_argument("--max-gap", metavar="DURATION", help="fail on empty captures or gaps exceeding this positive duration")
-    args = parser.parse_args(argv)
+    args = parse_capture_args(parser, argv)
     try:
         max_gap_ms = None
         if args.max_gap is not None:
@@ -2209,7 +2260,7 @@ def main():
     parser.add_argument("--summary-format", choices=("text", "json"), default="text",
                         help="write a plain-text or JSON capture summary to stdout (default: text)")
     parser.add_argument("--output", required=True, type=Path, help="new promtool YAML test file")
-    args = parser.parse_args()
+    args = parse_capture_args(parser)
     try:
         summary = generate(args)
     except FileExistsError:
