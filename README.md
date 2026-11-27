@@ -544,6 +544,8 @@ python3 incident_to_promtool.py incident.json \
 
 저장 파일은 Prometheus `matrix` 응답 형식이며, 지정 구간의 표본 시각을 밀리초 정밀도로 보존하고 라벨과 값을 그대로 담습니다. 저장된 응답을 합치려면 `snapshot`에 `--matrix part-a.matrix.json --matrix part-b.matrix.json`과 같이 입력을 반복 지정합니다. 같은 시계열에서 시각과 값이 일치하는 표본은 하나로 합칩니다. 구간 안에 표본이 없거나 같은 시각의 값이 충돌하거나, 응답에 경고 또는 네이티브 히스토그램이 있으면 오류로 처리합니다.
 
+`--max-gap`을 지정하면 간격 검사를 통과한 캡처만 스냅샷으로 저장합니다. [파일 생성 전 표본 간격 검사](#파일-생성-전-표본-간격-검사)
+
 ### 장애 재현 번들
 
 `bundle`은 한 번 캡처한 시계열로 스냅샷과 테스트를 만들고, 오프라인에서 다시 실행할 파일을 ZIP 하나에 담습니다. `--output`에는 새 ZIP 경로를 지정합니다.
@@ -557,6 +559,8 @@ unzip -q demo/generated/payment.zip -d demo/generated/payment
 ```
 
 시계열은 `--matrix`를 반복해 지정하거나 `--prometheus-url`로 가져옵니다. `--rule-file`을 반복해 설정의 룰 파일을 바꿀 수 있습니다. `--round-up`과 `--max-shift`는 테스트를 생성할 때와 같은 의미입니다.
+
+`--max-gap`을 지정하면 간격 검사를 통과한 캡처만 번들로 저장합니다. [파일 생성 전 표본 간격 검사](#파일-생성-전-표본-간격-검사)
 
 | 파일 | 내용 |
 | --- | --- |
@@ -666,7 +670,20 @@ python3 incident_to_promtool.py inspect demo/demo.json \
 
 저장 응답은 `--matrix`를 반복해 지정할 수 있습니다. 서버에서 조회할 때는 시간대가 있는 `start`와 `end`, `selectors`를 설정하고 `--prometheus-url`을 사용합니다.
 
-`--max-gap`을 지정하면 첫 표본 전, 표본 사이, 마지막 표본 후의 공백 중 하나라도 제한을 초과할 때 실패합니다. 구간에 표본이 하나도 없을 때도 이 검사는 실패합니다. 옵션을 생략하면 빈 구간을 포함한 관측 결과를 그대로 보고합니다. 종료 코드는 검사 통과 또는 제한 없이 보고할 때 `0`, 간격 검사 실패 `1`, 잘못된 입력 `2`입니다.
+`--max-gap`에 양수 기간을 지정하면 첫 표본 전, 표본 사이, 마지막 표본 후의 공백 중 하나라도 제한을 초과할 때 실패합니다. 구간에 표본이 하나도 없을 때도 이 검사는 실패합니다. 옵션을 생략하면 빈 구간을 포함한 관측 결과를 그대로 보고합니다. 종료 코드는 검사 통과 또는 제한 없이 보고할 때 `0`, 간격 검사 실패 `1`, 잘못된 입력 `2`입니다.
+
+#### 파일 생성 전 표본 간격 검사
+
+테스트 생성 명령과 `snapshot`, `bundle`도 `--max-gap`으로 같은 검사를 실행합니다. 라이브 조회와 저장된 `--matrix` 입력 모두에서 격자에 맞추기 전 관측된 시계열의 원본 시각으로 공백을 계산합니다. 공백이 제한과 같으면 통과합니다. 표본이 없거나 공백 하나라도 제한을 넘으면 출력 파일을 쓰기 전에 중단하고 종료 코드 `1`을 반환합니다. 시계열별로 어떤 공백이 검사에 걸렸는지 보려면 같은 입력으로 `inspect --max-gap`을 실행합니다.
+
+```sh
+mkdir -p demo/generated
+python3 incident_to_promtool.py demo/demo.json \
+  --matrix demo/incident.matrix.json --max-gap 30s \
+  --summary-format json --output demo/generated/payment.covered.test.yml
+```
+
+검사를 통과하면 테스트 생성의 JSON 요약과 번들의 `capture.json`에 `coverage_gate`를 기록합니다. 여기에는 `max_gap_ms`와 `passed`가 들어갑니다. 번들의 `coverage.json`에는 검사 결과와 시계열별 간격을 담고, `capture.json`의 `generation_options`에 `--max-gap`을 기록해 재생성에도 적용합니다. 스냅샷은 Prometheus `matrix` 형식으로 저장합니다.
 
 ### Alertmanager 웹훅으로 기대 동작 만들기
 

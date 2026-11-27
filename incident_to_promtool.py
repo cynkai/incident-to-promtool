@@ -71,7 +71,11 @@ def timestamp_ms(value):
     if not isinstance(value, str):
         raise ValueError("start and end must be ISO 8601 timestamps with a timezone")
     instant = datetime.fromisoformat(value.removesuffix("Z") + "+00:00" if value.endswith("Z") else value)
-    if instant.tzinfo is None or instant.microsecond % 1000:
+    if (
+        instant.tzinfo is None
+        or instant.microsecond % 1000
+        or instant.utcoffset().microseconds % 1000
+    ):
         raise ValueError("timestamps require a timezone and at most millisecond precision")
     delta = instant - EPOCH
     return instant.astimezone(timezone.utc), (delta.days * 86_400 + delta.seconds) * 1000 + delta.microseconds // 1000
@@ -664,6 +668,7 @@ class PreparedCapture:
     start: datetime
     end: datetime
     begin_ms: int
+    coverage: dict | None
 
 
 def capture_rule_paths(args, config):
@@ -680,6 +685,7 @@ def capture_rule_paths(args, config):
 
 
 def prepare_capture(args, config, rule_files):
+    max_gap_ms = parse_max_gap(args.max_gap)
     start, begin_ms = timestamp_ms(config["start"])
     end, end_ms = timestamp_ms(config["end"])
     window = end_ms - begin_ms
@@ -698,7 +704,8 @@ def prepare_capture(args, config, rule_files):
 
     tests = rule_test_cases(config["expectations"], window, evaluation, args.config.parent)
     matrices = capture_matrices(args, config, end, window)
-    samples = capture_samples(matrices, begin_ms, end_ms)
+    samples = capture_samples(matrices, begin_ms, end_ms, allow_empty=max_gap_ms is not None)
+    coverage = check_capture_coverage(samples, start, end, max_gap_ms)
     if automatic:
         capture, step = encode_automatic_samples(samples, evaluation, window, max_shift)
         sampling_mode = "auto_bounded" if capture.shifted_sample_count else "auto_exact"
@@ -731,7 +738,9 @@ def prepare_capture(args, config, rule_files):
         "checkpoint_count": len(tests),
         "expanded_slots": capture.expanded_slots,
     }
-    return PreparedCapture(fixture, summary, samples, start, end, begin_ms)
+    if coverage is not None:
+        summary["coverage_gate"] = coverage["gate"]
+    return PreparedCapture(fixture, summary, samples, start, end, begin_ms, coverage)
 
 
 def write_capture_fixture(path, prepared, *, relative=False):
@@ -792,12 +801,16 @@ def write_bundle(args):
         generation_options = ["--round-up"] if args.round_up else []
         if args.max_shift is not None:
             generation_options.extend(("--max-shift", args.max_shift))
+        if args.max_gap is not None:
+            generation_options.extend(("--max-gap", args.max_gap))
         summary["generation_options"] = generation_options
         summary["bundle_manifest_version"] = BUNDLE_MANIFEST_VERSION
         write_new_json(directory / BUNDLE_CAPTURE_SUMMARY, summary)
         write_new_json(directory / "incident.json", offline_incident_config(prepared, config["sample_interval"]))
         write_matrix_snapshot(directory / "incident.matrix.json", prepared.samples, prepared.begin_ms)
-        coverage = build_coverage_report(prepared.samples, prepared.start, prepared.end, None)
+        coverage = prepared.coverage
+        if coverage is None:
+            coverage = build_coverage_report(prepared.samples, prepared.start, prepared.end, None)
         write_new_json(directory / "coverage.json", coverage)
 
         entries = [*BUNDLE_FIXED_FILES, *rule_files]
@@ -1156,6 +1169,20 @@ def markdown_code(value):
     return f"<code>{escaped}</code>"
 
 
+def parse_max_gap(value):
+    if value is None:
+        return None
+    max_gap_ms = duration_ms(value)
+    if max_gap_ms <= 0:
+        raise ValueError("--max-gap requires a positive duration")
+    return max_gap_ms
+
+
+def longest_series_gap(row):
+    interior = row["max_sample_gap"]
+    return max(row["leading_gap_ms"], row["trailing_gap_ms"], interior["duration_ms"] if interior else 0)
+
+
 def build_coverage_report(samples, start, end, max_gap_ms):
     window = (end - start) // timedelta(milliseconds=1)
 
@@ -1181,7 +1208,7 @@ def build_coverage_report(samples, start, end, max_gap_ms):
             "max_sample_gap": gap,
         }
         if max_gap_ms is not None:
-            detail["gap_exceeded"] = max(first, window - last, gap["duration_ms"] if gap else 0) > max_gap_ms
+            detail["gap_exceeded"] = longest_series_gap(detail) > max_gap_ms
         details.append(detail)
     gate = None
     if max_gap_ms is not None:
@@ -1195,6 +1222,21 @@ def build_coverage_report(samples, start, end, max_gap_ms):
         "series": details,
         "gate": gate,
     }
+
+
+def check_capture_coverage(samples, start, end, max_gap_ms):
+    if max_gap_ms is None:
+        return None
+    report = build_coverage_report(samples, start, end, max_gap_ms)
+    if report["gate"]["passed"]:
+        return report
+    limit = as_duration(max_gap_ms)
+    if not report["series"]:
+        raise ValueError(f"--max-gap {limit} check failed. No float samples found in the capture window.")
+    exceeded = [row for row in report["series"] if row["gap_exceeded"]]
+    worst = max(exceeded, key=longest_series_gap)
+    gap = as_duration(longest_series_gap(worst))
+    raise ValueError(f"--max-gap {limit} exceeded in {len(exceeded)} series. The largest gap is {gap} in {worst['series']}.")
 
 
 def print_coverage_report(report):
@@ -2226,6 +2268,7 @@ def add_capture_source_options(parser):
     source.add_argument("--matrix", type=Path, action="append", help="read a saved raw query response (repeatable)")
     parser.add_argument("--chunk-window", metavar="DURATION", help="maximum PromQL range per live Prometheus query")
     parser.add_argument("--split-on-limit", action="store_true", help="bisect queries that exceed the Prometheus sample limit")
+    parser.add_argument("--max-gap", metavar="DURATION", help="fail on empty captures or gaps exceeding this positive duration")
     add_prometheus_connection_options(parser)
 
 
@@ -2335,10 +2378,12 @@ def snapshot_main(argv):
     parser.add_argument("--output", required=True, type=Path, help="new matrix JSON file")
     args = parse_capture_args(parser, argv)
     try:
+        max_gap_ms = parse_max_gap(args.max_gap)
         config = read_json(args.config)
-        (_, begin_ms), (end, end_ms) = capture_window(config)
+        (start, begin_ms), (end, end_ms) = capture_window(config)
         matrices = capture_matrices(args, config, end, end_ms - begin_ms)
-        samples = capture_samples(matrices, begin_ms, end_ms)
+        samples = capture_samples(matrices, begin_ms, end_ms, allow_empty=max_gap_ms is not None)
+        check_capture_coverage(samples, start, end, max_gap_ms)
         write_matrix_snapshot(args.output, samples, begin_ms)
     except FileExistsError:
         parser.exit(1, f"error: output file already exists: {args.output}\n")
@@ -2356,14 +2401,9 @@ def inspect_main(argv):
     parser.add_argument("config", type=Path, help="capture window and selectors (JSON)")
     add_capture_source_options(parser)
     parser.add_argument("--format", choices=("markdown", "json"), default="markdown", help="report format (default: markdown)")
-    parser.add_argument("--max-gap", metavar="DURATION", help="fail on empty captures or gaps exceeding this positive duration")
     args = parse_capture_args(parser, argv)
     try:
-        max_gap_ms = None
-        if args.max_gap is not None:
-            max_gap_ms = duration_ms(args.max_gap)
-            if max_gap_ms <= 0:
-                raise ValueError("--max-gap requires a positive duration")
+        max_gap_ms = parse_max_gap(args.max_gap)
         config = read_json(args.config)
         (start, begin_ms), (end, end_ms) = capture_window(config)
         matrices = capture_matrices(args, config, end, end_ms - begin_ms)
