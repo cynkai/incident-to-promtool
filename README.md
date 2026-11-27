@@ -464,14 +464,17 @@ python3 incident_to_promtool.py incident.json --prometheus-url http://localhost:
 
 파일에는 RFC 6750 형식의 Bearer 토큰 하나를 넣습니다. 끝에 줄바꿈(LF 또는 CRLF) 하나를 둘 수 있습니다. 명령 실행당 한 번 읽으며, 마운트된 Kubernetes Secret의 심볼릭 링크 경로도 사용할 수 있습니다. 파일 옵션을 지정하면 파일이 우선합니다. 파일 옵션을 생략하면 `PROMETHEUS_BEARER_TOKEN` 환경 변수의 토큰을 사용합니다.
 
+사설 CA나 자체 서명 인증서를 쓰는 Prometheus에는 같은 명령에서 `--ca-file PATH`로 PEM CA 파일을 지정할 수 있습니다. `--prometheus-url`에는 HTTPS 주소를 쓰고, Bearer 인증이 필요하면 `--bearer-token-file`도 함께 지정합니다. 지정한 CA는 시스템 기본 신뢰 목록에 추가되고, 서버 이름과 인증서 유효 기간도 계속 검증합니다.
+
 ```sh
 python3 incident_to_promtool.py snapshot incident.json \
   --prometheus-url https://prometheus.example.com \
+  --ca-file /etc/prometheus/tls/ca.crt \
   --bearer-token-file /var/run/secrets/prometheus/token \
   --output incident.matrix.json
 ```
 
-리디렉션이 발생하면 `urllib`은 원래 요청에만 인증 헤더를 붙입니다. 리디렉션이 끝난 최종 Prometheus HTTPS 기본 URL을 `--prometheus-url`에 지정하세요.
+`--ca-file`을 쓰면 HTTPS 리디렉션 대상의 인증서도 검증하며, HTTP로 향하는 리디렉션은 오류로 처리합니다. `urllib`은 원래 요청에만 인증 헤더를 붙이므로 `--prometheus-url`에는 최종 Prometheus HTTPS 기본 URL을 지정하세요.
 
 ### 캡처할 시계열 계획
 

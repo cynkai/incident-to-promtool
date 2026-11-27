@@ -21,7 +21,7 @@ import sys
 from tempfile import NamedTemporaryFile, TemporaryDirectory, TemporaryFile
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlencode, urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 from xml.etree import ElementTree
 from zipfile import ZIP_DEFLATED, BadZipFile, ZipFile
 import zlib
@@ -252,7 +252,7 @@ def redact_bearer_token(detail, token):
     return "***" if token in unquote(redacted) else redacted
 
 
-def prometheus_json(base_url, endpoint, params, *, post=False, bearer_token=None):
+def prometheus_json(base_url, endpoint, params, *, post=False, bearer_token=None, open_request=urlopen):
     form = urlencode(params)
     url = f"{base_url}/api/v1/{endpoint}"
     request = Request(
@@ -263,7 +263,7 @@ def prometheus_json(base_url, endpoint, params, *, post=False, bearer_token=None
         # urllib does not copy unredirected headers to a subsequent request.
         request.add_unredirected_header("Authorization", f"Bearer {bearer_token}")
     try:
-        with urlopen(request, timeout=30) as response:
+        with open_request(request, timeout=30) as response:
             return json.load(response, parse_float=Decimal)
     except HTTPError as exc:
         message = f"Prometheus returned HTTP {exc.code} for /api/v1/{endpoint}"
@@ -286,13 +286,50 @@ def prometheus_base_url(value):
     return base_url
 
 
-def fetch_matrix(base_url, selector, end, window, *, bearer_token=None):
+class HTTPSOnlyRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urlsplit(newurl).scheme != "https":
+            fp.close()
+            raise ValueError("Prometheus redirects must stay on HTTPS with --ca-file")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def prometheus_client(args):
+    base_url = prometheus_base_url(args.prometheus_url)
+    open_request = urlopen
+    if args.ca_file is not None:
+        if urlsplit(base_url).scheme != "https":
+            raise ValueError("--ca-file requires an HTTPS Prometheus URL")
+        try:
+            import ssl
+            from urllib.request import HTTPSHandler
+        except ImportError:
+            raise ValueError("--ca-file requires Python SSL support") from None
+        context = ssl.create_default_context()
+        try:
+            context.load_verify_locations(cafile=str(args.ca_file))
+        except OSError as exc:
+            raise ValueError(f"could not load Prometheus CA file {args.ca_file}: {exc.strerror}") from None
+        if ssl.HAS_ALPN:
+            context.set_alpn_protocols(["http/1.1"])
+        open_request = build_opener(HTTPSHandler(context=context), HTTPSOnlyRedirectHandler()).open
+    bearer_token = load_prometheus_bearer_token(args.bearer_token_file)
+
+    def request_json(endpoint, params, *, post=False):
+        return prometheus_json(
+            base_url, endpoint, params, post=post, bearer_token=bearer_token, open_request=open_request,
+        )
+
+    return request_json
+
+
+def fetch_matrix(request_json, selector, end, window):
     params = {"query": f"{selector}[{as_duration(window + 1)}]", "time": end.isoformat()}
-    return prometheus_json(base_url, "query", params, bearer_token=bearer_token)
+    return request_json("query", params)
 
 
-def fetch_promql_ast(base_url, expression, *, bearer_token=None):
-    response = prometheus_json(base_url, "parse_query", {"query": expression}, post=True, bearer_token=bearer_token)
+def fetch_promql_ast(request_json, expression):
+    response = request_json("parse_query", {"query": expression}, post=True)
     if not isinstance(response, dict) or response.get("status") != "success" or response.get("warnings"):
         raise ValueError("Prometheus could not parse the expression through /api/v1/parse_query")
     return response.get("data")
@@ -301,15 +338,14 @@ def fetch_promql_ast(base_url, expression, *, bearer_token=None):
 def capture_matrices(args, config, end, window):
     if args.matrix:
         return (read_json(path) for path in args.matrix)
-    base_url = prometheus_base_url(args.prometheus_url)
     selectors = config["selectors"]
     if not isinstance(selectors, list) or not selectors or any(
         not isinstance(selector, str) or not selector or not SELECTOR.fullmatch(selector)
         for selector in selectors
     ):
         raise ValueError("selectors must contain raw metric selectors, such as requests_total{job=\"api\"}")
-    bearer_token = load_prometheus_bearer_token(args.bearer_token_file)
-    return (fetch_matrix(base_url, selector, end, window, bearer_token=bearer_token) for selector in selectors)
+    request_json = prometheus_client(args)
+    return (fetch_matrix(request_json, selector, end, window) for selector in selectors)
 
 
 def series_name(labels):
@@ -2086,19 +2122,23 @@ def add_capture_source_options(parser):
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--prometheus-url", help="query a Prometheus server for raw historical samples")
     source.add_argument("--matrix", type=Path, action="append", help="read a saved raw query response (repeatable)")
-    add_prometheus_auth_options(parser)
+    add_prometheus_connection_options(parser)
 
 
-def add_prometheus_auth_options(parser):
+def add_prometheus_connection_options(parser):
     parser.add_argument(
         "--bearer-token-file", type=Path, help="read a Prometheus Bearer token from a file instead of PROMETHEUS_BEARER_TOKEN",
     )
+    parser.add_argument("--ca-file", type=Path, help="trust this additional PEM CA bundle for a live HTTPS Prometheus URL")
 
 
 def parse_capture_args(parser, argv=None):
     args = parser.parse_args(argv)
-    if args.bearer_token_file is not None and args.prometheus_url is None:
-        parser.error("--bearer-token-file requires --prometheus-url")
+    if args.prometheus_url is None:
+        if args.bearer_token_file is not None:
+            parser.error("--bearer-token-file requires --prometheus-url")
+        if args.ca_file is not None:
+            parser.error("--ca-file requires --prometheus-url")
     return args
 
 
@@ -2156,19 +2196,16 @@ def plan_capture_main(argv):
     parser.add_argument("rules", metavar="rule-file", nargs="+", type=Path, help="native Prometheus rule files")
     parser.add_argument("--alertname", required=True, action="append", help="alert rule name (repeatable)")
     parser.add_argument("--prometheus-url", required=True, help="Prometheus server providing /api/v1/parse_query")
-    add_prometheus_auth_options(parser)
+    add_prometheus_connection_options(parser)
     args = parser.parse_args(argv)
     if any(not name.strip() for name in args.alertname):
         parser.error("--alertname must not be empty")
     from capture_planner import plan_capture
 
     try:
-        base_url = prometheus_base_url(args.prometheus_url)
-        bearer_token = load_prometheus_bearer_token(args.bearer_token_file)
+        request_json = prometheus_client(args)
         sources = read_rule_sources(args.rules)
-        report = plan_capture(
-            sources, args.alertname, lambda expression: fetch_promql_ast(base_url, expression, bearer_token=bearer_token),
-        )
+        report = plan_capture(sources, args.alertname, lambda expression: fetch_promql_ast(request_json, expression))
     except (ValueError, TypeError, KeyError, OSError, RecursionError) as exc:
         parser.exit(2, f"error: {exc}\n")
     print(json.dumps(report, ensure_ascii=False, indent=2))
