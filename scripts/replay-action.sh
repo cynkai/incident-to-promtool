@@ -29,6 +29,12 @@ bundle_paths=()
 while IFS= read -r bundle_path; do
     bundle_paths+=("$bundle_path")
 done < <(nonempty_path_lines "${INCIDENT_BUNDLES:-}")
+required_metric_arguments=()
+while IFS= read -r metric; do
+    metric=${metric#"${metric%%[![:space:]]*}"}
+    metric=${metric%"${metric##*[![:space:]]}"}
+    required_metric_arguments+=(--bundle-require-metric="$metric")
+done < <(nonempty_path_lines "${INCIDENT_BUNDLE_REQUIRED_METRICS:-}")
 
 source_count=0
 for source in "$fixture" "${fixture_paths[0]:-}" "$bundle" "${bundle_paths[0]:-}"; do
@@ -55,6 +61,14 @@ fi
 if [[ "$bundle_mode" -eq 0 && -n "$bundle_max_gap" ]]; then
     printf 'bundle-max-gap requires bundle or bundles.\n' >&2
     exit 2
+fi
+if [[ "$bundle_mode" -eq 0 && -n "${required_metric_arguments[0]:-}" ]]; then
+    printf 'bundle-required-metrics requires bundle or bundles.\n' >&2
+    exit 2
+fi
+bundle_coverage_enabled=0
+if [[ -n "$bundle_max_gap" || -n "${required_metric_arguments[0]:-}" ]]; then
+    bundle_coverage_enabled=1
 fi
 
 timeline_mode=disabled
@@ -94,6 +108,9 @@ if [[ "$bundle_mode" -eq 1 ]]; then
     comparison_arguments=(compare-bundle --bundle-ref="$INCIDENT_BEFORE_REF" --after-ref="$INCIDENT_AFTER_REF")
     if [[ -n "$bundle_max_gap" ]]; then
         comparison_arguments+=(--bundle-max-gap="$bundle_max_gap")
+    fi
+    if [[ -n "${required_metric_arguments[0]:-}" ]]; then
+        comparison_arguments+=("${required_metric_arguments[@]}")
     fi
     input_paths=("${bundle_paths[@]}")
 else
@@ -227,7 +244,7 @@ printf '::%s::\n' "$command_token"
 
 if [[ "$status" -le 1 ]]; then
     if [[ -s "$report" && -s "$json_report" && -s "$junit_report" ]] &&
-        report_values=$("$python" - "$json_report" "$timeline_mode" "$bundle_max_gap" <<'PY'
+        report_values=$("$python" - "$json_report" "$timeline_mode" "$bundle_coverage_enabled" <<'PY'
 import json
 import sys
 
@@ -242,7 +259,7 @@ try:
     elif timeline_mode == "single":
         timeline = report["timeline"]
         timeline_passed = timeline["passed"] if "passed" in timeline else timeline["gate"]["passed"]
-    bundle_coverage_enabled = bool(sys.argv[3])
+    bundle_coverage_enabled = sys.argv[3] == "1"
     bundle_coverage_passed = report["bundle_coverage"]["passed"] if bundle_coverage_enabled else None
 except (OSError, ValueError, KeyError, TypeError):
     sys.exit(1)

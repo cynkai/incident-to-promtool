@@ -389,7 +389,7 @@ JSON의 `timeline_policy`에는 정책 경로 `path`, 읽은 파일 바이트의
 
 ZIP 하나를 비교할 때는 `bundle`, 여러 개면 `bundles`에 한 줄에 하나씩 경로를 적습니다. 비교에는 `bundle`, `bundles`, `fixture`, `fixtures` 중 하나를 선택합니다. 번들 비교에서는 ZIP을 `before-ref`(기본 `HEAD^1`)에서 읽고, `rule-files`에 지정한 공통 수정 룰을 `after-ref`(기본 `HEAD`)에서 읽습니다. 두 경로는 저장소 루트 기준이며, 룰 파일은 수정 커밋에 있으면 됩니다. [장애 재현 번들](#장애-재현-번들)
 
-`bundle-max-gap`은 `bundle`과 `bundles`에서 사용할 수 있습니다. 모든 ZIP에 같은 제한을 적용하며, `steps.compare.outputs.bundle-coverage-passed`에 전체 판정을 문자열 `true` 또는 `false`로 제공합니다. 표본 공백으로 단계가 실패해도 비교 리포트와 이 출력을 읽을 수 있습니다. [번들의 표본 간격 검사](#번들의-표본-간격-검사)
+`bundle`과 `bundles`에는 `bundle-max-gap`과 `bundle-required-metrics`를 각각 또는 함께 지정할 수 있습니다. 필수 메트릭 이름은 `bundle-required-metrics`에 한 줄에 하나씩 적습니다. 모든 ZIP에 같은 기준을 적용하며, `steps.compare.outputs.bundle-coverage-passed`에 전체 판정을 문자열 `true` 또는 `false`로 제공합니다. 표본 간격이나 필수 메트릭 검사로 단계가 실패해도 비교 리포트와 이 출력을 읽을 수 있습니다. [번들의 표본 간격 검사](#번들의-표본-간격-검사)
 
 현재 PR의 기준 룰을 사용하려면 `bundle` 또는 `bundles`와 함께 `before-rule-files`와 `after-rule-files`를 모두 지정합니다. ZIP과 기준 룰은 `before-ref`, 수정 룰은 `after-ref`에서 읽습니다. 두 룰 목록은 저장소 루트 기준으로 한 줄에 하나씩 적습니다. 두 목록을 제공하는 방식과 ZIP에 담긴 기준 룰을 쓰는 `rule-files` 방식 중 하나를 선택합니다.
 
@@ -401,6 +401,8 @@ with:
   after-rule-files: |
     prometheus/payment/alerts.yml
     prometheus/payment/recording.yml
+  bundle-required-metrics: |
+    payment_http_requests_total
   gate: regressions
 ```
 
@@ -593,14 +595,14 @@ python3 incident_to_promtool.py verify-bundle demo/generated/payment.zip --forma
 
 전체 검증에는 `manifest.json`이 필요합니다. 종료 코드는 검증을 통과하면 `0`, 형식이 잘못됐거나 파일과 해시가 일치하지 않으면 `2`입니다. 이 검사는 ZIP 내부 파일과 동봉된 해시의 일치 여부를 확인합니다. 작성자와 배포 출처를 확인하려면 신뢰할 수 있는 서명이나 별도의 출처 기록이 필요합니다.
 
-`--max-gap`을 지정하면 전체 파일의 SHA-256을 확인한 뒤 원본 표본의 공백을 검사합니다. `--format json`에는 [`inspect`와 같은 구조](#시계열-표본-간격-확인)의 `coverage`가 추가됩니다.
+`--max-gap` 또는 `--require-metric`을 지정하면 전체 파일의 SHA-256을 확인한 뒤 원본 표본에 해당 검사를 적용합니다. 이름을 여러 개 확인하려면 `--require-metric`을 반복합니다. `--format json`에는 [`inspect`와 같은 구조](#시계열-표본-간격-확인)의 `coverage`가 추가됩니다.
 
 ```sh
 python3 incident_to_promtool.py verify-bundle demo/generated/payment.zip \
-  --max-gap 30s --format json
+  --max-gap 30s --require-metric payment_http_requests_total --format json
 ```
 
-결제 번들은 `30s` 제한을 통과합니다. 제한을 `29s`로 바꾸면 간격 초과를 보고하고 `1`로 종료합니다. 원본 구간이 비어도 판정을 보고하고 `1`로 종료합니다. 매니페스트 누락, 해시 불일치, 잘못된 원본 설정이나 표본은 입력 오류 `2`로 처리합니다.
+결제 번들은 두 검사를 통과합니다. 제한을 `29s`로 바꾸면 간격 초과를, `--require-metric up`을 추가하면 메트릭 누락을 보고하고 `1`로 종료합니다. 원본 구간이 비어도 판정을 보고하고 `1`로 종료합니다. 매니페스트 누락, 해시 불일치, 잘못된 원본 설정이나 표본은 입력 오류 `2`로 처리합니다.
 
 #### 번들에서 룰 변경 비교
 
@@ -675,7 +677,7 @@ JSON의 `timeline`에는 선택한 `bundle`, 기준 룰의 출처 `baseline_sour
 
 ##### 번들의 표본 간격 검사
 
-`compare-bundle --bundle-max-gap`은 각 ZIP에 담긴 원본 표본에 양수 간격 제한을 적용합니다. 매니페스트와 대조한 `incident.json`에서 캡처 구간을 읽고, `incident.matrix.json`에서 격자 이동 전 표본 시각을 읽습니다. Git 비교에서는 `--bundle-ref`의 ZIP에서 읽습니다. 매니페스트가 있는 기존 ZIP에 적용할 수 있으며, `coverage.json`의 기록과 관계없이 이번에 지정한 제한으로 다시 계산합니다. 공백이 제한과 같으면 통과합니다.
+`compare-bundle --bundle-max-gap`은 각 ZIP에 담긴 원본 표본에 양수 간격 제한을 적용합니다. `--bundle-require-metric NAME`을 반복하면 각 ZIP에서 지정한 메트릭을 모두 확인합니다. 두 옵션은 각각 또는 함께 사용할 수 있습니다. 매니페스트와 대조한 `incident.json`에서 캡처 구간을 읽고, `incident.matrix.json`에서 격자 이동 전 표본을 읽습니다. Git 비교에서는 `--bundle-ref`의 ZIP에서 읽습니다. 매니페스트가 있는 기존 ZIP에 적용할 수 있으며, `coverage.json`의 기록과 관계없이 이번에 지정한 기준을 적용합니다. 공백이 제한과 같으면 통과합니다.
 
 ```sh
 python3 incident_to_promtool.py compare-bundle demo/generated/payment-baseline.zip \
@@ -684,9 +686,9 @@ python3 incident_to_promtool.py compare-bundle demo/generated/payment-baseline.z
   --junit-report demo/generated/payment-coverage.xml
 ```
 
-이 예제에서 수정 룰은 체크포인트 두 개를 충족하지만, 원본 표본의 `30s` 간격이 `29s` 제한을 넘겨 비교는 `1`로 종료합니다. 간격 검사에 실패해도 유효한 번들의 룰 비교를 실행하고 리포트를 생성합니다. 매니페스트가 없거나 원본 파일을 검증할 수 없으면 입력 오류 `2`로 처리합니다.
+이 예제에서 수정 룰은 체크포인트 두 개를 충족합니다. 원본 표본의 `30s` 간격이 `29s` 제한을 넘겨 비교는 `1`로 종료합니다. 표본 검사에 실패해도 유효한 번들의 룰 비교를 실행하고 리포트를 생성합니다. 매니페스트가 없거나 원본 파일을 검증할 수 없으면 입력 오류 `2`로 처리합니다.
 
-옵션을 켜면 JSON에 제한 `max_gap_ms`, 전체 판정 `passed`, 번들별 결과 `checks`를 담은 `bundle_coverage`가 추가됩니다. `checks`의 각 항목에는 ZIP 경로 `path`와 `inspect` 형식의 `coverage`가 있습니다. JUnit XML은 번들별 판정을 `Bundle sample coverage` 스위트에 기록합니다. [기준 번들로 PR 검사](#기준-번들로-pr-검사)
+표본 검사 옵션을 지정하면 JSON에 전체 판정 `passed`와 번들별 결과 `checks`를 담은 `bundle_coverage`가 추가됩니다. 선택한 검사에 따라 `max_gap_ms`에 간격 제한을, `required_metrics`에 필수 메트릭 이름 목록을 기록합니다. `checks`의 각 항목에는 ZIP 경로 `path`와 `inspect` 형식의 `coverage`가 있습니다. JUnit XML은 간격과 메트릭 누락 판정을 `Bundle sample coverage` 스위트에 기록합니다. [기준 번들로 PR 검사](#기준-번들로-pr-검사)
 
 ### 시계열 표본 간격 확인
 
@@ -699,7 +701,7 @@ python3 incident_to_promtool.py inspect demo/demo.json \
 
 저장 응답은 `--matrix`를 반복해 지정할 수 있습니다. 서버에서 조회할 때는 시간대가 있는 `start`와 `end`, `selectors`를 설정하고 `--prometheus-url`을 사용합니다.
 
-`--max-gap`에 양수 기간을 지정하면 첫 표본 전, 표본 사이, 마지막 표본 후의 공백 중 하나라도 제한을 초과할 때 실패합니다. 구간에 표본이 하나도 없을 때도 이 검사는 실패합니다. 옵션을 생략하면 빈 구간을 포함한 관측 결과를 그대로 보고합니다. 종료 코드는 검사 통과 또는 제한 없이 보고할 때 `0`, 간격 검사 실패 `1`, 잘못된 입력 `2`입니다.
+`--max-gap`에 양수 기간을 지정하면 첫 표본 전, 표본 사이, 마지막 표본 후의 공백 중 하나라도 제한을 초과할 때 실패합니다. 구간에 표본이 하나도 없을 때도 이 검사는 실패합니다. 검사 옵션을 모두 생략하면 빈 구간을 포함한 관측 결과를 그대로 보고합니다. 종료 코드는 검사 통과 또는 관측 결과만 보고할 때 `0`, 검사 실패 `1`, 잘못된 입력 `2`입니다.
 
 #### 파일 생성 전 표본 간격 검사
 
@@ -713,6 +715,18 @@ python3 incident_to_promtool.py demo/demo.json \
 ```
 
 검사를 통과하면 테스트 생성의 JSON 요약과 번들의 `capture.json`에 `coverage_gate`를 기록합니다. 여기에는 `max_gap_ms`와 `passed`가 들어갑니다. 번들의 `coverage.json`에는 검사 결과와 시계열별 간격을 담고, `capture.json`의 `generation_options`에 `--max-gap`을 기록해 재생성에도 적용합니다. 스냅샷은 Prometheus `matrix` 형식으로 저장합니다.
+
+#### 필수 메트릭 확인
+
+`inspect`, 테스트 생성 명령, `snapshot`, `bundle`, `verify-bundle`에서 `--require-metric NAME`을 반복해 캡처에 필요한 메트릭을 지정합니다. 각 이름과 `__name__`이 정확히 일치하는 시계열 중 하나에서 캡처 구간 안의 원본 실수 표본이 하나 이상 관측되면 통과합니다. 구간 안에서 관측이 이어졌는지는 `--max-gap`으로 확인합니다.
+
+```sh
+python3 incident_to_promtool.py inspect demo/demo.json \
+  --matrix demo/incident.matrix.json --max-gap 30s \
+  --require-metric payment_http_requests_total --require-metric up --format json
+```
+
+이 명령은 저장된 표본만 읽습니다. `30s` 간격 검사와 `payment_http_requests_total` 확인은 통과합니다. 필수 이름 `up`이 누락되어 종료 코드는 `1`입니다. JSON의 `required_metrics`에 확인한 이름 `names`, 누락한 이름 `missing`, 판정 `passed`가 표시됩니다. 테스트 생성, `snapshot`, `bundle`은 메트릭이 누락되면 파일을 쓰기 전에 중단하고 `1`로 종료합니다. 검사에 통과하면 테스트 생성 요약과 번들의 `capture.json`에 `required_metrics`를 기록합니다. 번들의 `generation_options`에도 필수 메트릭 옵션을 기록합니다. [번들 전체 검증](#번들-전체-검증)
 
 ### Alertmanager 웹훅으로 기대 동작 만들기
 

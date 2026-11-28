@@ -657,6 +657,8 @@ jobs:
           promtool-path: ${{ runner.temp }}/promtool
           timeline-policy: incidents/payment timing policy.json
           bundle-max-gap: 30s
+          bundle-required-metrics: |
+            payment_http_requests_total
       - name: Check the committed bundle batch comparison
         env:
           REPORT_PATH: ${{ steps.bundled-batch.outputs.report-path }}
@@ -720,21 +722,24 @@ jobs:
 
           bundle_coverage = report["bundle_coverage"]
           assert bundle_coverage["max_gap_ms"] == 30_000 and bundle_coverage["passed"] is True
+          required = ["payment_http_requests_total"]
+          assert bundle_coverage["required_metrics"] == required
           assert [check["path"] for check in bundle_coverage["checks"]] == paths
           for check, trailing_gap in zip(bundle_coverage["checks"], (0, 1), strict=True):
               coverage = check["coverage"]
               assert coverage["gate"] == {"max_gap_ms": 30_000, "passed": True}
+              assert coverage["required_metrics"] == {"names": required, "missing": [], "passed": True}
               assert coverage["sample_count"] == 21
               series, = coverage["series"]
               assert series["max_sample_gap"]["duration_ms"] == 30_000
               assert series["trailing_gap_ms"] == trailing_gap and series["gap_exceeded"] is False
 
           junit = ElementTree.parse(os.environ["JUNIT_REPORT_PATH"]).getroot()
-          assert junit.attrib["tests"] == "8" and junit.attrib["failures"] == "0"
+          assert junit.attrib["tests"] == "10" and junit.attrib["failures"] == "0"
           timing_cases = junit.findall("testsuite[@name='Alert firing delay']/testcase")
           assert len(timing_cases) == 2 and all(case.find("failure") is None for case in timing_cases)
           coverage_cases = junit.findall("testsuite[@name='Bundle sample coverage']/testcase")
-          assert len(coverage_cases) == 2 and all(case.find("failure") is None for case in coverage_cases)
+          assert len(coverage_cases) == 4 and all(case.find("failure") is None for case in coverage_cases)
           PY
       - name: Compare the bundles with a tighter sample gap limit
         id: bundled-gap-failure
@@ -778,6 +783,7 @@ jobs:
           assert report["timeline_policy"]["passed"] is True
           bundle_coverage = report["bundle_coverage"]
           assert bundle_coverage["max_gap_ms"] == 29_000 and bundle_coverage["passed"] is False
+          assert "required_metrics" not in bundle_coverage
           assert [check["path"] for check in bundle_coverage["checks"]] == [bundle["path"] for bundle in report["bundles"]]
           for check in bundle_coverage["checks"]:
               coverage = check["coverage"]
@@ -789,4 +795,57 @@ jobs:
           assert junit.attrib["tests"] == "8" and junit.attrib["failures"] == "2"
           failures = junit.findall("testsuite[@name='Bundle sample coverage']/testcase/failure")
           assert len(failures) == 2 and all(failure.attrib["type"] == "max-gap" for failure in failures)
+          PY
+      - name: Compare a committed bundle with a missing required metric
+        id: bundled-metric-failure
+        continue-on-error: true
+        uses: ./
+        with:
+          repo-path: ${{ runner.temp }}/composite-repo
+          bundle: incidents/payment baseline.zip
+          rule-files: |
+            rules/payment candidate.yml
+          rule-format: kubernetes
+          promtool-path: ${{ runner.temp }}/promtool
+          bundle-max-gap: 30s
+          bundle-required-metrics: |
+            payment_http_requests
+            payment_http_requests_total
+      - name: Check the required metric failure and preserved reports
+        env:
+          OUTCOME: ${{ steps.bundled-metric-failure.outcome }}
+          REPORT_PATH: ${{ steps.bundled-metric-failure.outputs.report-path }}
+          JSON_REPORT_PATH: ${{ steps.bundled-metric-failure.outputs.json-report-path }}
+          JUNIT_REPORT_PATH: ${{ steps.bundled-metric-failure.outputs.junit-report-path }}
+          NEWLY_FAILED: ${{ steps.bundled-metric-failure.outputs.newly-failed }}
+          BUNDLE_COVERAGE_PASSED: ${{ steps.bundled-metric-failure.outputs.bundle-coverage-passed }}
+        run: |
+          [[ "$OUTCOME" == failure && "$BUNDLE_COVERAGE_PASSED" == false ]]
+          [[ "$NEWLY_FAILED" == '0' ]]
+          report=$(cat "$REPORT_PATH")
+          [[ "$report" == *'| After | Passed | 2/2 |'* ]]
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from xml.etree import ElementTree
+
+          report = json.loads(Path(os.environ["JSON_REPORT_PATH"]).read_text(encoding="utf-8"))
+          assert report["gate"] == {"mode": "strict", "passed": True}
+          assert report["summary"]["after"] == {"matched": 2, "total": 2}
+          bundle_coverage = report["bundle_coverage"]
+          required = ["payment_http_requests", "payment_http_requests_total"]
+          assert bundle_coverage["required_metrics"] == required and bundle_coverage["passed"] is False
+          check, = bundle_coverage["checks"]
+          assert check["path"] == report["bundle"]["path"]
+          coverage = check["coverage"]
+          assert coverage["gate"] == {"max_gap_ms": 30_000, "passed": True}
+          assert coverage["required_metrics"] == {
+              "names": required, "missing": ["payment_http_requests"], "passed": False,
+          }
+
+          junit = ElementTree.parse(os.environ["JUNIT_REPORT_PATH"]).getroot()
+          assert junit.attrib["tests"] == "4" and junit.attrib["failures"] == "1"
+          failure, = junit.findall("testsuite[@name='Bundle sample coverage']/testcase/failure")
+          assert failure.attrib["type"] == "required-metrics"
           PY

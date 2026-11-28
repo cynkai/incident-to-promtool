@@ -16,6 +16,9 @@ inputs:
   bundle-max-gap:
     description: Maximum allowed gap between original samples or at the capture boundaries, such as 30s. Use with bundle or bundles.
     required: false
+  bundle-required-metrics:
+    description: Newline-separated metric names that must have at least one observed sample in each bundle. Use with bundle or bundles.
+    required: false
   fixture-ref:
     description: Git revision containing the repository-root-relative fixture and capture summary paths. Use with fixture or fixtures. Omit to read from the checkout.
     required: false
@@ -86,7 +89,7 @@ outputs:
     description: The string true or false when an optional timing gate or policy runs.
     value: ${{ steps.replay.outputs.timeline-passed }}
   bundle-coverage-passed:
-    description: The string true or false when the optional bundle sample coverage gate runs.
+    description: The string true or false when a bundle gap or required-metric check runs. When both are configured, both must pass.
     value: ${{ steps.replay.outputs.bundle-coverage-passed }}
 runs:
   using: composite
@@ -101,6 +104,7 @@ runs:
         INCIDENT_BUNDLE: ${{ inputs.bundle }}
         INCIDENT_BUNDLES: ${{ inputs.bundles }}
         INCIDENT_BUNDLE_MAX_GAP: ${{ inputs.bundle-max-gap }}
+        INCIDENT_BUNDLE_REQUIRED_METRICS: ${{ inputs.bundle-required-metrics }}
         INCIDENT_FIXTURE_REF: ${{ inputs.fixture-ref }}
         INCIDENT_CAPTURE_SUMMARIES: ${{ inputs.capture-summaries }}
         INCIDENT_RULE_FILES: ${{ inputs.rule-files }}

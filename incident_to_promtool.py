@@ -690,7 +690,7 @@ def capture_rule_paths(args, config):
 
 
 def prepare_capture(args, config, rule_files):
-    max_gap_ms = parse_max_gap(args.max_gap)
+    policy = parse_coverage_policy(args.max_gap, args.required_metrics)
     start, begin_ms = timestamp_ms(config["start"])
     end, end_ms = timestamp_ms(config["end"])
     window = end_ms - begin_ms
@@ -709,8 +709,8 @@ def prepare_capture(args, config, rule_files):
 
     tests = rule_test_cases(config["expectations"], window, evaluation, args.config.parent)
     matrices = capture_matrices(args, config, end, window)
-    samples = capture_samples(matrices, begin_ms, end_ms, allow_empty=max_gap_ms is not None)
-    coverage = check_capture_coverage(samples, start, end, max_gap_ms)
+    samples = capture_samples(matrices, begin_ms, end_ms, allow_empty=policy is not None)
+    coverage = check_capture_coverage(samples, start, end, policy)
     if automatic:
         capture, step = encode_automatic_samples(samples, evaluation, window, max_shift)
         sampling_mode = "auto_bounded" if capture.shifted_sample_count else "auto_exact"
@@ -744,7 +744,10 @@ def prepare_capture(args, config, rule_files):
         "expanded_slots": capture.expanded_slots,
     }
     if coverage is not None:
-        summary["coverage_gate"] = coverage["gate"]
+        if coverage["gate"] is not None:
+            summary["coverage_gate"] = coverage["gate"]
+        if "required_metrics" in coverage:
+            summary["required_metrics"] = coverage["required_metrics"]
     return PreparedCapture(fixture, summary, samples, start, end, begin_ms, coverage)
 
 
@@ -808,6 +811,9 @@ def write_bundle(args):
             generation_options.extend(("--max-shift", args.max_shift))
         if args.max_gap is not None:
             generation_options.extend(("--max-gap", args.max_gap))
+        if "required_metrics" in summary:
+            for name in summary["required_metrics"]["names"]:
+                generation_options.extend(("--require-metric", name))
         summary["generation_options"] = generation_options
         summary["bundle_manifest_version"] = BUNDLE_MANIFEST_VERSION
         write_new_json(directory / BUNDLE_CAPTURE_SUMMARY, summary)
@@ -1041,7 +1047,7 @@ def verify_bundle_capture_summary(path, checksum, contents, manifest):
             raise ValueError(f"{path}: capture summary requires {BUNDLE_MANIFEST}")
 
 
-def read_bundle_coverage(archive, path, manifest, max_gap_ms):
+def read_bundle_coverage(archive, path, manifest, policy):
     if manifest is None:
         raise ValueError(f"{path}: sample coverage verification requires {BUNDLE_MANIFEST}")
 
@@ -1059,10 +1065,10 @@ def read_bundle_coverage(archive, path, manifest, max_gap_ms):
         samples = capture_samples((matrix,), begin_ms, end_ms, allow_empty=True)
     except (ValueError, TypeError, KeyError, AttributeError, DecimalException, OverflowError) as exc:
         raise ValueError(f"{path}: invalid raw capture for sample coverage: {exc}") from exc
-    return build_coverage_report(samples, start, end, max_gap_ms)
+    return build_coverage_report(samples, start, end, policy)
 
 
-def load_bundle_replay(path, *, source=None, include_archived_rules=True, max_gap_ms=None):
+def load_bundle_replay(path, *, source=None, include_archived_rules=True, coverage_policy=None):
     fixture_path = f"{path}!{BUNDLE_FIXTURE}"
     summary_path = f"{path}!{BUNDLE_CAPTURE_SUMMARY}"
     with open_bundle_archive(path, source) as (archive, names):
@@ -1080,11 +1086,11 @@ def load_bundle_replay(path, *, source=None, include_archived_rules=True, max_ga
         rules = []
         if include_archived_rules:
             rules = [read_bundle_member(archive, path, name, manifest) for name in rule_paths]
-        coverage = read_bundle_coverage(archive, path, manifest, max_gap_ms) if max_gap_ms is not None else None
+        coverage = read_bundle_coverage(archive, path, manifest, coverage_policy) if coverage_policy is not None else None
     return fixture, rules, {"path": str(path), "rule_files": rule_paths}, coverage
 
 
-def verify_bundle(path, max_gap_ms=None):
+def verify_bundle(path, coverage_policy=None):
     report = {"schema_version": 1, "bundle_path": str(path)}
     with open_bundle_archive(path) as (archive, names):
         manifest = read_bundle_manifest(archive, path, names)
@@ -1093,25 +1099,25 @@ def verify_bundle(path, max_gap_ms=None):
         summary = read_bundle_member(archive, path, BUNDLE_CAPTURE_SUMMARY, manifest)
         verify_bundle_capture_summary(path, manifest[BUNDLE_FIXTURE], summary, manifest)
         remaining = manifest.keys() - {BUNDLE_CAPTURE_SUMMARY}
-        if max_gap_ms is not None:
+        if coverage_policy is not None:
             remaining -= {BUNDLE_CONFIG, BUNDLE_MATRIX}
         for name in manifest:
             if name in remaining:
                 with archive.open(bundle_member_info(archive, path, name)) as content:
                     verify_bundle_member_hash(path, name, stream_sha256(content), manifest)
         report["verified_files"] = sorted(manifest)
-        if max_gap_ms is not None:
-            report["coverage"] = read_bundle_coverage(archive, path, manifest, max_gap_ms)
+        if coverage_policy is not None:
+            report["coverage"] = read_bundle_coverage(archive, path, manifest, coverage_policy)
     return report
 
 
-def load_committed_bundle_replay(repo, revision, path, *, include_archived_rules=True, max_gap_ms=None):
+def load_committed_bundle_replay(repo, revision, path, *, include_archived_rules=True, coverage_policy=None):
     object_id = committed_file_id(repo, revision, path, "bundle")
     with TemporaryFile() as source:
         git_output(repo, "cat-file", "blob", object_id, stdout=source)
         source.seek(0)
         return load_bundle_replay(
-            path, source=source, include_archived_rules=include_archived_rules, max_gap_ms=max_gap_ms,
+            path, source=source, include_archived_rules=include_archived_rules, coverage_policy=coverage_policy,
         )
 
 
@@ -1217,12 +1223,31 @@ def parse_max_gap(value, *, option="--max-gap"):
     return max_gap_ms
 
 
+@dataclass(frozen=True)
+class CoveragePolicy:
+    max_gap_ms: int | None
+    required_metrics: tuple[str, ...]
+
+
+def parse_coverage_policy(max_gap, required_metrics, *, bundle=False):
+    prefix = "--bundle-" if bundle else "--"
+    max_gap_ms = parse_max_gap(max_gap, option=f"{prefix}max-gap")
+    names = tuple(dict.fromkeys(required_metrics or ()))
+    for name in names:
+        if not METRIC_NAME.fullmatch(name):
+            raise ValueError(f"{prefix}require-metric requires a Prometheus metric name, got {name!r}")
+    if max_gap_ms is None and not names:
+        return None
+    return CoveragePolicy(max_gap_ms, names)
+
+
 def longest_series_gap(row):
     interior = row["max_sample_gap"]
     return max(row["leading_gap_ms"], row["trailing_gap_ms"], interior["duration_ms"] if interior else 0)
 
 
-def build_coverage_report(samples, start, end, max_gap_ms):
+def build_coverage_report(samples, start, end, policy):
+    max_gap_ms = policy.max_gap_ms if policy is not None else None
     window = (end - start) // timedelta(milliseconds=1)
 
     def timestamp_at(offset):
@@ -1252,7 +1277,7 @@ def build_coverage_report(samples, start, end, max_gap_ms):
     gate = None
     if max_gap_ms is not None:
         gate = {"max_gap_ms": max_gap_ms, "passed": bool(details) and not any(row["gap_exceeded"] for row in details)}
-    return {
+    report = {
         "schema_version": 1,
         "start": start.isoformat(),
         "end": end.isoformat(),
@@ -1261,21 +1286,38 @@ def build_coverage_report(samples, start, end, max_gap_ms):
         "series": details,
         "gate": gate,
     }
+    if policy is not None and policy.required_metrics:
+        observed = {series.labels["__name__"] for series in samples.values()}
+        names = list(policy.required_metrics)
+        missing = [name for name in names if name not in observed]
+        report["required_metrics"] = {"names": names, "missing": missing, "passed": not missing}
+    return report
 
 
-def check_capture_coverage(samples, start, end, max_gap_ms):
-    if max_gap_ms is None:
+def coverage_passed(report):
+    return all(check["passed"] for check in (report["gate"], report.get("required_metrics")) if check is not None)
+
+
+def check_capture_coverage(samples, start, end, policy):
+    if policy is None:
         return None
-    report = build_coverage_report(samples, start, end, max_gap_ms)
-    if report["gate"]["passed"]:
-        return report
-    limit = as_duration(max_gap_ms)
-    if not report["series"]:
-        raise ValueError(f"--max-gap {limit} check failed. No float samples found in the capture window.")
-    exceeded = [row for row in report["series"] if row["gap_exceeded"]]
-    worst = max(exceeded, key=longest_series_gap)
-    gap = as_duration(longest_series_gap(worst))
-    raise ValueError(f"--max-gap {limit} exceeded in {len(exceeded)} series. The largest gap is {gap} in {worst['series']}.")
+    report = build_coverage_report(samples, start, end, policy)
+    problems = []
+    gate = report["gate"]
+    if gate is not None and not gate["passed"]:
+        limit = as_duration(gate["max_gap_ms"])
+        if not report["series"]:
+            problems.append(f"--max-gap {limit} check failed. No float samples found in the capture window.")
+        else:
+            exceeded = [row for row in report["series"] if row["gap_exceeded"]]
+            worst = max(exceeded, key=longest_series_gap)
+            gap = as_duration(longest_series_gap(worst))
+            problems.append(f"--max-gap {limit} exceeded in {len(exceeded)} series. The largest gap is {gap} in {worst['series']}.")
+    if (required := report.get("required_metrics")) is not None and required["missing"]:
+        problems.append(f"Missing required metrics: {', '.join(required['missing'])}.")
+    if problems:
+        raise ValueError(" ".join(problems))
+    return report
 
 
 def print_coverage_report(report):
@@ -1286,6 +1328,13 @@ def print_coverage_report(report):
     if gate is not None:
         result = "Passed" if gate["passed"] else "Failed"
         print(f"Gap limit `{as_duration(gate['max_gap_ms'])}` **{result}**.\n")
+    if required := report.get("required_metrics"):
+        names = ", ".join(markdown_code(name) for name in required["names"])
+        result = "Passed" if required["passed"] else "Failed"
+        print(f"Required metrics {names} **{result}**.\n")
+        if required["missing"]:
+            missing = ", ".join(markdown_code(name) for name in required["missing"])
+            print(f"Missing required metrics {missing}.\n")
     if not report["series"]:
         print("No samples found in the capture window.")
         return
@@ -1437,17 +1486,36 @@ def worst_coverage_series(coverage):
 
 
 def print_bundle_coverage_report(report):
-    limit = as_duration(report["max_gap_ms"])
     print("\n### Bundle sample coverage\n")
-    print(f"Maximum sample gap `{limit}` **{'Passed' if report['passed'] else 'Failed'}**\n")
-    print("| Bundle | Largest gap | Series | Result |\n| --- | ---: | --- | --- |")
-    for check in report["checks"]:
+    checks = report["checks"]
+    show_gaps = "max_gap_ms" in report
+    show_metrics = "required_metrics" in report
+    columns = [("Bundle", "---")]
+    if show_gaps:
+        limit = as_duration(report["max_gap_ms"])
+        passed = all(check["coverage"]["gate"]["passed"] for check in checks)
+        print(f"Maximum sample gap `{limit}` **{'Passed' if passed else 'Failed'}**\n")
+        columns.extend((("Largest gap", "---:"), ("Series", "---")))
+    if show_metrics:
+        names = ", ".join(markdown_code(name) for name in report["required_metrics"])
+        passed = all(check["coverage"]["required_metrics"]["passed"] for check in checks)
+        print(f"Required metrics {names} **{'Passed' if passed else 'Failed'}**\n")
+        columns.append(("Missing required metrics", "---"))
+    columns.append(("Result", "---"))
+    for values in zip(*columns):
+        print("| " + " | ".join(values) + " |")
+    for check in checks:
         coverage = check["coverage"]
-        worst = worst_coverage_series(coverage)
-        gap = as_duration(longest_series_gap(worst)) if worst else "No float samples"
-        series = markdown_code(worst["series"]) if worst else "—"
-        result = "Passed" if coverage["gate"]["passed"] else "Failed"
-        print(f"| {markdown_code(check['path'])} | {gap} | {series} | {result} |")
+        cells = [markdown_code(check["path"])]
+        if show_gaps:
+            worst = worst_coverage_series(coverage)
+            cells.append(as_duration(longest_series_gap(worst)) if worst else "No float samples")
+            cells.append(markdown_code(worst["series"]) if worst else "—")
+        if show_metrics:
+            missing = ", ".join(markdown_code(name) for name in coverage["required_metrics"]["missing"])
+            cells.append(missing or "—")
+        cells.append("Passed" if coverage_passed(coverage) else "Failed")
+        print("| " + " | ".join(cells) + " |")
 
 
 def build_junit_report(fixtures, report):
@@ -1455,8 +1523,10 @@ def build_junit_report(fixtures, report):
     timelines = report.get("timeline_policy", {}).get("checks", ())
     if "timeline" in report:
         timelines = (report["timeline"],)
-    coverage_checks = report.get("bundle_coverage", {}).get("checks", ())
-    test_count = report["summary"]["after"]["total"] + len(timelines) + len(coverage_checks)
+    bundle_coverage = report.get("bundle_coverage", {})
+    coverage_checks = bundle_coverage.get("checks", ())
+    coverage_test_count = len(coverage_checks) * sum(key in bundle_coverage for key in ("max_gap_ms", "required_metrics"))
+    test_count = report["summary"]["after"]["total"] + len(timelines) + coverage_test_count
     root = ElementTree.Element("testsuites", {
         "name": "incident-to-promtool", "tests": str(test_count), **zero_counts,
     })
@@ -1501,33 +1571,46 @@ def build_junit_report(fixtures, report):
             add_timeline_junit_case(suite, timeline)
         failures += timing_failures
     if coverage_checks:
-        failures += add_coverage_junit_suite(root, coverage_checks, zero_counts)
+        failures += add_coverage_junit_suite(root, coverage_checks, coverage_test_count, zero_counts)
     root.set("failures", str(failures))
     ElementTree.indent(root)
     return ElementTree.tostring(root, encoding="utf-8", xml_declaration=True) + b"\n"
 
 
-def add_coverage_junit_suite(root, checks, zero_counts):
-    failures = sum(not check["coverage"]["gate"]["passed"] for check in checks)
+def add_coverage_junit_suite(root, checks, test_count, zero_counts):
     suite = ElementTree.SubElement(root, "testsuite", {
-        "name": "Bundle sample coverage", "tests": str(len(checks)), "failures": str(failures), **zero_counts,
+        "name": "Bundle sample coverage", "tests": str(test_count), "failures": "0", **zero_counts,
     })
+    failures = 0
     for check in checks:
         coverage = check["coverage"]
-        gate = coverage["gate"]
-        limit = as_duration(gate["max_gap_ms"])
-        case = ElementTree.SubElement(suite, "testcase", {
-            "classname": XML_INVALID.sub("\ufffd", check["path"]), "name": f"Maximum sample gap ({limit})",
-        })
-        if not gate["passed"]:
-            failure = ElementTree.SubElement(case, "failure", {"message": "Bundle sample coverage failed", "type": "max-gap"})
-            worst = worst_coverage_series(coverage)
-            if worst is None:
-                failure.text = "No float samples found in the capture window."
-            else:
-                gap = as_duration(longest_series_gap(worst))
-                failure.text = XML_INVALID.sub("\ufffd", f"The largest gap is {gap} in {worst['series']}. The limit is {limit}.")
+        path = XML_INVALID.sub("\ufffd", check["path"])
+        if coverage["gate"] is not None:
+            failures += add_gap_junit_case(suite, path, coverage)
+        if required := coverage.get("required_metrics"):
+            case = ElementTree.SubElement(suite, "testcase", {"classname": path, "name": "Required metrics"})
+            if not required["passed"]:
+                failure = ElementTree.SubElement(case, "failure", {"message": "Required metrics missing", "type": "required-metrics"})
+                failure.text = f"Missing required metrics: {', '.join(required['missing'])}."
+                failures += 1
+    suite.set("failures", str(failures))
     return failures
+
+
+def add_gap_junit_case(suite, path, coverage):
+    gate = coverage["gate"]
+    limit = as_duration(gate["max_gap_ms"])
+    case = ElementTree.SubElement(suite, "testcase", {"classname": path, "name": f"Maximum sample gap ({limit})"})
+    if gate["passed"]:
+        return 0
+    failure = ElementTree.SubElement(case, "failure", {"message": "Bundle sample coverage failed", "type": "max-gap"})
+    worst = worst_coverage_series(coverage)
+    if worst is None:
+        failure.text = "No float samples found in the capture window."
+    else:
+        gap = as_duration(longest_series_gap(worst))
+        failure.text = XML_INVALID.sub("\ufffd", f"The largest gap is {gap} in {worst['series']}. The limit is {limit}.")
+    return 1
 
 
 def add_timeline_junit_case(suite, timeline):
@@ -1640,8 +1723,8 @@ def compare(
     elif timing_reports:
         print()
         print_timeline_report(timing_reports[0])
-    coverage_passed = bundle_coverage is None or bundle_coverage["passed"]
-    return int(not (report["gate"]["passed"] and timing_passed and coverage_passed))
+    bundle_coverage_passed = bundle_coverage is None or bundle_coverage["passed"]
+    return int(not (report["gate"]["passed"] and timing_passed and bundle_coverage_passed))
 
 
 def add_comparison_report_options(parser):
@@ -2254,6 +2337,10 @@ def compare_bundle_main(argv):
     parser.add_argument("--repo", type=Path, help="Git repository for ref comparison (default: current directory)")
     parser.add_argument("--bundle-max-gap", metavar="DURATION", help="check gaps against a positive duration using each bundle's raw capture")
     parser.add_argument(
+        "--bundle-require-metric", dest="required_metrics", metavar="NAME", action="append",
+        help="require a raw sample of this metric in each bundle (repeatable)",
+    )
+    parser.add_argument(
         "--rule-format", choices=("prometheus", "kubernetes"), default="prometheus",
         help="input format of explicitly supplied rule files (default: prometheus)",
     )
@@ -2276,7 +2363,7 @@ def compare_bundle_main(argv):
         parser.error("file bundle comparison requires at least one --after rule file")
     timing_index = comparison_timeline_index(parser, args, args.bundles, args.timeline_bundle, "bundle")
     try:
-        max_gap_ms = parse_max_gap(args.bundle_max_gap, option="--bundle-max-gap")
+        coverage_policy = parse_coverage_policy(args.bundle_max_gap, args.required_metrics, bundle=True)
         identities = args.bundles if git_mode else [os.path.realpath(path, strict=True) for path in args.bundles]
         if len(identities) != len(set(identities)):
             raise ValueError("each incident bundle must be supplied only once")
@@ -2289,7 +2376,7 @@ def compare_bundle_main(argv):
             revisions = (resolve_commit(repo, args.bundle_ref), resolve_commit(repo, args.after_ref))
             replays = [
                 load_committed_bundle_replay(
-                    repo, revisions[0], path, include_archived_rules=include_archived_rules, max_gap_ms=max_gap_ms,
+                    repo, revisions[0], path, include_archived_rules=include_archived_rules, coverage_policy=coverage_policy,
                 )
                 for path in args.bundles
             ]
@@ -2301,7 +2388,7 @@ def compare_bundle_main(argv):
                 rule_paths = {"before": args.before_rule_file, "after": candidate_paths}
         else:
             replays = [
-                load_bundle_replay(Path(path), include_archived_rules=include_archived_rules, max_gap_ms=max_gap_ms)
+                load_bundle_replay(Path(path), include_archived_rules=include_archived_rules, coverage_policy=coverage_policy)
                 for path in args.bundles
             ]
             after = read_rule_sources(args.after)
@@ -2312,12 +2399,16 @@ def compare_bundle_main(argv):
                 rule_paths = {"before": [str(path) for path in args.before], "after": candidate_paths}
         fixtures, baseline_rule_sets, bundles, coverage_reports = zip(*replays)
         bundle_coverage = None
-        if max_gap_ms is not None:
-            bundle_coverage = {
-                "max_gap_ms": max_gap_ms,
-                "passed": all(report["gate"]["passed"] for report in coverage_reports),
-                "checks": [{"path": bundle["path"], "coverage": report} for bundle, report in zip(bundles, coverage_reports)],
-            }
+        if coverage_policy is not None:
+            bundle_coverage = {}
+            if coverage_policy.max_gap_ms is not None:
+                bundle_coverage["max_gap_ms"] = coverage_policy.max_gap_ms
+            if coverage_policy.required_metrics:
+                bundle_coverage["required_metrics"] = list(coverage_policy.required_metrics)
+            bundle_coverage["passed"] = all(coverage_passed(report) for report in coverage_reports)
+            bundle_coverage["checks"] = [
+                {"path": bundle["path"], "coverage": report} for bundle, report in zip(bundles, coverage_reports, strict=True)
+            ]
         timelines, policy = prepare_comparison_timelines(
             args, fixtures, timing_index, args.bundles, repo=repo, commit=revisions[0] if revisions else None,
         )
@@ -2365,6 +2456,13 @@ def export_rules_main(argv):
     print(f"Exported {len(rules)} native rule file(s) to {args.output_dir}.")
 
 
+def add_required_metric_option(parser):
+    parser.add_argument(
+        "--require-metric", dest="required_metrics", metavar="NAME", action="append",
+        help="require at least one raw sample of this metric in the capture window (repeatable)",
+    )
+
+
 def add_capture_source_options(parser):
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--prometheus-url", help="query a Prometheus server for raw historical samples")
@@ -2372,6 +2470,7 @@ def add_capture_source_options(parser):
     parser.add_argument("--chunk-window", metavar="DURATION", help="maximum PromQL range per live Prometheus query")
     parser.add_argument("--split-on-limit", action="store_true", help="bisect queries that exceed the Prometheus sample limit")
     parser.add_argument("--max-gap", metavar="DURATION", help="fail on empty captures or gaps exceeding this positive duration")
+    add_required_metric_option(parser)
     add_prometheus_connection_options(parser)
 
 
@@ -2434,10 +2533,12 @@ def verify_bundle_main(argv):
     )
     parser.add_argument("bundle", type=Path, help="incident ZIP containing a manifest")
     parser.add_argument("--max-gap", metavar="DURATION", help="check gaps against a positive duration using the bundle's raw capture")
+    add_required_metric_option(parser)
     parser.add_argument("--format", choices=("markdown", "json"), default="markdown", help="report format (default: markdown)")
     args = parser.parse_args(argv)
     try:
-        report = verify_bundle(args.bundle, parse_max_gap(args.max_gap))
+        policy = parse_coverage_policy(args.max_gap, args.required_metrics)
+        report = verify_bundle(args.bundle, policy)
     except (OSError, ValueError, TypeError, RecursionError) as exc:
         parser.exit(2, f"error: {exc}\n")
     if args.format == "json":
@@ -2450,7 +2551,7 @@ def verify_bundle_main(argv):
         if "coverage" in report:
             print()
             print_coverage_report(report["coverage"])
-    return int("coverage" in report and not report["coverage"]["gate"]["passed"])
+    return int("coverage" in report and not coverage_passed(report["coverage"]))
 
 
 def plan_capture_main(argv):
@@ -2486,12 +2587,12 @@ def snapshot_main(argv):
     parser.add_argument("--output", required=True, type=Path, help="new matrix JSON file")
     args = parse_capture_args(parser, argv)
     try:
-        max_gap_ms = parse_max_gap(args.max_gap)
+        policy = parse_coverage_policy(args.max_gap, args.required_metrics)
         config = read_json(args.config)
         (start, begin_ms), (end, end_ms) = capture_window(config)
         matrices = capture_matrices(args, config, end, end_ms - begin_ms)
-        samples = capture_samples(matrices, begin_ms, end_ms, allow_empty=max_gap_ms is not None)
-        check_capture_coverage(samples, start, end, max_gap_ms)
+        samples = capture_samples(matrices, begin_ms, end_ms, allow_empty=policy is not None)
+        check_capture_coverage(samples, start, end, policy)
         write_matrix_snapshot(args.output, samples, begin_ms)
     except FileExistsError:
         parser.exit(1, f"error: output file already exists: {args.output}\n")
@@ -2511,19 +2612,19 @@ def inspect_main(argv):
     parser.add_argument("--format", choices=("markdown", "json"), default="markdown", help="report format (default: markdown)")
     args = parse_capture_args(parser, argv)
     try:
-        max_gap_ms = parse_max_gap(args.max_gap)
+        policy = parse_coverage_policy(args.max_gap, args.required_metrics)
         config = read_json(args.config)
         (start, begin_ms), (end, end_ms) = capture_window(config)
         matrices = capture_matrices(args, config, end, end_ms - begin_ms)
         samples = capture_samples(matrices, begin_ms, end_ms, allow_empty=True)
-        report = build_coverage_report(samples, start, end, max_gap_ms)
+        report = build_coverage_report(samples, start, end, policy)
     except (ValueError, KeyError, TypeError, AttributeError, InvalidOperation, OSError, OverflowError) as exc:
         parser.exit(2, f"error: {exc}\n")
     if args.format == "json":
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
         print_coverage_report(report)
-    return int(report["gate"] is not None and not report["gate"]["passed"])
+    return int(not coverage_passed(report))
 
 
 def main():
