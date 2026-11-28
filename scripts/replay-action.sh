@@ -18,6 +18,7 @@ nonempty_path_lines() {
 
 bundle=${INCIDENT_BUNDLE:-}
 bundle_max_gap=${INCIDENT_BUNDLE_MAX_GAP:-}
+bundle_coverage_policy=${INCIDENT_BUNDLE_COVERAGE_POLICY:-}
 fixture=${INCIDENT_FIXTURE:-}
 fixture_ref=${INCIDENT_FIXTURE_REF:-}
 capture_summaries=${INCIDENT_CAPTURE_SUMMARIES:-}
@@ -66,8 +67,18 @@ if [[ "$bundle_mode" -eq 0 && -n "${required_metric_arguments[0]:-}" ]]; then
     printf 'bundle-required-metrics requires bundle or bundles.\n' >&2
     exit 2
 fi
+if [[ -n "$bundle_coverage_policy" ]]; then
+    if [[ "$bundle_mode" -eq 0 ]]; then
+        printf 'bundle-coverage-policy requires bundle or bundles.\n' >&2
+        exit 2
+    fi
+    if [[ -n "$bundle_max_gap" || -n "${required_metric_arguments[0]:-}" ]]; then
+        printf 'Provide bundle-coverage-policy or individual bundle coverage inputs.\n' >&2
+        exit 2
+    fi
+fi
 bundle_coverage_enabled=0
-if [[ -n "$bundle_max_gap" || -n "${required_metric_arguments[0]:-}" ]]; then
+if [[ -n "$bundle_coverage_policy" || -n "$bundle_max_gap" || -n "${required_metric_arguments[0]:-}" ]]; then
     bundle_coverage_enabled=1
 fi
 
@@ -111,6 +122,9 @@ if [[ "$bundle_mode" -eq 1 ]]; then
     fi
     if [[ -n "${required_metric_arguments[0]:-}" ]]; then
         comparison_arguments+=("${required_metric_arguments[@]}")
+    fi
+    if [[ -n "$bundle_coverage_policy" ]]; then
+        comparison_arguments+=(--bundle-coverage-policy="$bundle_coverage_policy")
     fi
     input_paths=("${bundle_paths[@]}")
 else

@@ -212,6 +212,8 @@ jobs:
           bundle="incidents/payment baseline.zip"
           second_bundle="incidents/alternative baseline.zip"
           timing_policy="incidents/payment timing policy.json"
+          coverage_policy="incidents/payment coverage policy.json"
+          failing_coverage_policy="incidents/payment missing metric policy.json"
           bundle_baseline="rules/bundle baseline fixed.yml"
           bundle_regression="rules/bundle candidate regressed.yml"
           git init --quiet "$repo"
@@ -244,6 +246,17 @@ jobs:
             ]
           }
           JSON
+          cat > "$repo/$coverage_policy" <<'JSON'
+          {
+            "schema_version": 1,
+            "checks": [
+              {"source": "incidents/alternative baseline.zip", "max_gap": "30s"},
+              {"source": "incidents/payment baseline.zip", "required_metrics": ["payment_http_requests_total"]}
+            ]
+          }
+          JSON
+          sed 's/payment_http_requests_total/payment_http_requests/' \
+            "$repo/$coverage_policy" > "$repo/$failing_coverage_policy"
           (
             cd "$repo"
             python3 "$GITHUB_WORKSPACE/incident_to_promtool.py" "$GITHUB_WORKSPACE/demo/demo.json" \
@@ -281,6 +294,7 @@ jobs:
           cp demo/kubernetes/before.yml "$repo/$scoped_baseline"
           cp demo/kubernetes/after.yml "$repo/$bundle_baseline"
           git -C "$repo" add -- "$rule" "$scoped_baseline" "$bundle" "$second_bundle" "$bundle_baseline" "$timing_policy" \
+            "$coverage_policy" "$failing_coverage_policy" \
             payment.test.yml payment.capture.json quiet.test.yml quiet.capture.json timing.test.yml timing.capture.json
           git -C "$repo" commit --quiet -m 'Add original payment alert'
           cp demo/kubernetes/after.yml "$repo/$rule"
@@ -304,9 +318,11 @@ jobs:
           printf 'invalid replacement bundle\n' > "$repo/$bundle"
           git -C "$repo" add -- "$rule" "$candidate" "$renamed_rule" "$recording_rule" \
             "$bundle" "$bundle_regression"
-          git -C "$repo" rm --quiet -- "$second_bundle" "$scoped_baseline" "$bundle_baseline" "$timing_policy"
+          git -C "$repo" rm --quiet -- "$second_bundle" "$scoped_baseline" "$bundle_baseline" "$timing_policy" \
+            "$coverage_policy" "$failing_coverage_policy"
           git -C "$repo" commit --quiet -m 'Fix late payment alert'
           printf 'invalid timing policy\n' > "$repo/$timing_policy"
+          printf 'invalid coverage policy\n' > "$repo/$coverage_policy"
           printf 'invalid fixture\n' > "$repo/payment.test.yml"
           printf 'invalid fixture\n' > "$repo/timing.test.yml"
           rm -- "$repo/payment.capture.json" "$repo/quiet.test.yml" "$repo/quiet.capture.json" "$repo/timing.capture.json" \
@@ -848,4 +864,97 @@ jobs:
           assert junit.attrib["tests"] == "4" and junit.attrib["failures"] == "1"
           failure, = junit.findall("testsuite[@name='Bundle sample coverage']/testcase/failure")
           assert failure.attrib["type"] == "required-metrics"
+          PY
+      - name: Compare committed bundles using distinct coverage criteria
+        id: bundled-coverage-policy
+        uses: ./
+        with:
+          repo-path: ${{ runner.temp }}/composite-repo
+          bundles: |
+            incidents/payment baseline.zip
+            incidents/alternative baseline.zip
+          rule-files: |
+            rules/payment candidate.yml
+          rule-format: kubernetes
+          promtool-path: ${{ runner.temp }}/promtool
+          timeline-policy: incidents/payment timing policy.json
+          bundle-coverage-policy: incidents/payment coverage policy.json
+      - name: Compare committed bundles using a missing policy metric
+        id: bundled-coverage-policy-failure
+        continue-on-error: true
+        uses: ./
+        with:
+          repo-path: ${{ runner.temp }}/composite-repo
+          bundles: |
+            incidents/payment baseline.zip
+            incidents/alternative baseline.zip
+          rule-files: |
+            rules/payment candidate.yml
+          rule-format: kubernetes
+          promtool-path: ${{ runner.temp }}/promtool
+          timeline-policy: incidents/payment timing policy.json
+          bundle-coverage-policy: incidents/payment missing metric policy.json
+      - name: Check pinned coverage policy results and preserved reports
+        env:
+          PASS_REPORT: ${{ steps.bundled-coverage-policy.outputs.report-path }}
+          PASS_JSON: ${{ steps.bundled-coverage-policy.outputs.json-report-path }}
+          PASS_JUNIT: ${{ steps.bundled-coverage-policy.outputs.junit-report-path }}
+          PASS_COVERAGE: ${{ steps.bundled-coverage-policy.outputs.bundle-coverage-passed }}
+          PASS_TIMING: ${{ steps.bundled-coverage-policy.outputs.timeline-passed }}
+          FAIL_REPORT: ${{ steps.bundled-coverage-policy-failure.outputs.report-path }}
+          FAIL_JSON: ${{ steps.bundled-coverage-policy-failure.outputs.json-report-path }}
+          FAIL_JUNIT: ${{ steps.bundled-coverage-policy-failure.outputs.junit-report-path }}
+          FAIL_COVERAGE: ${{ steps.bundled-coverage-policy-failure.outputs.bundle-coverage-passed }}
+          FAIL_TIMING: ${{ steps.bundled-coverage-policy-failure.outputs.timeline-passed }}
+          FAIL_OUTCOME: ${{ steps.bundled-coverage-policy-failure.outcome }}
+        run: |
+          [[ "$PASS_COVERAGE" == true && "$FAIL_COVERAGE" == false && "$FAIL_OUTCOME" == failure ]]
+          [[ "$PASS_TIMING" == true && "$FAIL_TIMING" == true ]]
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          from xml.etree import ElementTree
+
+          repo = Path(os.environ["RUNNER_TEMP"], "composite-repo")
+          baseline = subprocess.check_output(["git", "rev-parse", "HEAD^1"], cwd=repo, text=True).strip()
+          for prefix, policy_name, metric, passed in (
+              ("PASS", "payment coverage policy.json", "payment_http_requests_total", True),
+              ("FAIL", "payment missing metric policy.json", "payment_http_requests", False),
+          ):
+              policy_path = f"incidents/{policy_name}"
+              policy_bytes = subprocess.check_output(["git", "show", f"{baseline}:{policy_path}"], cwd=repo)
+              markdown = Path(os.environ[f"{prefix}_REPORT"]).read_text(encoding="utf-8")
+              assert "| After | Passed | 4/4 |" in markdown
+              status = "Passed" if passed else "Failed"
+              assert f"Coverage policy <code>{policy_path}</code> at Git commit `{baseline}` **{status}**" in markdown
+              report = json.loads(Path(os.environ[f"{prefix}_JSON"]).read_text(encoding="utf-8"))
+              assert report["commits"]["before"] == baseline
+              assert report["gate"] == {"mode": "strict", "passed": True}
+              assert report["timeline_policy"]["passed"] is True
+              coverage = report["bundle_coverage"]
+              assert coverage["passed"] is passed
+              assert coverage["policy"] == {
+                  "path": policy_path, "commit": baseline, "sha256": hashlib.sha256(policy_bytes).hexdigest(),
+              }
+              assert [check["path"] for check in coverage["checks"]] == [
+                  "incidents/payment baseline.zip", "incidents/alternative baseline.zip",
+              ]
+              payment, alternative = [check["coverage"] for check in coverage["checks"]]
+              assert payment["gate"] is None and "required_metrics" not in alternative
+              assert payment["required_metrics"] == {
+                  "names": [metric], "missing": [] if passed else [metric], "passed": passed,
+              }
+              assert alternative["gate"] == {"max_gap_ms": 30_000, "passed": True}
+
+              junit = ElementTree.parse(os.environ[f"{prefix}_JUNIT"]).getroot()
+              assert junit.attrib["tests"] == "8" and junit.attrib["failures"] == str(int(not passed))
+              timing = junit.findall("testsuite[@name='Alert firing delay']/testcase")
+              assert len(timing) == 2 and all(case.find("failure") is None for case in timing)
+              cases = junit.findall("testsuite[@name='Bundle sample coverage']/testcase")
+              assert [case.attrib["classname"] for case in cases] == [check["path"] for check in coverage["checks"]]
+              failures = [failure.attrib["type"] for case in cases for failure in case.findall("failure")]
+              assert failures == ([] if passed else ["required-metrics"])
           PY

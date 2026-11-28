@@ -1487,6 +1487,9 @@ def worst_coverage_series(coverage):
 
 def print_bundle_coverage_report(report):
     print("\n### Bundle sample coverage\n")
+    if "policy" in report:
+        print_bundle_coverage_policy(report)
+        return
     checks = report["checks"]
     show_gaps = "max_gap_ms" in report
     show_metrics = "required_metrics" in report
@@ -1518,6 +1521,26 @@ def print_bundle_coverage_report(report):
         print("| " + " | ".join(cells) + " |")
 
 
+def print_bundle_coverage_policy(report):
+    origin = report["policy"]
+    revision = f" at Git commit `{origin['commit']}`" if "commit" in origin else ""
+    result = "Passed" if report["passed"] else "Failed"
+    print(f"Coverage policy {markdown_code(origin['path'])}{revision} **{result}**\n")
+    print("| Bundle | Largest gap / limit | Required metrics | Missing required metrics | Result |\n| --- | --- | --- | --- | --- |")
+    for check in report["checks"]:
+        coverage = check["coverage"]
+        gap = "—"
+        if gate := coverage["gate"]:
+            worst = worst_coverage_series(coverage)
+            largest = as_duration(longest_series_gap(worst)) if worst else "No float samples"
+            gap = f"{largest} / {as_duration(gate['max_gap_ms'])}"
+        metrics = coverage.get("required_metrics", {})
+        names = ", ".join(markdown_code(name) for name in metrics.get("names", ())) or "—"
+        missing = ", ".join(markdown_code(name) for name in metrics.get("missing", ())) or "—"
+        result = "Passed" if coverage_passed(coverage) else "Failed"
+        print(f"| {markdown_code(check['path'])} | {gap} | {names} | {missing} | {result} |")
+
+
 def build_junit_report(fixtures, report):
     zero_counts = {"errors": "0", "skipped": "0"}
     timelines = report.get("timeline_policy", {}).get("checks", ())
@@ -1525,7 +1548,10 @@ def build_junit_report(fixtures, report):
         timelines = (report["timeline"],)
     bundle_coverage = report.get("bundle_coverage", {})
     coverage_checks = bundle_coverage.get("checks", ())
-    coverage_test_count = len(coverage_checks) * sum(key in bundle_coverage for key in ("max_gap_ms", "required_metrics"))
+    coverage_test_count = sum(
+        criterion is not None for check in coverage_checks
+        for criterion in (check["coverage"]["gate"], check["coverage"].get("required_metrics"))
+    )
     test_count = report["summary"]["after"]["total"] + len(timelines) + coverage_test_count
     root = ElementTree.Element("testsuites", {
         "name": "incident-to-promtool", "tests": str(test_count), **zero_counts,
@@ -2207,28 +2233,68 @@ def comparison_timeline_index(parser, args, paths, selection, source):
     return paths.index(selection)
 
 
-def load_timeline_policy(path, repo, commit):
-    contents = read_replay_bytes(path, repo, commit, "timeline policy")
+def load_checks_policy(path, repo, commit, label):
+    contents = read_replay_bytes(path, repo, commit, label)
     try:
         document = json.loads(contents.decode("utf-8"), object_pairs_hook=unique_json_object)
     except (ValueError, RecursionError) as exc:
-        raise ValueError(f"{path}: invalid timeline policy JSON: {exc}") from exc
+        raise ValueError(f"{path}: invalid {label} JSON: {exc}") from exc
     version = document.get("schema_version") if isinstance(document, dict) else None
     if type(version) is not int or version != 1:
-        raise ValueError(f"{path}: timeline policy requires schema_version 1")
+        raise ValueError(f"{path}: {label} requires schema_version 1")
     if document.keys() - {"schema_version", "checks"}:
-        raise ValueError(f"{path}: timeline policy contains unknown fields")
+        raise ValueError(f"{path}: {label} contains unknown fields")
     checks = document.get("checks")
     if not isinstance(checks, list) or not checks:
-        raise ValueError(f"{path}: timeline policy requires a nonempty checks array")
+        raise ValueError(f"{path}: {label} requires a nonempty checks array")
     origin = {"path": str(path), "sha256": hashlib.sha256(contents).hexdigest()}
     if commit is not None:
         origin["commit"] = commit
     return checks, origin
 
 
+def prepare_bundle_coverage_policies(path, bundles, repo, commit):
+    checks, origin = load_checks_policy(path, repo, commit, "bundle coverage policy")
+    sources = set(bundles)
+    policies = {}
+    criteria = {"max_gap", "required_metrics"}
+    for number, check in enumerate(checks, start=1):
+        try:
+            if not isinstance(check, dict) or not criteria.intersection(check):
+                raise ValueError("requires at least one of max_gap or required_metrics")
+            if check.keys() - criteria - {"source"}:
+                raise ValueError("contains unknown fields")
+            if "source" in check:
+                source = check["source"]
+                if not isinstance(source, str) or not source.strip():
+                    raise ValueError("source must be a nonempty path")
+                if source not in sources:
+                    raise ValueError(f"source {source!r} must match one of the supplied bundle paths")
+            elif len(bundles) == 1:
+                source = bundles[0]
+            else:
+                raise ValueError("source is required when comparing multiple bundles")
+            if source in policies:
+                raise ValueError(f"duplicate check for bundle {source!r}")
+            max_gap = check.get("max_gap")
+            if "max_gap" in check and not isinstance(max_gap, str):
+                raise ValueError("max_gap must be a positive duration string")
+            metrics = check.get("required_metrics")
+            if "required_metrics" in check and (
+                not isinstance(metrics, list) or not metrics or any(not isinstance(name, str) for name in metrics)
+            ):
+                raise ValueError("required_metrics must be a nonempty array of metric names")
+            policies[source] = parse_coverage_policy(max_gap, metrics, bundle=True)
+        except ValueError as exc:
+            raise ValueError(f"{path}: check {number}: {exc}") from exc
+    missing = [repr(source) for source in bundles if source not in policies]
+    if missing:
+        raise ValueError(f"{path}: missing checks for bundles {', '.join(missing)}")
+    return [policies[source] for source in bundles], origin
+
+
 def prepare_policy_timelines(path, fixtures, paths, repo, commit):
-    checks, origin = load_timeline_policy(path, repo, commit)
+    checks, origin = load_checks_policy(path, repo, commit, "timeline policy")
     positions = {source: index for index, source in enumerate(paths)}
     required = {"alertname", "end"}
     limits = {"max_delay", "fire_by"}
@@ -2329,12 +2395,13 @@ def compare_bundle_main(argv):
     parser.add_argument("bundles", metavar="bundle", nargs="+", help="ZIP archives created with bundle (repository-root-relative in Git mode)")
     parser.add_argument("--before", type=Path, action="append", help="override the archived baseline with a local rule file (repeatable)")
     parser.add_argument("--after", type=Path, action="append", help="proposed rule file in the working tree (repeatable)")
-    parser.add_argument("--bundle-ref", help="Git ref or commit containing the bundles and any explicit baseline rules")
+    parser.add_argument("--bundle-ref", help="Git ref or commit containing the bundles, policies, and any explicit baseline rules")
     parser.add_argument("--after-ref", help="Git ref or commit containing the proposed rules")
     parser.add_argument("--rule-file", action="append", help="repository-root-relative proposed rule path when using archived baselines (repeatable)")
     parser.add_argument("--before-rule-file", action="append", help="repository-root-relative baseline rule path at --bundle-ref (repeatable)")
     parser.add_argument("--after-rule-file", action="append", help="repository-root-relative proposed rule path at --after-ref with an explicit baseline (repeatable)")
     parser.add_argument("--repo", type=Path, help="Git repository for ref comparison (default: current directory)")
+    parser.add_argument("--bundle-coverage-policy", type=Path, help="JSON file with sample coverage checks for each bundle")
     parser.add_argument("--bundle-max-gap", metavar="DURATION", help="check gaps against a positive duration using each bundle's raw capture")
     parser.add_argument(
         "--bundle-require-metric", dest="required_metrics", metavar="NAME", action="append",
@@ -2361,35 +2428,44 @@ def compare_bundle_main(argv):
         parser.error("Git bundle comparison requires --rule-file or both --before-rule-file and --after-rule-file lists")
     if not git_mode and not args.after:
         parser.error("file bundle comparison requires at least one --after rule file")
+    if args.bundle_coverage_policy is not None and (args.bundle_max_gap is not None or args.required_metrics is not None):
+        parser.error("--bundle-coverage-policy cannot be combined with --bundle-max-gap or --bundle-require-metric")
     timing_index = comparison_timeline_index(parser, args, args.bundles, args.timeline_bundle, "bundle")
     try:
-        coverage_policy = parse_coverage_policy(args.bundle_max_gap, args.required_metrics, bundle=True)
+        shared_coverage_policy = parse_coverage_policy(args.bundle_max_gap, args.required_metrics, bundle=True)
         identities = args.bundles if git_mode else [os.path.realpath(path, strict=True) for path in args.bundles]
         if len(identities) != len(set(identities)):
             raise ValueError("each incident bundle must be supplied only once")
-        revisions = None
+        repo = (args.repo or Path.cwd()) if git_mode else None
+        revisions = (resolve_commit(repo, args.bundle_ref), resolve_commit(repo, args.after_ref)) if git_mode else None
+        bundle_commit = revisions[0] if revisions else None
+        coverage_origin = None
+        if args.bundle_coverage_policy is None:
+            coverage_policies = [shared_coverage_policy] * len(args.bundles)
+        else:
+            coverage_policies, coverage_origin = prepare_bundle_coverage_policies(
+                args.bundle_coverage_policy, args.bundles, repo, bundle_commit,
+            )
+        sources = zip(args.bundles, coverage_policies, strict=True)
         before = None
-        repo = None
         include_archived_rules = not (scoped_paths or args.before)
         if git_mode:
-            repo = args.repo or Path.cwd()
-            revisions = (resolve_commit(repo, args.bundle_ref), resolve_commit(repo, args.after_ref))
             replays = [
                 load_committed_bundle_replay(
-                    repo, revisions[0], path, include_archived_rules=include_archived_rules, coverage_policy=coverage_policy,
+                    repo, bundle_commit, path, include_archived_rules=include_archived_rules, coverage_policy=policy,
                 )
-                for path in args.bundles
+                for path, policy in sources
             ]
             candidate_paths = args.after_rule_file if scoped_paths else args.rule_file
             after = read_committed_rules(repo, revisions[1], candidate_paths)
             rule_paths = {"after": candidate_paths}
             if scoped_paths:
-                before = read_committed_rules(repo, revisions[0], args.before_rule_file)
+                before = read_committed_rules(repo, bundle_commit, args.before_rule_file)
                 rule_paths = {"before": args.before_rule_file, "after": candidate_paths}
         else:
             replays = [
-                load_bundle_replay(Path(path), include_archived_rules=include_archived_rules, coverage_policy=coverage_policy)
-                for path in args.bundles
+                load_bundle_replay(Path(path), include_archived_rules=include_archived_rules, coverage_policy=policy)
+                for path, policy in sources
             ]
             after = read_rule_sources(args.after)
             candidate_paths = [str(path) for path in args.after]
@@ -2399,18 +2475,21 @@ def compare_bundle_main(argv):
                 rule_paths = {"before": [str(path) for path in args.before], "after": candidate_paths}
         fixtures, baseline_rule_sets, bundles, coverage_reports = zip(*replays)
         bundle_coverage = None
-        if coverage_policy is not None:
+        if coverage_origin is not None or shared_coverage_policy is not None:
             bundle_coverage = {}
-            if coverage_policy.max_gap_ms is not None:
-                bundle_coverage["max_gap_ms"] = coverage_policy.max_gap_ms
-            if coverage_policy.required_metrics:
-                bundle_coverage["required_metrics"] = list(coverage_policy.required_metrics)
+            if coverage_origin is not None:
+                bundle_coverage["policy"] = coverage_origin
+            else:
+                if shared_coverage_policy.max_gap_ms is not None:
+                    bundle_coverage["max_gap_ms"] = shared_coverage_policy.max_gap_ms
+                if shared_coverage_policy.required_metrics:
+                    bundle_coverage["required_metrics"] = list(shared_coverage_policy.required_metrics)
             bundle_coverage["passed"] = all(coverage_passed(report) for report in coverage_reports)
             bundle_coverage["checks"] = [
                 {"path": bundle["path"], "coverage": report} for bundle, report in zip(bundles, coverage_reports, strict=True)
             ]
         timelines, policy = prepare_comparison_timelines(
-            args, fixtures, timing_index, args.bundles, repo=repo, commit=revisions[0] if revisions else None,
+            args, fixtures, timing_index, args.bundles, repo=repo, commit=bundle_commit,
         )
         if before is not None:
             baseline_rule_sets = [comparison_rule_bytes(before, args.rule_format)] * len(fixtures)

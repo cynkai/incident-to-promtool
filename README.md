@@ -391,6 +391,8 @@ ZIP 하나를 비교할 때는 `bundle`, 여러 개면 `bundles`에 한 줄에 �
 
 `bundle`과 `bundles`에는 `bundle-max-gap`과 `bundle-required-metrics`를 각각 또는 함께 지정할 수 있습니다. 필수 메트릭 이름은 `bundle-required-metrics`에 한 줄에 하나씩 적습니다. 모든 ZIP에 같은 기준을 적용하며, `steps.compare.outputs.bundle-coverage-passed`에 전체 판정을 문자열 `true` 또는 `false`로 제공합니다. 표본 간격이나 필수 메트릭 검사로 단계가 실패해도 비교 리포트와 이 출력을 읽을 수 있습니다. [번들의 표본 간격 검사](#번들의-표본-간격-검사)
 
+ZIP마다 기준이 다르면 대신 `bundle-coverage-policy`에 정책 파일 경로를 지정합니다. [번들별 표본 검사 정책](#번들별-표본-검사-정책)
+
 현재 PR의 기준 룰을 사용하려면 `bundle` 또는 `bundles`와 함께 `before-rule-files`와 `after-rule-files`를 모두 지정합니다. ZIP과 기준 룰은 `before-ref`, 수정 룰은 `after-ref`에서 읽습니다. 두 룰 목록은 저장소 루트 기준으로 한 줄에 하나씩 적습니다. 두 목록을 제공하는 방식과 ZIP에 담긴 기준 룰을 쓰는 `rule-files` 방식 중 하나를 선택합니다.
 
 ```yaml
@@ -689,6 +691,51 @@ python3 incident_to_promtool.py compare-bundle demo/generated/payment-baseline.z
 이 예제에서 수정 룰은 체크포인트 두 개를 충족합니다. 원본 표본의 `30s` 간격이 `29s` 제한을 넘겨 비교는 `1`로 종료합니다. 표본 검사에 실패해도 유효한 번들의 룰 비교를 실행하고 리포트를 생성합니다. 매니페스트가 없거나 원본 파일을 검증할 수 없으면 입력 오류 `2`로 처리합니다.
 
 표본 검사 옵션을 지정하면 JSON에 전체 판정 `passed`와 번들별 결과 `checks`를 담은 `bundle_coverage`가 추가됩니다. 선택한 검사에 따라 `max_gap_ms`에 간격 제한을, `required_metrics`에 필수 메트릭 이름 목록을 기록합니다. `checks`의 각 항목에는 ZIP 경로 `path`와 `inspect` 형식의 `coverage`가 있습니다. JUnit XML은 간격과 메트릭 누락 판정을 `Bundle sample coverage` 스위트에 기록합니다. [기준 번들로 PR 검사](#기준-번들로-pr-검사)
+
+##### 번들별 표본 검사 정책
+
+`compare-bundle --bundle-coverage-policy PATH`는 ZIP마다 다른 표본 검사 기준을 적용합니다. JSON의 `schema_version`은 `1`입니다. `checks`에 비교할 ZIP을 각각 한 번씩 적고 `source`는 명령에 적은 경로와 정확히 맞춥니다. ZIP 하나를 비교할 때는 `source`를 생략할 수 있습니다. 각 검사에 양수 기간 `max_gap`, 비어 있지 않은 메트릭 이름 목록 `required_metrics` 중 하나 이상을 지정합니다. 원본 표본의 공백이 모두 `max_gap` 이하면 간격 검사를 통과합니다. 정책에서 ZIP을 빠뜨리거나 중복해 적거나 비교 대상에 없는 ZIP을 적으면 입력 오류 `2`로 처리합니다.
+
+위의 `payment-baseline.zip`을 먼저 만들고, 같은 결제 데이터를 사용하는 타임라인 예제 번들을 추가합니다.
+
+```sh
+python3 incident_to_promtool.py bundle demo/timing.incident.json \
+  --matrix demo/incident.matrix.json --output demo/generated/payment-timing.zip
+
+cat > demo/generated/payment-coverage.policy.json <<'JSON'
+{
+  "schema_version": 1,
+  "checks": [
+    {"source": "demo/generated/payment-baseline.zip", "max_gap": "30s", "required_metrics": ["payment_http_requests_total"]},
+    {"source": "demo/generated/payment-timing.zip", "max_gap": "45s"}
+  ]
+}
+JSON
+
+python3 incident_to_promtool.py compare-bundle \
+  demo/generated/payment-baseline.zip demo/generated/payment-timing.zip \
+  --after demo/after.rules.yml \
+  --bundle-coverage-policy demo/generated/payment-coverage.policy.json \
+  --json-report demo/generated/payment-policy-review.json
+```
+
+두 ZIP 모두 정책을 통과합니다. 두 번째 ZIP의 `max_gap`을 `29s`로 바꾸면 해당 ZIP의 표본 검사만 실패하고 비교는 `1`로 종료합니다. 새 JSON 리포트 경로로 다시 실행하면 룰 비교 결과와 실패한 검사를 함께 확인할 수 있습니다.
+
+표본 검사는 `--bundle-coverage-policy`와 공통 옵션(`--bundle-max-gap`, `--bundle-require-metric`) 중 한 방식으로 설정합니다. 발화 시간 검사는 함께 실행할 수 있습니다. 파일 비교의 상대 경로는 현재 디렉터리를 기준으로 합니다. Git 비교는 `--bundle-ref`의 정책과 ZIP을 읽으며, 경로는 저장소 루트 기준입니다. JSON의 `bundle_coverage.policy`에 정책 경로 `path`, 파일 바이트의 `sha256`, Git에서 읽었을 때의 `commit`이 들어갑니다. 각 번들이 적용받은 기준은 `bundle_coverage.checks`의 해당 `coverage`에서 확인합니다.
+
+GitHub Actions는 `before-ref`에서 ZIP과 정책을 읽습니다. 아래 예제에서는 두 ZIP과 정책을 기준 커밋의 `tests/fixtures/` 아래에 보관하고 정책의 `source`를 `bundles`에 적은 경로와 맞춥니다. `bundle-coverage-policy`와 공통 입력(`bundle-max-gap`, `bundle-required-metrics`) 중 한 방식을 선택합니다.
+
+```yaml
+- name: Compare alert rules and bundle coverage policy
+  id: compare
+  uses: cynkai/incident-to-promtool@main
+  with:
+    bundles: |
+      tests/fixtures/payment-baseline.zip
+      tests/fixtures/payment-timing.zip
+    rule-files: demo/after.rules.yml
+    bundle-coverage-policy: tests/fixtures/payment-coverage.policy.json
+```
 
 ### 시계열 표본 간격 확인
 
