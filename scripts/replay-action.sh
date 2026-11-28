@@ -17,6 +17,7 @@ nonempty_path_lines() {
 }
 
 bundle=${INCIDENT_BUNDLE:-}
+bundle_max_gap=${INCIDENT_BUNDLE_MAX_GAP:-}
 fixture=${INCIDENT_FIXTURE:-}
 fixture_ref=${INCIDENT_FIXTURE_REF:-}
 capture_summaries=${INCIDENT_CAPTURE_SUMMARIES:-}
@@ -50,6 +51,10 @@ timeline_policy=${INCIDENT_TIMELINE_POLICY:-}
 bundle_mode=0
 if [[ -n "$bundle" || -n "${bundle_paths[0]:-}" ]]; then
     bundle_mode=1
+fi
+if [[ "$bundle_mode" -eq 0 && -n "$bundle_max_gap" ]]; then
+    printf 'bundle-max-gap requires bundle or bundles.\n' >&2
+    exit 2
 fi
 
 timeline_mode=disabled
@@ -87,6 +92,9 @@ if [[ "$bundle_mode" -eq 1 ]]; then
         bundle_paths+=("$bundle")
     fi
     comparison_arguments=(compare-bundle --bundle-ref="$INCIDENT_BEFORE_REF" --after-ref="$INCIDENT_AFTER_REF")
+    if [[ -n "$bundle_max_gap" ]]; then
+        comparison_arguments+=(--bundle-max-gap="$bundle_max_gap")
+    fi
     input_paths=("${bundle_paths[@]}")
 else
     if [[ -n "$fixture" ]]; then
@@ -219,7 +227,7 @@ printf '::%s::\n' "$command_token"
 
 if [[ "$status" -le 1 ]]; then
     if [[ -s "$report" && -s "$json_report" && -s "$junit_report" ]] &&
-        report_values=$("$python" - "$json_report" "$timeline_mode" <<'PY'
+        report_values=$("$python" - "$json_report" "$timeline_mode" "$bundle_max_gap" <<'PY'
 import json
 import sys
 
@@ -234,20 +242,33 @@ try:
     elif timeline_mode == "single":
         timeline = report["timeline"]
         timeline_passed = timeline["passed"] if "passed" in timeline else timeline["gate"]["passed"]
+    bundle_coverage_enabled = bool(sys.argv[3])
+    bundle_coverage_passed = report["bundle_coverage"]["passed"] if bundle_coverage_enabled else None
 except (OSError, ValueError, KeyError, TypeError):
     sys.exit(1)
-if type(count) is not int or count < 0 or (timeline_mode != "disabled" and type(timeline_passed) is not bool):
+if (
+    type(count) is not int or count < 0
+    or (timeline_mode != "disabled" and type(timeline_passed) is not bool)
+    or (bundle_coverage_enabled and type(bundle_coverage_passed) is not bool)
+):
     sys.exit(1)
-print(count, str(timeline_passed).lower() if timeline_passed is not None else "")
+print(
+    count,
+    "-" if timeline_passed is None else str(timeline_passed).lower(),
+    "-" if bundle_coverage_passed is None else str(bundle_coverage_passed).lower(),
+)
 PY
     ); then
-        read -r newly_failed timeline_passed <<< "$report_values"
+        IFS=' ' read -r newly_failed timeline_passed bundle_coverage_passed <<< "$report_values"
         cat -- "$report" >> "$GITHUB_STEP_SUMMARY"
         {
             printf 'report-path=%s\njson-report-path=%s\njunit-report-path=%s\nnewly-failed=%s\n' \
                 "$report" "$json_report" "$junit_report" "$newly_failed"
-            if [[ -n "$timeline_passed" ]]; then
+            if [[ "$timeline_passed" != '-' ]]; then
                 printf 'timeline-passed=%s\n' "$timeline_passed"
+            fi
+            if [[ "$bundle_coverage_passed" != '-' ]]; then
+                printf 'bundle-coverage-passed=%s\n' "$bundle_coverage_passed"
             fi
         } >> "$GITHUB_OUTPUT"
         exit "$status"

@@ -18,6 +18,8 @@ Run `bash scripts/demo.sh --timing` for the same offline payment replay with a s
 
 Use `timeline` to compare an alert's first firing across Git revisions. The GitHub Action can enforce delay limits and firing deadlines from a committed timing policy alongside checkpoint checks. [GitHub Action timing policy](#발화-지연-정책)
 
+Check raw sample gaps when replaying archived incidents in CI. [Bundle coverage check](#번들의-표본-간격-검사)
+
 Use Python 3.10+ and `promtool` 3.9+. With no local `promtool`, the demo downloads and verifies a pinned binary on Linux x64. Set `PROMTOOL=/path/to/promtool` to use a specific executable.
 
 Commit a fixture for your own incident, compare rule changes between Git refs, and add the same check to CI. Detailed examples are available in Korean. [Capture an incident](#내-prometheus로-실행) · [Plan capture selectors](#캡처할-시계열-계획) · [Raw metric snapshot](#원본-시계열-스냅샷) · [Bundle an incident](#장애-재현-번들) · [Inspect sample gaps](#시계열-표본-간격-확인) · [Alertmanager webhook](#alertmanager-웹훅으로-기대-동작-만들기) · [Native Prometheus rules](#룰-변경-전후-비교) · [Git ref comparison](#git-커밋으로-비교) · [Kubernetes PrometheusRule](#kubernetes-prometheusrule로-테스트) · [GitHub Action](#github-actions에서-pr-검사)
@@ -365,7 +367,7 @@ JSON의 `timeline_policy`에는 정책 경로 `path`, 읽은 파일 바이트의
 
 #### 기준 번들로 PR 검사
 
-기준 커밋에 장애 번들 ZIP이 있으면 각 ZIP의 테스트와 기준 룰을 적용할 수 있습니다. 위 워크플로의 `fetch-depth: 0` 체크아웃을 유지하고 비교 단계를 다음과 같이 설정합니다. 아래 예제는 결제 번들에 최초 발화 지연 검사도 적용합니다.
+기준 커밋에 장애 번들 ZIP이 있으면 각 ZIP의 테스트와 기준 룰을 적용할 수 있습니다. 위 워크플로의 `fetch-depth: 0` 체크아웃을 유지하고 비교 단계를 다음과 같이 설정합니다. 아래 예제는 두 번들의 표본 간격과 결제 번들의 최초 발화 지연을 검사합니다.
 
 ```yaml
 - name: Compare alert rules from bundles
@@ -382,9 +384,12 @@ JSON의 `timeline_policy`에는 정책 경로 `path`, 읽은 파일 바이트의
     timeline-end: '10m'
     timeline-max-delay: '0s'
     timeline-bundle: tests/fixtures/payment-baseline.zip
+    bundle-max-gap: '30s'
 ```
 
 ZIP 하나를 비교할 때는 `bundle`, 여러 개면 `bundles`에 한 줄에 하나씩 경로를 적습니다. 비교에는 `bundle`, `bundles`, `fixture`, `fixtures` 중 하나를 선택합니다. 번들 비교에서는 ZIP을 `before-ref`(기본 `HEAD^1`)에서 읽고, `rule-files`에 지정한 공통 수정 룰을 `after-ref`(기본 `HEAD`)에서 읽습니다. 두 경로는 저장소 루트 기준이며, 룰 파일은 수정 커밋에 있으면 됩니다. [장애 재현 번들](#장애-재현-번들)
+
+`bundle-max-gap`은 `bundle`과 `bundles`에서 사용할 수 있습니다. 모든 ZIP에 같은 제한을 적용하며, `steps.compare.outputs.bundle-coverage-passed`에 전체 판정을 문자열 `true` 또는 `false`로 제공합니다. 표본 공백으로 단계가 실패해도 비교 리포트와 이 출력을 읽을 수 있습니다. [번들의 표본 간격 검사](#번들의-표본-간격-검사)
 
 현재 PR의 기준 룰을 사용하려면 `bundle` 또는 `bundles`와 함께 `before-rule-files`와 `after-rule-files`를 모두 지정합니다. ZIP과 기준 룰은 `before-ref`, 수정 룰은 `after-ref`에서 읽습니다. 두 룰 목록은 저장소 루트 기준으로 한 줄에 하나씩 적습니다. 두 목록을 제공하는 방식과 ZIP에 담긴 기준 룰을 쓰는 `rule-files` 방식 중 하나를 선택합니다.
 
@@ -588,6 +593,15 @@ python3 incident_to_promtool.py verify-bundle demo/generated/payment.zip --forma
 
 전체 검증에는 `manifest.json`이 필요합니다. 종료 코드는 검증을 통과하면 `0`, 형식이 잘못됐거나 파일과 해시가 일치하지 않으면 `2`입니다. 이 검사는 ZIP 내부 파일과 동봉된 해시의 일치 여부를 확인합니다. 작성자와 배포 출처를 확인하려면 신뢰할 수 있는 서명이나 별도의 출처 기록이 필요합니다.
 
+`--max-gap`을 지정하면 전체 파일의 SHA-256을 확인한 뒤 원본 표본의 공백을 검사합니다. `--format json`에는 [`inspect`와 같은 구조](#시계열-표본-간격-확인)의 `coverage`가 추가됩니다.
+
+```sh
+python3 incident_to_promtool.py verify-bundle demo/generated/payment.zip \
+  --max-gap 30s --format json
+```
+
+결제 번들은 `30s` 제한을 통과합니다. 제한을 `29s`로 바꾸면 간격 초과를 보고하고 `1`로 종료합니다. 원본 구간이 비어도 판정을 보고하고 `1`로 종료합니다. 매니페스트 누락, 해시 불일치, 잘못된 원본 설정이나 표본은 입력 오류 `2`로 처리합니다.
+
 #### 번들에서 룰 변경 비교
 
 `compare-bundle`은 ZIP에서 테스트를 바로 읽습니다. 기본 비교에는 ZIP에 담긴 기준 Prometheus 룰을 사용합니다. 번들 내부 `capture.json`에 기록된 테스트의 SHA-256을 확인하고, 같은 테스트로 기준 룰과 수정 룰을 비교합니다. 매니페스트가 있는 번들에서는 `incident.test.yml`과 `capture.json`을 매니페스트와 대조합니다. ZIP에 담긴 기준 룰을 사용하면 해당 룰도 대조합니다. 기존 ZIP도 `capture.json`의 테스트 해시로 검증해 비교할 수 있습니다. [번들 전체 검증](#번들-전체-검증)
@@ -658,6 +672,21 @@ python3 incident_to_promtool.py compare-bundle demo/generated/payment-baseline.z
 여러 ZIP을 비교할 때는 `--timeline-bundle`에 입력 목록의 ZIP 경로 하나를 그대로 적습니다. ZIP 하나를 비교할 때는 그 파일을 기본으로 선택합니다.
 
 JSON의 `timeline`에는 선택한 `bundle`, 기준 룰의 출처 `baseline_source`(`bundle` 또는 `rules`), 실제 비교한 `rule_files.before`와 `rule_files.after`를 기록합니다. ZIP의 기준 룰을 사용하면 `before` 목록은 번들 내부의 룰 멤버 경로입니다. Git 비교에서는 `timeline.fixture_commit`에 ZIP에서 테스트를 읽은 커밋을 기록합니다. [PR에서 최초 발화 지연 검사](#pr에서-최초-발화-지연-검사)
+
+##### 번들의 표본 간격 검사
+
+`compare-bundle --bundle-max-gap`은 각 ZIP에 담긴 원본 표본에 양수 간격 제한을 적용합니다. 매니페스트와 대조한 `incident.json`에서 캡처 구간을 읽고, `incident.matrix.json`에서 격자 이동 전 표본 시각을 읽습니다. Git 비교에서는 `--bundle-ref`의 ZIP에서 읽습니다. 매니페스트가 있는 기존 ZIP에 적용할 수 있으며, `coverage.json`의 기록과 관계없이 이번에 지정한 제한으로 다시 계산합니다. 공백이 제한과 같으면 통과합니다.
+
+```sh
+python3 incident_to_promtool.py compare-bundle demo/generated/payment-baseline.zip \
+  --after demo/after.rules.yml --bundle-max-gap 29s \
+  --json-report demo/generated/payment-coverage.json \
+  --junit-report demo/generated/payment-coverage.xml
+```
+
+이 예제에서 수정 룰은 체크포인트 두 개를 충족하지만, 원본 표본의 `30s` 간격이 `29s` 제한을 넘겨 비교는 `1`로 종료합니다. 간격 검사에 실패해도 유효한 번들의 룰 비교를 실행하고 리포트를 생성합니다. 매니페스트가 없거나 원본 파일을 검증할 수 없으면 입력 오류 `2`로 처리합니다.
+
+옵션을 켜면 JSON에 제한 `max_gap_ms`, 전체 판정 `passed`, 번들별 결과 `checks`를 담은 `bundle_coverage`가 추가됩니다. `checks`의 각 항목에는 ZIP 경로 `path`와 `inspect` 형식의 `coverage`가 있습니다. JUnit XML은 번들별 판정을 `Bundle sample coverage` 스위트에 기록합니다. [기준 번들로 PR 검사](#기준-번들로-pr-검사)
 
 ### 시계열 표본 간격 확인
 

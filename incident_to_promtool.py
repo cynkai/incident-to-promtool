@@ -5,7 +5,7 @@ import argparse
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, DecimalException, InvalidOperation
 import hashlib
 from http.client import HTTPException
 from itertools import pairwise
@@ -42,11 +42,13 @@ MAX_PROMTOOL_DURATION_MS = (2**63 - 1) // 1_000_000
 MAX_TIMELINE_TICKS = 10_000
 BUNDLE_FIXTURE = "incident.test.yml"
 BUNDLE_CAPTURE_SUMMARY = "capture.json"
+BUNDLE_CONFIG = "incident.json"
+BUNDLE_MATRIX = "incident.matrix.json"
 BUNDLE_RULE_PATH = re.compile(r"rules/rules-[1-9][0-9]*\.yml")
 BUNDLE_MANIFEST = "manifest.json"
 BUNDLE_MANIFEST_VERSION = 1
 BUNDLE_FIXED_FILES = (
-    "incident.json", "incident.matrix.json", BUNDLE_FIXTURE, BUNDLE_CAPTURE_SUMMARY, "coverage.json",
+    BUNDLE_CONFIG, BUNDLE_MATRIX, BUNDLE_FIXTURE, BUNDLE_CAPTURE_SUMMARY, "coverage.json",
 )
 SHA256_HEX = re.compile(r"[0-9a-fA-F]{64}")
 XML_INVALID = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
@@ -480,7 +482,10 @@ def capture_samples(matrices, start, end, *, allow_empty=False):
         result = matrix["data"]
         if result["resultType"] != "matrix":
             raise ValueError("expected raw matrix data from /api/v1/query with a range selector")
-        for series in result["result"]:
+        series_list = result["result"]
+        if not isinstance(series_list, (list, tuple)):
+            raise ValueError("matrix result must be an array of series")
+        for series in series_list:
             labels = series["metric"]
             name = series_name(labels)
             if series.get("histograms"):
@@ -806,8 +811,8 @@ def write_bundle(args):
         summary["generation_options"] = generation_options
         summary["bundle_manifest_version"] = BUNDLE_MANIFEST_VERSION
         write_new_json(directory / BUNDLE_CAPTURE_SUMMARY, summary)
-        write_new_json(directory / "incident.json", offline_incident_config(prepared, config["sample_interval"]))
-        write_matrix_snapshot(directory / "incident.matrix.json", prepared.samples, prepared.begin_ms)
+        write_new_json(directory / BUNDLE_CONFIG, offline_incident_config(prepared, config["sample_interval"]))
+        write_matrix_snapshot(directory / BUNDLE_MATRIX, prepared.samples, prepared.begin_ms)
         coverage = prepared.coverage
         if coverage is None:
             coverage = build_coverage_report(prepared.samples, prepared.start, prepared.end, None)
@@ -1036,7 +1041,28 @@ def verify_bundle_capture_summary(path, checksum, contents, manifest):
             raise ValueError(f"{path}: capture summary requires {BUNDLE_MANIFEST}")
 
 
-def load_bundle_replay(path, *, source=None, include_archived_rules=True):
+def read_bundle_coverage(archive, path, manifest, max_gap_ms):
+    if manifest is None:
+        raise ValueError(f"{path}: sample coverage verification requires {BUNDLE_MANIFEST}")
+
+    def read_json_member(name):
+        contents = read_bundle_member(archive, path, name, manifest)
+        try:
+            return json.loads(contents.decode("utf-8"), parse_float=Decimal, object_pairs_hook=unique_json_object)
+        except (ValueError, DecimalException, RecursionError) as exc:
+            raise ValueError(f"{path}!{name}: invalid JSON: {exc}") from exc
+
+    config = read_json_member(BUNDLE_CONFIG)
+    matrix = read_json_member(BUNDLE_MATRIX)
+    try:
+        (start, begin_ms), (end, end_ms) = capture_window(config)
+        samples = capture_samples((matrix,), begin_ms, end_ms, allow_empty=True)
+    except (ValueError, TypeError, KeyError, AttributeError, DecimalException, OverflowError) as exc:
+        raise ValueError(f"{path}: invalid raw capture for sample coverage: {exc}") from exc
+    return build_coverage_report(samples, start, end, max_gap_ms)
+
+
+def load_bundle_replay(path, *, source=None, include_archived_rules=True, max_gap_ms=None):
     fixture_path = f"{path}!{BUNDLE_FIXTURE}"
     summary_path = f"{path}!{BUNDLE_CAPTURE_SUMMARY}"
     with open_bundle_archive(path, source) as (archive, names):
@@ -1054,29 +1080,39 @@ def load_bundle_replay(path, *, source=None, include_archived_rules=True):
         rules = []
         if include_archived_rules:
             rules = [read_bundle_member(archive, path, name, manifest) for name in rule_paths]
-    return fixture, rules, {"path": str(path), "rule_files": rule_paths}
+        coverage = read_bundle_coverage(archive, path, manifest, max_gap_ms) if max_gap_ms is not None else None
+    return fixture, rules, {"path": str(path), "rule_files": rule_paths}, coverage
 
 
-def verify_bundle(path):
+def verify_bundle(path, max_gap_ms=None):
+    report = {"schema_version": 1, "bundle_path": str(path)}
     with open_bundle_archive(path) as (archive, names):
         manifest = read_bundle_manifest(archive, path, names)
         if manifest is None:
             raise ValueError(f"{path}: missing {BUNDLE_MANIFEST}; full verification requires a manifest")
         summary = read_bundle_member(archive, path, BUNDLE_CAPTURE_SUMMARY, manifest)
         verify_bundle_capture_summary(path, manifest[BUNDLE_FIXTURE], summary, manifest)
+        remaining = manifest.keys() - {BUNDLE_CAPTURE_SUMMARY}
+        if max_gap_ms is not None:
+            remaining -= {BUNDLE_CONFIG, BUNDLE_MATRIX}
         for name in manifest:
-            if name != BUNDLE_CAPTURE_SUMMARY:
+            if name in remaining:
                 with archive.open(bundle_member_info(archive, path, name)) as content:
                     verify_bundle_member_hash(path, name, stream_sha256(content), manifest)
-    return {"schema_version": 1, "bundle_path": str(path), "verified_files": sorted(manifest)}
+        report["verified_files"] = sorted(manifest)
+        if max_gap_ms is not None:
+            report["coverage"] = read_bundle_coverage(archive, path, manifest, max_gap_ms)
+    return report
 
 
-def load_committed_bundle_replay(repo, revision, path, *, include_archived_rules=True):
+def load_committed_bundle_replay(repo, revision, path, *, include_archived_rules=True, max_gap_ms=None):
     object_id = committed_file_id(repo, revision, path, "bundle")
     with TemporaryFile() as source:
         git_output(repo, "cat-file", "blob", object_id, stdout=source)
         source.seek(0)
-        return load_bundle_replay(path, source=source, include_archived_rules=include_archived_rules)
+        return load_bundle_replay(
+            path, source=source, include_archived_rules=include_archived_rules, max_gap_ms=max_gap_ms,
+        )
 
 
 def identify_alert_mismatches(fixture, cases):
@@ -1169,12 +1205,15 @@ def markdown_code(value):
     return f"<code>{escaped}</code>"
 
 
-def parse_max_gap(value):
+def parse_max_gap(value, *, option="--max-gap"):
     if value is None:
         return None
-    max_gap_ms = duration_ms(value)
+    try:
+        max_gap_ms = duration_ms(value)
+    except ValueError as exc:
+        raise ValueError(f"{option}: {exc}") from exc
     if max_gap_ms <= 0:
-        raise ValueError("--max-gap requires a positive duration")
+        raise ValueError(f"{option} requires a positive duration")
     return max_gap_ms
 
 
@@ -1393,12 +1432,31 @@ def print_markdown_report(report):
             print(f"\n{fence}text\n{details}\n{fence}")
 
 
+def worst_coverage_series(coverage):
+    return max(coverage["series"], key=longest_series_gap, default=None)
+
+
+def print_bundle_coverage_report(report):
+    limit = as_duration(report["max_gap_ms"])
+    print("\n### Bundle sample coverage\n")
+    print(f"Maximum sample gap `{limit}` **{'Passed' if report['passed'] else 'Failed'}**\n")
+    print("| Bundle | Largest gap | Series | Result |\n| --- | ---: | --- | --- |")
+    for check in report["checks"]:
+        coverage = check["coverage"]
+        worst = worst_coverage_series(coverage)
+        gap = as_duration(longest_series_gap(worst)) if worst else "No float samples"
+        series = markdown_code(worst["series"]) if worst else "—"
+        result = "Passed" if coverage["gate"]["passed"] else "Failed"
+        print(f"| {markdown_code(check['path'])} | {gap} | {series} | {result} |")
+
+
 def build_junit_report(fixtures, report):
     zero_counts = {"errors": "0", "skipped": "0"}
     timelines = report.get("timeline_policy", {}).get("checks", ())
     if "timeline" in report:
         timelines = (report["timeline"],)
-    test_count = report["summary"]["after"]["total"] + len(timelines)
+    coverage_checks = report.get("bundle_coverage", {}).get("checks", ())
+    test_count = report["summary"]["after"]["total"] + len(timelines) + len(coverage_checks)
     root = ElementTree.Element("testsuites", {
         "name": "incident-to-promtool", "tests": str(test_count), **zero_counts,
     })
@@ -1442,9 +1500,34 @@ def build_junit_report(fixtures, report):
         for timeline in timelines:
             add_timeline_junit_case(suite, timeline)
         failures += timing_failures
+    if coverage_checks:
+        failures += add_coverage_junit_suite(root, coverage_checks, zero_counts)
     root.set("failures", str(failures))
     ElementTree.indent(root)
     return ElementTree.tostring(root, encoding="utf-8", xml_declaration=True) + b"\n"
+
+
+def add_coverage_junit_suite(root, checks, zero_counts):
+    failures = sum(not check["coverage"]["gate"]["passed"] for check in checks)
+    suite = ElementTree.SubElement(root, "testsuite", {
+        "name": "Bundle sample coverage", "tests": str(len(checks)), "failures": str(failures), **zero_counts,
+    })
+    for check in checks:
+        coverage = check["coverage"]
+        gate = coverage["gate"]
+        limit = as_duration(gate["max_gap_ms"])
+        case = ElementTree.SubElement(suite, "testcase", {
+            "classname": XML_INVALID.sub("\ufffd", check["path"]), "name": f"Maximum sample gap ({limit})",
+        })
+        if not gate["passed"]:
+            failure = ElementTree.SubElement(case, "failure", {"message": "Bundle sample coverage failed", "type": "max-gap"})
+            worst = worst_coverage_series(coverage)
+            if worst is None:
+                failure.text = "No float samples found in the capture window."
+            else:
+                gap = as_duration(longest_series_gap(worst))
+                failure.text = XML_INVALID.sub("\ufffd", f"The largest gap is {gap} in {worst['series']}. The limit is {limit}.")
+    return failures
 
 
 def add_timeline_junit_case(suite, timeline):
@@ -1498,6 +1581,7 @@ def write_comparison_reports(reports):
 def compare(
     fixtures, baseline_rule_sets, after, executable, revisions, gate, json_report, fixture_commit,
     *, bundles=(), junit_report=None, rule_paths=None, show_rule_paths=True, timelines=(), timeline_policy=None,
+    bundle_coverage=None,
 ):
     if (json_report is not None and junit_report is not None
             and os.path.realpath(json_report) == os.path.realpath(junit_report)):
@@ -1533,6 +1617,8 @@ def compare(
         report["bundle"] = bundles[0]
     elif bundles:
         report["bundles"] = list(bundles)
+    if bundle_coverage is not None:
+        report["bundle_coverage"] = bundle_coverage
     if show_rule_paths and rule_paths is not None:
         report["rule_files"] = rule_paths
     if timeline_policy is not None:
@@ -1547,12 +1633,15 @@ def compare(
     if reports:
         write_comparison_reports(reports)
     print_markdown_report(report)
+    if bundle_coverage is not None:
+        print_bundle_coverage_report(bundle_coverage)
     if timeline_policy is not None:
         print_timeline_policy(report["timeline_policy"])
     elif timing_reports:
         print()
         print_timeline_report(timing_reports[0])
-    return int(not (report["gate"]["passed"] and timing_passed))
+    coverage_passed = bundle_coverage is None or bundle_coverage["passed"]
+    return int(not (report["gate"]["passed"] and timing_passed and coverage_passed))
 
 
 def add_comparison_report_options(parser):
@@ -2163,6 +2252,7 @@ def compare_bundle_main(argv):
     parser.add_argument("--before-rule-file", action="append", help="repository-root-relative baseline rule path at --bundle-ref (repeatable)")
     parser.add_argument("--after-rule-file", action="append", help="repository-root-relative proposed rule path at --after-ref with an explicit baseline (repeatable)")
     parser.add_argument("--repo", type=Path, help="Git repository for ref comparison (default: current directory)")
+    parser.add_argument("--bundle-max-gap", metavar="DURATION", help="check gaps against a positive duration using each bundle's raw capture")
     parser.add_argument(
         "--rule-format", choices=("prometheus", "kubernetes"), default="prometheus",
         help="input format of explicitly supplied rule files (default: prometheus)",
@@ -2186,6 +2276,7 @@ def compare_bundle_main(argv):
         parser.error("file bundle comparison requires at least one --after rule file")
     timing_index = comparison_timeline_index(parser, args, args.bundles, args.timeline_bundle, "bundle")
     try:
+        max_gap_ms = parse_max_gap(args.bundle_max_gap, option="--bundle-max-gap")
         identities = args.bundles if git_mode else [os.path.realpath(path, strict=True) for path in args.bundles]
         if len(identities) != len(set(identities)):
             raise ValueError("each incident bundle must be supplied only once")
@@ -2197,7 +2288,9 @@ def compare_bundle_main(argv):
             repo = args.repo or Path.cwd()
             revisions = (resolve_commit(repo, args.bundle_ref), resolve_commit(repo, args.after_ref))
             replays = [
-                load_committed_bundle_replay(repo, revisions[0], path, include_archived_rules=include_archived_rules)
+                load_committed_bundle_replay(
+                    repo, revisions[0], path, include_archived_rules=include_archived_rules, max_gap_ms=max_gap_ms,
+                )
                 for path in args.bundles
             ]
             candidate_paths = args.after_rule_file if scoped_paths else args.rule_file
@@ -2207,14 +2300,24 @@ def compare_bundle_main(argv):
                 before = read_committed_rules(repo, revisions[0], args.before_rule_file)
                 rule_paths = {"before": args.before_rule_file, "after": candidate_paths}
         else:
-            replays = [load_bundle_replay(Path(path), include_archived_rules=include_archived_rules) for path in args.bundles]
+            replays = [
+                load_bundle_replay(Path(path), include_archived_rules=include_archived_rules, max_gap_ms=max_gap_ms)
+                for path in args.bundles
+            ]
             after = read_rule_sources(args.after)
             candidate_paths = [str(path) for path in args.after]
             rule_paths = {"after": candidate_paths}
             if args.before:
                 before = read_rule_sources(args.before)
                 rule_paths = {"before": [str(path) for path in args.before], "after": candidate_paths}
-        fixtures, baseline_rule_sets, bundles = zip(*replays)
+        fixtures, baseline_rule_sets, bundles, coverage_reports = zip(*replays)
+        bundle_coverage = None
+        if max_gap_ms is not None:
+            bundle_coverage = {
+                "max_gap_ms": max_gap_ms,
+                "passed": all(report["gate"]["passed"] for report in coverage_reports),
+                "checks": [{"path": bundle["path"], "coverage": report} for bundle, report in zip(bundles, coverage_reports)],
+            }
         timelines, policy = prepare_comparison_timelines(
             args, fixtures, timing_index, args.bundles, repo=repo, commit=revisions[0] if revisions else None,
         )
@@ -2224,7 +2327,7 @@ def compare_bundle_main(argv):
             fixtures, baseline_rule_sets, comparison_rule_bytes(after, args.rule_format), args.promtool, revisions=revisions,
             gate=args.gate, json_report=args.json_report, fixture_commit=None, bundles=bundles,
             junit_report=args.junit_report, rule_paths=rule_paths, show_rule_paths=not include_archived_rules,
-            timelines=timelines, timeline_policy=policy,
+            timelines=timelines, timeline_policy=policy, bundle_coverage=bundle_coverage,
         )
     except (OSError, ValueError, TypeError) as exc:
         parser.exit(2, f"error: {exc}\n")
@@ -2330,10 +2433,11 @@ def verify_bundle_main(argv):
         description="Verify the member inventory and recorded SHA-256 hashes of an incident bundle ZIP.",
     )
     parser.add_argument("bundle", type=Path, help="incident ZIP containing a manifest")
+    parser.add_argument("--max-gap", metavar="DURATION", help="check gaps against a positive duration using the bundle's raw capture")
     parser.add_argument("--format", choices=("markdown", "json"), default="markdown", help="report format (default: markdown)")
     args = parser.parse_args(argv)
     try:
-        report = verify_bundle(args.bundle)
+        report = verify_bundle(args.bundle, parse_max_gap(args.max_gap))
     except (OSError, ValueError, TypeError, RecursionError) as exc:
         parser.exit(2, f"error: {exc}\n")
     if args.format == "json":
@@ -2343,6 +2447,10 @@ def verify_bundle_main(argv):
         print(f"Verified SHA-256 for {len(files)} files in bundle {markdown_code(report['bundle_path'])}.\n")
         for name in files:
             print(f"- {markdown_code(name)}")
+        if "coverage" in report:
+            print()
+            print_coverage_report(report["coverage"])
+    return int("coverage" in report and not report["coverage"]["gate"]["passed"])
 
 
 def plan_capture_main(argv):
