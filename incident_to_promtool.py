@@ -1216,6 +1216,8 @@ def parse_max_gap(value, *, option="--max-gap"):
         return None
     try:
         max_gap_ms = duration_ms(value)
+        # Validate the decimal representation used in coverage reports before replay.
+        str(max_gap_ms)
     except ValueError as exc:
         raise ValueError(f"{option}: {exc}") from exc
     if max_gap_ms <= 0:

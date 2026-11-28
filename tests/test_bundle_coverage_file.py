@@ -176,6 +176,10 @@ class BundleCoverageFileIntegrationTests(unittest.TestCase):
             ("invalid metric list", single, policy_bytes({"required_metrics": PAYMENT}), r"(?i)required.metrics|array"),
             ("invalid metric name", single, policy_bytes({"required_metrics": ["not a metric"]}), r"(?i)required.metrics|metric name"),
         )
+        digit_limit = getattr(sys, "get_int_max_str_digits", lambda: 0)()
+        if digit_limit:
+            huge_gap = "9" * digit_limit + "d"
+            invalid += (("gap too large to report", single, policy_bytes({"max_gap": huge_gap}), r"(?i)max.gap|digits"),)
         for index, (name, archives, content, diagnostic) in enumerate(invalid):
             with self.subTest(case=name):
                 policy = self.write_policy(f"invalid-{index}.json", content)
