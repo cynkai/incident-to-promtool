@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "checks": [
+    {
+      "source": "complete.zip",
+      "max_gap": "30s",
+      "required_metrics": ["payment_http_requests_total"]
+    },
+    {
+      "source": "sparse.zip",
+      "max_gap": "45s",
+      "required_metrics": ["payment_http_requests_total"]
+    }
+  ]
+}

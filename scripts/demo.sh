@@ -2,19 +2,43 @@
 set -euo pipefail
 
 usage() {
-    printf 'Usage: bash scripts/demo.sh [--timing]\n'
+    printf 'Usage: bash scripts/demo.sh [--timing | --coverage [--output-dir DIR]]\n'
     printf 'Use --timing to compare two versions of the payment alert against a firing deadline.\n'
+    printf 'Use --coverage to replay two captures and see the effect of one missing scrape.\n'
+    printf 'Use --output-dir with --coverage to keep the replay inputs and reports in a new directory.\n'
 }
 
-timing=0
-if [[ $# -eq 1 && $1 == --timing ]]; then
-    timing=1
-elif [[ $# -eq 1 && ( $1 == -h || $1 == --help ) ]]; then
+if [[ $# -eq 1 && ( $1 == -h || $1 == --help ) ]]; then
     usage
     exit 0
-elif [[ $# -ne 0 ]]; then
+fi
+mode=checkpoints
+output_dir=
+while (( $# )); do
+    case "$1" in
+        --timing|--coverage)
+            [[ $mode == checkpoints ]] || { usage >&2; exit 2; }
+            mode=${1#--}
+            ;;
+        --output-dir)
+            [[ $# -ge 2 && -z $output_dir && -n $2 && $2 != -* ]] || { usage >&2; exit 2; }
+            output_dir=$2
+            shift
+            ;;
+        *) usage >&2; exit 2 ;;
+    esac
+    shift
+done
+if [[ -n $output_dir && $mode != coverage ]]; then
     usage >&2
     exit 2
+fi
+if [[ -n $output_dir ]]; then
+    if [[ $output_dir != /* ]]; then output_dir="$PWD/$output_dir"; fi
+    if [[ -e $output_dir || -L $output_dir ]]; then
+        printf 'Output path already exists: %s\n' "$output_dir" >&2
+        exit 2
+    fi
 fi
 
 repo=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
@@ -51,8 +75,12 @@ fi
     CDPATH= cd -- "$temporary"
     # Keep subprocess scratch paths valid after leaving the caller's directory.
     export TMPDIR="$PWD"
+    if [[ $mode == coverage ]]; then
+        "$python" "$repo/scripts/demo-coverage.py" "$promtool" "$output_dir"
+        exit
+    fi
     incident="$repo/demo/demo.json"
-    if [[ "$timing" -eq 1 ]]; then
+    if [[ $mode == timing ]]; then
         incident="$repo/demo/timing.incident.json"
     fi
     "$python" "$repo/incident_to_promtool.py" "$incident" \
@@ -60,7 +88,7 @@ fi
 
     compare=("$python" "$repo/incident_to_promtool.py" compare payment.test.yml
         --before "$repo/demo/before.rules.yml" --promtool "$promtool")
-    if [[ "$timing" -eq 0 ]]; then
+    if [[ $mode == checkpoints ]]; then
         "${compare[@]}" --after "$repo/demo/after.rules.yml"
         exit
     fi

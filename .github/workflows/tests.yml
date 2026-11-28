@@ -55,6 +55,75 @@ jobs:
           bash "$demo" --unknown > /dev/null 2>&1 || status=$?
           [[ "$status" -eq 2 ]]
           [[ $(ls -A) == "$TMPDIR" && -z $(ls -A -- "$TMPDIR") ]]
+      - name: Run and reproduce the coverage quickstart outside the checkout
+        run: |
+          demo="$GITHUB_WORKSPACE/scripts/demo.sh"
+          quickstart=$(mktemp -d "$RUNNER_TEMP/coverage-quickstart.XXXXXXXX")
+          cd "$quickstart"
+          export PROMTOOL="$RUNNER_TEMP/promtool"
+          status=0
+          bash "$demo" --coverage --output-dir --timing > /dev/null 2>&1 || status=$?
+          [[ "$status" -eq 2 && ! -e ./--timing ]]
+          status=0
+          PROMTOOL="$PWD/missing-promtool" bash "$demo" --coverage --output-dir invalid > /dev/null 2>&1 || status=$?
+          [[ "$status" -eq 2 && ! -e invalid ]]
+          report=$(bash "$demo" --coverage)
+          [[ "$report" == '## Prometheus alert comparison'* ]]
+          [[ "$report" == *'| After | Passed | 4/4 |'* ]]
+          [[ "$report" == *'30s / 30s'* && "$report" == *'60s / 45s'* ]]
+          [[ -z $(ls -A) ]]
+
+          evidence='coverage evidence'
+          bash "$demo" --coverage --output-dir "$evidence" > saved.md
+          cmp -- saved.md "$evidence/review.md"
+          files=(complete.zip sparse.zip coverage.policy.json candidate.rules.yml review.md review.json review.xml)
+          for file in "${files[@]}"; do test -s "$evidence/$file"; done
+          sha256sum -- "$evidence"/* > evidence.sha256
+          if bash "$demo" --coverage --output-dir "$evidence" > /dev/null 2>&1; then exit 1; fi
+          sha256sum --check --status evidence.sha256
+          [[ $(ls -1A -- "$evidence" | wc -l) -eq ${#files[@]} ]]
+
+          mkdir 'copied inputs'
+          for file in complete.zip sparse.zip coverage.policy.json candidate.rules.yml; do
+            cp -- "$evidence/$file" 'copied inputs/'
+          done
+          status=0
+          (
+            cd 'copied inputs'
+            python3 "$GITHUB_WORKSPACE/incident_to_promtool.py" compare-bundle complete.zip sparse.zip \
+              --after candidate.rules.yml --bundle-coverage-policy coverage.policy.json --promtool "$PROMTOOL" \
+              --json-report replay.json > replay.md
+          ) || status=$?
+          [[ "$status" -eq 1 ]]
+
+          python3 - "$evidence" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          from xml.etree import ElementTree
+
+          evidence = Path(sys.argv[1])
+          original = json.loads((evidence / "review.json").read_bytes())
+          replay = json.loads(Path("copied inputs/replay.json").read_bytes())
+          assert original["gate"] == replay["gate"] == {"mode": "strict", "passed": True}
+          assert original["summary"]["after"] == replay["summary"]["after"] == {"matched": 4, "total": 4}
+          coverage = original["bundle_coverage"]
+          assert coverage == replay["bundle_coverage"] and coverage["passed"] is False
+          for check, (name, limit, gap, passed) in zip(coverage["checks"], (
+              ("complete.zip", 30_000, 30_000, True), ("sparse.zip", 45_000, 60_000, False),
+          ), strict=True):
+              assert check["path"] == name
+              samples = check["coverage"]
+              assert samples["gate"] == {"max_gap_ms": limit, "passed": passed}
+              assert samples["required_metrics"] == {"names": ["payment_http_requests_total"], "missing": [], "passed": True}
+              series, = samples["series"]
+              assert series["max_sample_gap"]["duration_ms"] == gap
+
+          junit = ElementTree.parse(evidence / "review.xml").getroot()
+          assert (junit.attrib["tests"], junit.attrib["failures"]) == ("8", "1")
+          case, = junit.findall("testsuite[@name='Bundle sample coverage']/testcase[failure]")
+          assert case.attrib["classname"] == "sparse.zip" and case.find("failure").attrib["type"] == "max-gap"
+          PY
       - name: Smoke test the installed wheel
         if: matrix.version == '3.11.0'
         run: |

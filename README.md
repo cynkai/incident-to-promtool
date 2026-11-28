@@ -18,7 +18,7 @@ Run `bash scripts/demo.sh --timing` for the same offline payment replay with a s
 
 Use `timeline` to compare an alert's first firing across Git revisions. The GitHub Action can enforce delay limits and firing deadlines from a committed timing policy alongside checkpoint checks. [GitHub Action timing policy](#발화-지연-정책)
 
-Check raw sample gaps when replaying archived incidents in CI. [Bundle coverage check](#번들의-표본-간격-검사)
+Run `bash scripts/demo.sh --coverage` to replay two bundles. The proposed rule passes all four alert checkpoints. One missing scrape leaves a 60-second gap in a bundle with a 45-second limit. The demo succeeds when it reproduces that failure. Add `--output-dir ./coverage-example` to keep the inputs and reports for offline replay. [Bundle coverage demo](#번들-표본-검사-예제)
 
 Use Python 3.10+ and `promtool` 3.9+. With no local `promtool`, the demo downloads and verifies a pinned binary on Linux x64. Set `PROMTOOL=/path/to/promtool` to use a specific executable.
 
@@ -83,6 +83,38 @@ python3 incident_to_promtool.py demo/timing.incident.json \
 python3 incident_to_promtool.py compare demo/generated/payment-timing.test.yml \
   --before demo/before.rules.yml --after demo/after.rules.yml \
   --timeline-policy demo/timing.policy.json --json-report demo/generated/timing-review.json
+```
+
+### 번들 표본 검사 예제
+
+```sh
+bash scripts/demo.sh --coverage
+```
+
+두 결제 번들 모두 `payment_http_requests_total`을 요구하며 수정 룰은 체크포인트 `4/4`를 충족합니다. `complete.zip`은 최대 공백이 `30s`로 `30s` 제한을 충족합니다. `sparse.zip`은 원본 표본을 하나 빼면서 최대 공백이 `60s`가 되어 `45s` 제한을 넘습니다. 스크립트는 이 결과를 확인하면 `0`으로 종료합니다. [번들별 표본 검사 정책](#번들별-표본-검사-정책)
+
+`--output-dir`에 새 디렉터리를 지정하면 `complete.zip`, `sparse.zip`, `coverage.policy.json`, `candidate.rules.yml`과 리포트 `review.md`, `review.json`, `review.xml`을 저장합니다.
+
+```sh
+bash scripts/demo.sh --coverage --output-dir ./coverage-example
+```
+
+설치한 CLI와 `PATH`에 있는 `promtool`로 내보낸 파일을 오프라인에서 다시 실행할 수 있습니다. 아래 `compare-bundle`은 `sparse.zip`의 간격 검사 실패를 보고하고 `1`로 종료합니다. [CLI 설치](#install-the-cli-from-github)
+
+```sh
+cd coverage-example
+incident-to-promtool compare-bundle complete.zip sparse.zip \
+  --after candidate.rules.yml --bundle-coverage-policy coverage.policy.json \
+  --json-report replay.json --junit-report replay.xml > replay.md
+```
+
+같은 디렉터리에서 `sparse.zip`의 제한을 `60s`로 바꾼 정책을 만들어 다시 비교하면 두 번들 모두 통과합니다.
+
+```sh
+sed 's/"45s"/"60s"/' coverage.policy.json > coverage-60s.policy.json
+incident-to-promtool compare-bundle complete.zip sparse.zip \
+  --after candidate.rules.yml --bundle-coverage-policy coverage-60s.policy.json \
+  --json-report replay-60s.json --junit-report replay-60s.xml > replay-60s.md
 ```
 
 ## 룰 변경 전후 비교
